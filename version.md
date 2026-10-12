@@ -1,340 +1,187 @@
-# mini-vLLM v0.6 — KV-pressure preemption + recomputation
+# mini-vLLM v0.7 — speculative decoding (planning branch)
 
 ## 1. Version identity
 
-- **Branch:** `v0.6`
-- **Previous version:** `v0.5`
-- **Theme:** scheduler-visible KV pressure, active-request preemption, and deterministic replay
-- **Status:** frozen historical learning snapshot after validation
+- **Branch:** `v0.7`
+- **Base:** latest validated `v0.6` / `main`
+- **Previous version:** `v0.6`
+- **Theme:** speculative decoding as a transactional KV-state problem
+- **Status:** planning / implementation target; runtime still behaves as v0.6 until acceptance criteria pass
 
-v0.6 keeps v0.5 prefix caching and v0.4 token-budget scheduling, but closes the first serious resource-pressure loop:
+## 2. Why v0.7 follows v0.6
 
-```text
-scheduled request needs KV
-        │
-        ▼
-allocation fails
-        │
-        ▼
-scheduler chooses victim
-        │
-        ▼
-release victim active KV
-        │
-        ▼
-rollback physical execution frontier
-        │
-        ▼
-resume later by recomputation
-```
+v0.6 makes KV invalidation and replay explicit. That is the prerequisite for speculative decoding, where the runtime intentionally creates temporary candidate state that may later be rejected.
 
----
+The new question is:
 
-## 2. Why v0.6 follows v0.5
+> How can several draft tokens be proposed and verified while guaranteeing that rejected tokens leave no visible model or KV state behind?
 
-v0.3 made the KV pool finite. v0.5 added resident cached blocks and shared ownership. Once active requests and cached prefixes compete for a bounded physical pool, an allocator can legitimately say:
+## 3. Primary mental model
 
 ```text
-no evictable free/cached block remains
-```
-
-v0.5 stops there. v0.6 answers the next systems question:
-
-> Which active request should lose its execution state, and how can it later continue without changing logical generation semantics?
-
----
-
-## 3. Core distinction: logical history vs physical state
-
-A request owns two kinds of state:
-
-```text
-logical history
-  prompt_token_ids
-  output_token_ids
-
-physical execution state
-  num_computed_tokens
-  active KV block references
-```
-
-Preemption discards the second category, not the first.
-
-```text
-before preemption
-prompt = [p0 p1 p2]
-output = [o0]
-num_computed_tokens = 4
-KV exists for p0 p1 p2 o0
-
-preempt
-prompt = [p0 p1 p2]       preserved
-output = [o0]              preserved
-num_computed_tokens = 0    rolled back
-active KV = none           released
-```
-
-Later replay reconstructs the physical state from the preserved logical history.
-
----
-
-## 4. Request lifecycle delta
-
-v0.6 adds:
-
-```text
-WAITING
-   │
-   ▼
-RUNNING
-   │
-   ├──────────────► FINISHED
-   │
-   │ KV pressure
-   ▼
-PREEMPTED
-   │
-   │ later eligible
-   ▼
-RUNNING
-```
-
-`Request.mark_preempted()`:
-
-- preserves `prompt_token_ids`;
-- preserves `output_token_ids`;
-- sets `num_computed_tokens = 0`;
-- increments `preemption_count`;
-- marks that cache state must be reconstructed.
-
----
-
-## 5. Scheduler policy
-
-`PreemptiveBudgetedScheduler` extends the v0.4 token-budget scheduler.
-
-Victim selection is intentionally simple:
-
-1. the blocked request cannot be its own victim;
-2. only currently `RUNNING` requests are eligible;
-3. choose the **most recently admitted** eligible request.
-
-This is deterministic and easy to inspect. It is not presented as production-optimal.
-
-### Anti-thrashing fairness rule
-
-Without a resume guard, two requests can do this forever:
-
-```text
-A blocks -> preempt B
-next step B returns
-B blocks -> preempt A
-next step A returns
-...
-```
-
-Therefore a preempted request is kept at the front of the waiting queue but remains ineligible until at least one request that survived the preemption has finished.
-
-For bounded workloads this creates a simple liveness guarantee while keeping the policy small.
-
----
-
-## 6. Engine pressure path
-
-The cache still owns storage only. It never chooses a victim.
-
-```text
-ScheduleDecision
+stable request state
       │
       ▼
-Engine._fit_cache()
+KV checkpoint
       │
-      ├── ensure_capacity() succeeds
-      │         │
-      │         ▼
-      │      execute
+      ▼
+draft proposes [d0 d1 d2]
       │
-      └── ensure_capacity() fails
-                │
-                ▼
-     scheduler.select_preemption_victim()
-                │
-                ▼
-          cache.free(victim)
-                │
-                ▼
-          victim.mark_preempted()
-                │
-                ▼
-     scheduler.on_request_preempted()
-                │
-                ▼
-          retry reservation
+      ▼
+target verifies candidates
+      │
+      ├── accept [d0 d1] ──► commit accepted prefix
+      │
+      └── reject d2       ──► rollback rejected suffix
+      │
+      ▼
+continue from committed state only
 ```
 
-If no eligible victim exists, allocation failure is explicit.
+Speculative decoding is therefore not merely “generate multiple tokens at once.” It is a transaction over logical token history and physical KV state.
 
----
+## 4. Required contracts
 
-## 7. Replay semantics
-
-A sampled output token is logical history even after its KV disappears.
-
-Suppose:
+Introduce small explicit abstractions rather than mixing speculation into the normal sampler path:
 
 ```text
-prompt = [p0 p1 p2]
-output = [o0]
+DraftProvider
+DraftBatch
+VerificationResult
+CacheCheckpoint
+commit()
+rollback()
 ```
 
-After preemption the runtime may execute:
+Start with a deterministic scripted draft provider. Do **not** introduce a second neural draft model until transaction semantics are proven.
+
+## 5. Cache checkpoint semantics
+
+A checkpoint must capture enough state to restore the request to the last stable frontier.
+
+At minimum reason about:
+
+- logical token count before speculation;
+- `num_computed_tokens` before speculation;
+- block-table length / tail allocation frontier;
+- private mutable tail state;
+- shared immutable prefix blocks that must not be modified;
+- any new blocks allocated for speculative candidates.
+
+Rollback must make rejected speculative positions unreachable and recyclable.
+
+## 6. Logical-history invariant
+
+Draft tokens are **proposals**, not committed output history.
+
+Before verification:
 
 ```text
-recompute p0 p1 p2
-recompute historical o0
+committed output_token_ids = stable history
+speculative tokens         = temporary proposal buffer
+```
+
+Only accepted tokens may become durable request output.
+
+This prevents normal preemption/replay code from treating rejected speculative tokens as real generation history.
+
+## 7. Verification policy
+
+The first educational implementation should use a deterministic acceptance rule that is easy to test.
+
+A suggested progression:
+
+1. scripted draft tokens;
+2. target model computes verification logits over the candidate sequence;
+3. accept the longest prefix whose candidate matches the target greedy token;
+4. on first mismatch, reject that token and all later draft tokens;
+5. sample/commit the target token at the mismatch position;
+6. rollback any physical KV state beyond the committed frontier.
+
+The goal is semantic correctness, not maximum speculative throughput.
+
+## 8. Critical invariants
+
+### Transaction invariant
+
+After verification, request state must be indistinguishable from an execution that only ever computed the committed token sequence.
+
+### Rollback invariant
+
+Rejected speculative tokens must not remain:
+
+- in `output_token_ids`;
+- in the visible computed-token frontier;
+- in block-table ownership beyond the committed frontier;
+- in future attention context.
+
+### Shared-prefix invariant
+
+Checkpoint/rollback may modify only request-private speculative state. Shared immutable prefix blocks remain untouched.
+
+### Deterministic-equivalence invariant
+
+With greedy target sampling, speculative and ordinary v0.6 decoding must produce the same final output tokens.
+
+## 9. Scheduler interaction
+
+Do not redesign the scheduler in the first v0.7 increment.
+
+Prefer:
+
+```text
+PreemptiveBudgetedScheduler
         │
         ▼
-only now sample o1
-```
-
-The existing `WorkItem.completes_current_sequence` rule naturally prevents duplicate sampling: while replay is still behind `len(prompt + output)`, model execution only rebuilds KV.
-
----
-
-## 8. Prefix-cache compatibility
-
-When a preempted request returns, Engine calls `cache.prepare_request(...)` before replay.
-
-Therefore some physical state may be restored immediately:
-
-```text
-released active request KV
+normal scheduled request
         │
         ▼
-shared/cache-resident immutable prefix still exists
-        │
-        ▼
-reattach cached full blocks
-        │
-        ▼
-recompute only the missing suffix/history
+Speculative execution policy
 ```
 
-Preempting B does not invalidate A's reference to a shared prefix block:
+Later experiments may account for draft/verification token cost in the token budget, but transaction correctness comes first.
+
+## 10. Acceptance criteria
+
+v0.7 cannot be frozen until:
+
+- [ ] a deterministic `DraftProvider` can propose multiple tokens;
+- [ ] a request can create a cache checkpoint before speculative work;
+- [ ] target verification accepts a correct candidate prefix;
+- [ ] a mismatching candidate causes suffix rollback;
+- [ ] rejected tokens disappear from logical history and KV visibility;
+- [ ] accepted speculative tokens become normal committed output history;
+- [ ] speculative greedy output matches ordinary v0.6 greedy output;
+- [ ] rollback correctly frees or truncates request-private blocks;
+- [ ] shared prefix blocks survive rollback unchanged;
+- [ ] preemption of a non-speculating request still passes v0.6 regressions;
+- [ ] tests cover accept-all, reject-first, partial-accept, and rollback-across-block-boundary cases;
+- [ ] an executable trace shows checkpoint -> draft -> verify -> commit/rollback;
+- [ ] validated implementation is synchronized to `main`.
+
+## 11. Preferred implementation order
 
 ```text
-A + B: refcount = 2
-preempt B
-A only: refcount = 1
+1. DraftProvider + scripted candidates
+2. VerificationResult data model
+3. cache checkpoint metadata
+4. rollback/truncate API on paged/prefix cache
+5. target verification reference path
+6. logical commit of accepted tokens
+7. integration with Engine trace
+8. equivalence tests
 ```
 
----
+## 12. Explicit non-goals
 
-## 9. Trace additions
+- learned neural draft model in the first increment;
+- Medusa / EAGLE / multi-head draft methods;
+- production acceptance kernels;
+- distributed speculative execution;
+- async streaming changes;
+- Executor / Worker process split — `v0.8`;
+- CUDA/Triton optimization.
 
-`EngineStepOutput` adds:
+## 13. Next version
 
-```python
-preempted_request_ids: tuple[str, ...]
-```
-
-Requests expose:
-
-```python
-preemption_count
-```
-
-This makes pressure behavior visible without inspecting private scheduler state.
-
----
-
-## 10. Important source files
-
-```text
-mini_vllm/core/request.py
-        ↓
-mini_vllm/scheduler/base.py
-        ↓
-mini_vllm/scheduler/preemptive.py
-        ↓
-mini_vllm/core/engine.py
-        ↓
-mini_vllm/versions/v0_6/engine.py
-        ↓
-tests/test_preemption.py
-        ↓
-examples/07_preemption.py
-```
-
-Recommended comparison:
-
-```bash
-git diff v0.5..v0.6 -- mini_vllm tests examples version.md
-```
-
----
-
-## 11. Tests and validation
-
-v0.6 validates:
-
-- deterministic latest-admitted victim selection;
-- a victim is not immediately re-admitted before a survivor completes;
-- active KV ownership is released on preemption;
-- `num_computed_tokens` rolls back to match discarded state;
-- logical output tokens survive preemption;
-- replay later catches up and finishes;
-- pressured and roomy deterministic runs generate identical output histories;
-- preempting one shared-prefix owner does not mutate the other owner's K/V;
-- impossible allocation with no eligible victim raises explicitly;
-- all v0.1-v0.5 regressions continue to pass.
-
-The frozen local snapshot passes **22 tests** plus all seven executable examples.
-
----
-
-## 12. Learning goals
-
-After v0.6, the learner should be able to explain:
-
-- why allocation failure belongs in the scheduler/engine feedback loop;
-- why the cache must not secretly choose an active victim;
-- the difference between logical token history and physical KV state;
-- why `num_computed_tokens` must roll back after state invalidation;
-- how historical sampled tokens can be replayed without being sampled twice;
-- how prefix caching reduces recomputation after preemption;
-- how naive immediate resume can cause preemption thrashing;
-- why recompute preemption is conceptually simpler than KV swap.
-
----
-
-## 13. Explicit non-goals
-
-- CPU/host KV swap;
-- sophisticated priority/aging policy;
-- production admission control;
-- speculative decoding;
-- multiprocess Executor / Worker split;
-- distributed execution;
-- CUDA/Triton PagedAttention.
-
----
-
-## 14. Next version
-
-`v0.7` introduces **speculative decoding** and makes KV mutation transactional:
-
-```text
-checkpoint
-   ↓
-draft tokens
-   ↓
-target verification
-   ↓
-accept prefix
-rollback rejected suffix
-   ↓
-commit
-```
-
-v0.6 is the prerequisite because it already establishes explicit KV invalidation and reconstruction semantics.
+`v0.8` introduces the **EngineCore / Executor / Worker** boundary. Once scheduling, cache ownership, preemption, and speculative transaction semantics are explicit in-process, execution can be moved behind an executor interface without changing those semantics.
