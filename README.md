@@ -1,112 +1,70 @@
-# mini-vLLM
+# mini-vLLM v0.4 — planning branch
 
-A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the core systems ideas behind vLLM.
+This branch is the **next learning milestone**, not a fake completed release.
 
-Current integrated release on `main`: **v0.3**.
+The runtime code intentionally remains equivalent to the validated v0.3 implementation until the v0.4 acceptance criteria are implemented and tested.
 
-## Branch-first learning model
+Before changing code, read in this order:
+
+1. `Agents.md`
+2. `version.md`
+3. `Plan.md`
+4. `mini_vllm/core/work.py`
+5. `mini_vllm/scheduler/`
+6. `mini_vllm/cache/paged.py`
+7. relevant tests
+
+## Primary question
+
+> Once continuous batching and paged KV already exist, how should the scheduler bound **token work per engine step**, rather than only the number of active sequences?
+
+Target mental model:
 
 ```text
-main  ───────────────────────────────► newest validated state (v0.3)
-  │
-  ├── v0.1  static batching + contiguous KV
-  ├── v0.2  continuous batching + contiguous KV
-  ├── v0.3  continuous batching + paged KV
-  └── v0.4  planning: token budget + chunked prefill
+max_num_batched_tokens = step token budget
+
+step:
+  decode A       = 1 token
+  prefill B      = 64-token chunk
+  prefill C      = 31-token chunk
+                  --------
+  scheduled       96 tokens <= budget
 ```
 
-Study the project by comparing branches:
+This enables **chunked prefill**: a long prompt no longer has to monopolize one whole engine step.
+
+## Planned v0.4 delta
+
+- `max_num_batched_tokens`
+- budget-aware scheduler
+- prompt chunks represented as `WorkItem`s
+- partial prefill across multiple steps
+- compatibility with incremental paged-KV growth
+- decode/prefill interleaving experiments
+- token-budget invariant tests
+- TTFT / ITL educational step metrics
+
+## Acceptance criteria
+
+- every schedule satisfies `sum(work_item.num_tokens) <= max_num_batched_tokens`;
+- long prompts can span multiple engine steps;
+- decode requests can make progress while another request is still prefilling;
+- chunked and unchunked reference execution agree numerically for the same token history;
+- tests and examples make the scheduling timeline visible;
+- validated implementation is synchronized back to `main` before v0.4 is frozen.
+
+## Explicit non-goals
+
+- prefix caching (`v0.5`)
+- memory-pressure preemption (`v0.6`)
+- speculative decoding (`v0.7`)
+- EngineCore / Executor / Worker split (`v0.8`)
+- Triton/CUDA PagedAttention (`v0.12`)
+
+## Compare with v0.3
 
 ```bash
-git diff v0.1..v0.2
-git diff v0.2..v0.3
+git diff v0.3..v0.4
 ```
 
-Before changing code, read `Agents.md`. `Plan.md` is the canonical forward roadmap.
-
-## Core runtime
-
-```text
-Request
-  ↓
-Scheduler
-  ↓
-KV Cache Backend
-  ↓
-ModelRunner
-  ↓
-Sampler
-  ↓
-request state update / free
-```
-
-## Version ladder
-
-| Branch | Scheduler | KV cache | Primary lesson |
-|---|---|---|---|
-| `v0.1` | Static cohort | Contiguous slab | Minimal serving loop |
-| `v0.2` | Continuous | Contiguous slab | Dynamic slot refill |
-| `v0.3` | Continuous | Paged blocks | Block tables and recycling |
-| `v0.4` | Planned token-budget scheduler | Paged blocks | Chunked prefill |
-
-## Install / verify
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-./scripts/check.sh
-```
-
-## v0.3 key idea
-
-For block size `B` and token position `p`:
-
-```text
-logical_block = p // B
-block_offset  = p % B
-physical      = block_table[request_id][logical_block]
-```
-
-Example:
-
-```text
-block_size = 4
-block_table[A] = [5, 1, 8]
-position = 9
-
-logical block = 2
-physical block = 8
-offset = 1
-```
-
-Run:
-
-```bash
-python examples/03_page_table_walkthrough.py
-python examples/04_compare_cache_waste.py
-```
-
-The reference implementation deliberately gathers paged K/V into a logical contiguous prefix before ordinary PyTorch attention. It is a correctness/learning path, not a fused CUDA/Triton kernel.
-
-## Reading order
-
-```text
-core/request.py
-  ↓
-core/work.py
-  ↓
-scheduler/static.py
-  ↓
-scheduler/continuous.py
-  ↓
-cache/contiguous.py
-  ↓
-cache/paged.py
-  ↓
-model/tiny_transformer.py
-  ↓
-core/engine.py
-```
-
-Next: checkout `v0.4` and read its `version.md` before implementing token-budget scheduling and chunked prefill.
+At branch creation this diff should be mostly planning/documentation. As v0.4 is implemented, keep each validated increment narrow and synchronize it to `main` according to `Agents.md`.
