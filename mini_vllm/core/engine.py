@@ -6,6 +6,7 @@ from mini_vllm.cache.base import KVCacheBackend
 from mini_vllm.config import EngineConfig
 from mini_vllm.core.request import Request, RequestStatus
 from mini_vllm.core.sampler import Sampler
+from mini_vllm.speculative.types import VerificationResult
 from mini_vllm.core.work import EngineStepOutput, ScheduleDecision, WorkItem, WorkTrace
 from mini_vllm.model.runner import ModelRunner
 from mini_vllm.scheduler.base import Scheduler, make_work_item
@@ -39,6 +40,7 @@ class Engine:
         self._requests: OrderedDict[str, Request] = OrderedDict()
         self._step = 0
         self._preemption_events = 0
+        self._step_speculation: list[VerificationResult] = []
 
     def _validate_cached_token_count(self, request: Request, cached_tokens: int) -> None:
         if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
@@ -101,8 +103,6 @@ class Engine:
         preempted_ids: list[str] = []
 
         for original_item in decision.work_items:
-            # A victim selected while processing an earlier WorkItem may still
-            # have an entry in this already-materialized scheduling decision.
             if original_item.request.status is RequestStatus.PREEMPTED:
                 continue
 
@@ -117,9 +117,6 @@ class Engine:
 
                 self._preempt(victim)
                 preempted_ids.append(victim.request_id)
-
-                # If the victim had already reserved work this step, discard
-                # that not-yet-executed WorkItem as well.  Its KV was released.
                 accepted = [
                     accepted_item
                     for accepted_item in accepted
@@ -131,10 +128,17 @@ class Engine:
         decision.work_items = accepted
         return decision, tuple(preempted_ids)
 
+    def _produce_output_tokens(self, request: Request, logits) -> tuple[int, ...]:
+        token_id = self.sampler.sample(logits, request.sampling_params)
+        request.append_output(token_id)
+        return (token_id,)
+
     def step(self) -> EngineStepOutput:
+        self._step_speculation = []
         decision, preempted_ids = self._fit_cache(self.scheduler.schedule())
         work_trace = tuple(WorkTrace.from_item(item) for item in decision.work_items)
         sampled: dict[str, int] = {}
+        committed_by_request: dict[str, tuple[int, ...]] = {}
         finished: list[str] = []
 
         if decision.work_items:
@@ -149,20 +153,20 @@ class Engine:
                 )
                 request.num_computed_tokens = item.end_pos
 
-                # Partial prefill and replay of historical output tokens both
-                # advance valid KV without producing a new logical output.
                 if not item.completes_current_sequence:
                     continue
 
-                token_id = self.sampler.sample(
-                    logits_by_request[item.request_id], request.sampling_params
+                committed = self._produce_output_tokens(
+                    request, logits_by_request[item.request_id]
                 )
-                request.append_output(token_id)
-                sampled[item.request_id] = token_id
+                if not committed:
+                    continue
+                committed_by_request[item.request_id] = committed
+                sampled[item.request_id] = committed[-1]
 
                 reached_eos = (
                     self.config.eos_token_id is not None
-                    and token_id == self.config.eos_token_id
+                    and self.config.eos_token_id in committed
                 )
                 reached_limit = len(request.output_token_ids) >= request.max_new_tokens
                 if reached_eos or reached_limit:
@@ -180,6 +184,8 @@ class Engine:
             cache_stats=self.cache.stats(),
             work=work_trace,
             preempted_request_ids=preempted_ids,
+            committed_token_ids=committed_by_request,
+            speculation=tuple(self._step_speculation),
         )
         self._step += 1
         return output

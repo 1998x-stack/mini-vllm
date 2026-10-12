@@ -104,7 +104,8 @@ Canonical sequence:
 - `v0.4` — token-budget scheduling + chunked prefill
 - `v0.5` — prefix caching + shared KV block ownership
 - `v0.6` — KV-pressure preemption + recomputation
-- `v0.7` — speculative decoding + cache transaction semantics (planned next step)
+- `v0.7` — speculative decoding + cache transaction semantics
+- `v0.8` — EngineCore / Executor / Worker split (planned next step)
 
 Every version branch must contain:
 
@@ -173,6 +174,7 @@ Examples:
 - Engine: cache is freed when a request finishes.
 - Preemption: discarded KV forces the computed-token frontier to roll back.
 - Replay: historical sampled tokens are recomputed without being sampled twice.
+- Speculation: rejected draft tokens disappear from logical history and KV visibility.
 
 ## Phase D — integrate
 
@@ -274,6 +276,7 @@ Avoid circular imports between scheduler, cache, model, and engine layers.
 - ModelRunner executes model work; it must not implement queue policy.
 - Sampler chooses tokens; it must not mutate scheduler internals.
 - Engine coordinates these components; it should not duplicate their algorithms.
+- DraftProvider proposes candidates only; it must not commit request history or mutate KV ownership.
 
 ## 7.3 Prefer conceptual vLLM compatibility
 
@@ -320,7 +323,11 @@ Finished requests must release cache ownership exactly once.
 
 ## 8.5 Semantic-equivalence invariant
 
-Changing KV storage layout must not change model semantics. Reference contiguous and paged paths should produce numerically equivalent logits within tolerance.
+Changing KV storage layout or adding speculative acceleration must not change deterministic target-model semantics.
+
+## 8.6 Transaction invariant
+
+Draft tokens are temporary proposals. Rejected speculative tokens must not remain in committed output history, the visible computed frontier, block-table ownership beyond the committed frontier, or future attention context.
 
 ---
 
@@ -404,7 +411,7 @@ feat(cache): add paged KV block pool
 feat(cache): expose logical-to-physical slot mapping
 test(cache): verify block recycling
 test(model): compare contiguous and paged logits
-docs: define v0.4 chunked-prefill scope
+feat(speculative): add checkpoint and rollback
 ```
 
 Do not mix unrelated mechanisms into a single opaque change.
@@ -431,7 +438,8 @@ Examples:
 
 - Python paged gather before Triton PagedAttention;
 - synchronous Engine before async/multiprocess execution;
-- simple FCFS/token budget before sophisticated priority/preemption.
+- simple FCFS/token budget before sophisticated priority/preemption;
+- scripted draft provider before a neural draft model.
 
 ---
 

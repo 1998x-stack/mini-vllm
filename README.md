@@ -2,20 +2,20 @@
 
 A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the systems ideas behind vLLM.
 
-## Current integrated version: v0.6
+## Current integrated version: v0.7
 
 ```text
-main  ─────────────────────────────────► newest validated state (v0.6)
-  │
+main  ─────────────────────────────────► newest validated state (v0.7)
   ├── v0.1  static batching + contiguous KV
   ├── v0.2  continuous batching
   ├── v0.3  paged KV + block tables
   ├── v0.4  token budget + chunked prefill
   ├── v0.5  prefix caching + shared KV ownership
-  └── v0.6  KV-pressure preemption + recomputation
+  ├── v0.6  KV-pressure preemption + recomputation
+  └── v0.7  speculative decoding + transactional KV
 ```
 
-Next: `v0.7` — speculative decoding with cache checkpoint / commit / rollback semantics.
+Next: `v0.8` — EngineCore / Executor / Worker separation.
 
 ## Version ladder
 
@@ -27,89 +27,95 @@ Next: `v0.7` — speculative decoding with cache checkpoint / commit / rollback 
 | `v0.4` | token budget + chunked prefill | how much token work runs per step? |
 | `v0.5` | prefix cache + refcounts | how can identical prefixes share immutable KV? |
 | `v0.6` | recompute preemption | what happens when active KV no longer fits? |
+| `v0.7` | speculative transaction | how can temporary draft state be verified and rolled back safely? |
 
 Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-## v0.6 mental model
+## v0.7 mental model
 
 ```text
-scheduled work
-     │
-     ▼
-reserve KV capacity
-     │
-     ├── success ─────────────► execute
-     │
-     └── failure
-           │
-           ▼
-      Scheduler chooses victim
-           │
-           ▼
-      release victim active KV
-           │
-           ▼
-      PREEMPTED
-  logical output history kept
-  computed frontier reset
-           │
-           ▼
-     later re-admission
-           │
-           ├── reuse valid cached prefix
-           └── replay remaining history
-           │
-           ▼
-        continue decode
+stable target state
+      │
+      ▼
+CacheCheckpoint
+      │
+      ▼
+DraftProvider
+      │ candidates
+      ▼
+target verification
+      │
+      ├── accept prefix ──► keep verified K/V
+      │
+      └── reject suffix ──► rollback private K/V
+      │
+      ▼
+commit logical outputs
 ```
 
 The central invariant is:
 
 ```text
-num_computed_tokens claims only KV state that still exists and is addressable.
+Draft tokens are temporary proposals until target verification commits them.
 ```
 
-### Replay does not resample history
+### Partial accept
 
-If a request already sampled output token `x` before preemption, `x` remains in `output_token_ids`.
-After KV is discarded, the runtime recomputes prompt + historical output tokens. `WorkItem.completes_current_sequence` prevents a new token from being sampled until replay reaches the end of the existing logical token history.
+```text
+draft:  [A B C]
+target: [A X ...]
 
-### Anti-thrashing rule
+accepted: [A]
+rejected: [B C]
+fallback: X
+```
 
-The reference scheduler chooses the most recently admitted eligible request as the victim, but a preempted request cannot immediately re-enter. It waits until at least one surviving request finishes. This deliberately simple rule prevents endless A/B ping-pong in a tiny KV pool and gives a bounded-workload fairness guarantee.
+Physical K/V for rejected positions is truncated. Logical output becomes `[A, X]`, while only `A` is already represented in KV.
+
+### Accept all
+
+```text
+draft: [A B C]
+all match target
+        │
+        ▼
+keep K/V(A,B,C)
+        +
+sample target bonus D
+```
+
+`D` remains the normal sampled-but-not-yet-computed token for the next decode step.
 
 ## Architecture
 
 ```text
-PreemptiveBudgetedScheduler
-        │ schedule
-        ▼
-      Engine
-        │ reserve KV
-        ▼
-PrefixCachingPagedKVCache
-        │
-        ├── success ─────────► ModelRunner
-        │
-        └── failure
+PreemptiveBudgetedScheduler        (unchanged v0.6 policy)
               │
               ▼
-       select_preemption_victim()
+      SpeculativeEngine
+              │
+      stable sampling frontier
+              ▼
+         DraftProvider
               │
               ▼
-       cache.free(victim)
-       victim.mark_preempted()
-       scheduler.on_request_preempted()
+TinyTransformerRunner.execute_speculative()
+              │
+              ▼
+TransactionalPrefixCachingPagedKVCache
+       │ checkpoint / rollback
+       ▼
+VerificationResult
 ```
 
-Policy and mechanism remain separate:
+Policy boundaries remain explicit:
 
 ```text
-Scheduler       chooses victim / admission / token budget
-KVCacheBackend  owns blocks, refcounts, prefix residency
-Engine          coordinates state transitions
-ModelRunner     executes token work
-Sampler         creates new logical output tokens
+Scheduler       admission / token budget / preemption victim
+DraftProvider   proposal only
+Target model    verification truth
+KV cache        transactional physical state
+Engine          logical commit coordination
 ```
 
 ## Install and verify
@@ -121,7 +127,7 @@ pip install -e '.[dev]'
 ./scripts/check.sh
 ```
 
-Current frozen v0.6 snapshot: **22 tests + 7 examples**.
+Current frozen v0.7 snapshot: **27 tests + 8 examples**.
 
 ## Learn through branch diffs
 
@@ -131,24 +137,26 @@ git diff v0.2..v0.3 -- mini_vllm/cache tests examples version.md
 git diff v0.3..v0.4 -- mini_vllm tests examples version.md
 git diff v0.4..v0.5 -- mini_vllm/cache mini_vllm/core tests examples version.md
 git diff v0.5..v0.6 -- mini_vllm tests examples version.md
+git diff v0.6..v0.7 -- mini_vllm tests examples version.md
 ```
 
-For v0.6, focus on:
+For v0.7, focus on:
 
 ```text
-mini_vllm/core/request.py
-mini_vllm/core/engine.py
-mini_vllm/scheduler/base.py
-mini_vllm/scheduler/preemptive.py
-mini_vllm/versions/v0_6/engine.py
-tests/test_preemption.py
-examples/07_preemption.py
+mini_vllm/cache/transactional.py
+mini_vllm/speculative/draft.py
+mini_vllm/speculative/types.py
+mini_vllm/speculative/engine.py
+mini_vllm/model/tiny_transformer.py
+mini_vllm/model/runner.py
+tests/test_speculative.py
+examples/08_speculative_decoding.py
 ```
 
 Run:
 
 ```bash
-python examples/07_preemption.py
+python examples/08_speculative_decoding.py
 ```
 
-Observe a request keep its logical output history while its active KV state is discarded and later reconstructed.
+Observe both `partial accept + rollback` and `accept all + bonus token`, then compare the final output with ordinary v0.6 greedy decoding.

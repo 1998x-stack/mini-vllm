@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from mini_vllm.core.request import Request
+from mini_vllm.speculative.types import VerificationResult
 
 WorkPhase = Literal["prefill", "decode"]
 
@@ -40,14 +41,6 @@ class WorkItem:
 
     @property
     def completes_current_sequence(self) -> bool:
-        """Whether logits from this work item may be sampled.
-
-        This also handles v0.6 replay correctly.  After preemption, historical
-        sampled output tokens remain in ``all_token_ids``.  Replaying them does
-        not sample again until execution reaches the end of that logical token
-        history.
-        """
-
         return self.end_pos == len(self.request.all_token_ids)
 
 
@@ -90,6 +83,8 @@ class EngineStepOutput:
     cache_stats: dict[str, int | float]
     work: tuple[WorkTrace, ...] = ()
     preempted_request_ids: tuple[str, ...] = ()
+    committed_token_ids: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    speculation: tuple[VerificationResult, ...] = ()
 
     @property
     def num_scheduled_tokens(self) -> int:

@@ -6,128 +6,95 @@
 0 <= num_computed_tokens <= len(prompt_token_ids + output_token_ids)
 ```
 
-Every position below `num_computed_tokens` must have valid, addressable K/V.
-A sampled output token remains logically known but physically uncomputed until a later forward pass consumes it.
+Every position below `num_computed_tokens` must have valid, addressable K/V. A sampled or bonus output token may be logically known while remaining physically uncomputed until a later forward pass consumes it.
 
-## v0.6 adds invalidation
-
-Before v0.6, computed state only moved forward. Preemption adds an explicit rollback of **physical execution state**:
+## Evolution through v0.7
 
 ```text
-logical token history: prompt + output_token_ids     preserved
-physical KV frontier: num_computed_tokens             rolled back
+v0.3  block-addressed KV
+v0.4  partial token work
+v0.5  immutable shared prefixes
+v0.6  invalidate/recompute whole active request state
+v0.7  checkpoint/rollback a temporary request-private suffix
 ```
 
-This distinction is what makes recomputation possible without changing generated output history.
+v0.6 rollback is coarse: preemption discards active execution state and later replays logical history. v0.7 rollback is fine-grained: a speculative transaction retains the verified prefix and removes only rejected temporary positions.
 
-## Pressure feedback path
-
-```text
-Scheduler.schedule()
-       │
-       ▼
-ScheduleDecision
-       │
-       ▼
-Engine asks cache.ensure_capacity()
-       │
-       ├── success -> WorkItem executes
-       │
-       └── failure
-             │
-             ▼
-Scheduler.select_preemption_victim(blocked_request)
-             │
-             ▼
-Engine releases victim active KV
-             │
-             ▼
-Request.mark_preempted()
-             │
-             ▼
-Scheduler.on_request_preempted()
-```
-
-The cache reports capacity failure but never decides which active request to sacrifice.
-
-## Victim policy
-
-The educational policy is deterministic:
-
-1. exclude the request whose allocation is currently blocked;
-2. among remaining active requests, choose the most recently admitted one;
-3. never choose finished/preempted requests.
-
-This is not claimed to be throughput-optimal. Its purpose is to make policy inspectable.
-
-## Anti-thrashing / fairness guard
-
-Immediately re-admitting a victim can produce:
+## Speculative execution path
 
 ```text
-A preempts B
-B immediately returns
-B preempts A
-A immediately returns
-...
-```
-
-v0.6 therefore records a resume barrier. A preempted request becomes eligible only after at least one request that remained active has finished. It is kept at the front of the waiting queue, so once eligible it resumes before later normal arrivals.
-
-For bounded workloads this provides a simple liveness story without introducing priorities or aging scores.
-
-## Recompute replay
-
-A victim keeps:
-
-```text
-prompt_token_ids
-output_token_ids
-sampling_params
-```
-
-but loses active KV and sets:
-
-```text
-num_computed_tokens = 0
-cache_rebuild_required = True
-```
-
-When re-admitted:
-
-```text
-cache.prepare_request()
-        │
-        ├── reattach still-resident immutable prefix blocks
-        └── return cached-token frontier
+normal scheduled WorkItem
         │
         ▼
-replay remaining prompt/history tokens
+reach sampling frontier
+        │
+        ▼
+DraftProvider.propose()
+        │
+        ▼
+reserve optional temporary KV
+        │
+        ▼
+cache.checkpoint()
+        │
+        ▼
+ModelRunner.execute_speculative()
+        │
+        ▼
+per-position target logits
+        │
+        ▼
+longest matching draft prefix
+        │
+   ┌────┴───────────────┐
+   ▼                    ▼
+accepted             rejected
+retain KV            rollback KV
+   │                    │
+   └─────────┬──────────┘
+             ▼
+commit accepted tokens + target fallback/bonus
 ```
 
-Historical output tokens are part of `all_token_ids`. During replay, they are fed through the model but are **not sampled again**. Sampling resumes only once execution catches up to the end of the existing logical history.
+## Why verification needs per-position logits
 
-## Prefix-cache compatibility
-
-Preemption calls the same `cache.free(request_id)` ownership path used by normal completion.
-For shared blocks:
+For draft `[d0, d1, d2]`, target verification uses shifted distributions:
 
 ```text
-A + B -> refcount 2
-preempt B -> refcount 1
-A still owns and reads exactly the same physical block
+stable logits          predict d0
+logits after d0        predict d1
+logits after d1        predict d2
+logits after d2        predict bonus
 ```
 
-Cached blocks with refcount 0 may remain resident or be evicted under pressure; active blocks referenced by another request remain protected.
+The normal v0.1-v0.6 runner only needs final logits. v0.7 adds a reference trace API that returns logits after every computed draft token while preserving the old final-logit path.
 
-## Why v0.6 uses recompute instead of swap
+## Cache checkpoint
 
-Recompute exposes the minimum required semantics:
+A checkpoint records:
 
 ```text
-invalidate physical state
-preserve logical history
-reconstruct state later
+request_id
+stable token frontier
+stable block-table identity
 ```
 
-Host/CPU KV swap adds another storage tier and transfer policy without teaching a more fundamental ownership rule, so it stays out of scope.
+Temporary speculative allocation may extend the block table, but rollback is append-only. It cannot cross the checkpoint token frontier and cannot free cached/shared blocks.
+
+## Shared-prefix safety
+
+```text
+[ immutable shared prefix ] [ request-private speculative tail ]
+             ▲                          ▲
+      outside transaction          may rollback
+```
+
+This is why v0.5 block ownership is a prerequisite for v0.7: transaction code can tell which state is legal to mutate.
+
+## Fallback and bonus semantics
+
+On mismatch, target fallback token is committed logically but not computed physically. When all draft candidates match, the logits after the final accepted candidate produce one target bonus token with the same pending-token behavior.
+
+## Scheduler remains unchanged
+
+The first v0.7 increment deliberately keeps `PreemptiveBudgetedScheduler` unchanged. Draft/verification cost is not yet part of the step token budget. Correct transaction semantics are the reference oracle; later versions may integrate speculative cost into policy.

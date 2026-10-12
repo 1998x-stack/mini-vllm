@@ -1,28 +1,19 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
+requires=["setuptools>=68","wheel"]
+build-backend="setuptools.build_meta"
 [project]
-name = "mini-vllm"
-version = "0.6.0"
-description = "A small, extensible, educational LLM serving runtime inspired by vLLM."
-readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [{name = "mini-vLLM contributors"}]
-dependencies = ["torch>=2.1"]
-
+name="mini-vllm"
+version="0.7.0"
+description="A small, extensible, educational LLM serving runtime inspired by vLLM."
+readme="README.md"
+requires-python=">=3.10"
+license={text="MIT"}
+dependencies=["torch>=2.1"]
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "ruff>=0.5"]
-
+dev=["pytest>=7.4","ruff>=0.5"]
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["mini_vllm*"]
-
+where=["."]
+include=["mini_vllm*"]
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
+testpaths=["tests"]
+addopts="-q"

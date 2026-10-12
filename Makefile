@@ -1,4 +1,4 @@
-.PHONY: test examples check
+.PHONY: test examples check example-v07
 
 test:
 	python -m pytest
@@ -11,6 +11,10 @@ examples:
 	python examples/05_chunked_prefill.py
 	python examples/06_prefix_caching.py
 	python examples/07_preemption.py
+	python examples/08_speculative_decoding.py
 
 check:
 	./scripts/check.sh
+
+example-v07:
+	PYTHONPATH=. python examples/08_speculative_decoding.py

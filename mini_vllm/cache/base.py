@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
+
+
+@dataclass(frozen=True, slots=True)
+class CacheCheckpoint:
+    """Stable request-local frontier before temporary KV mutation."""
+
+    request_id: str
+    num_tokens: int
+    block_table: tuple[int, ...]
 
 
 class KVCacheBackend(ABC):
@@ -36,6 +46,18 @@ class KVCacheBackend(ABC):
     ) -> None:
         """Publish cache metadata after a WorkItem has fully executed."""
         return None
+
+    def checkpoint(self, request_id: str, num_tokens: int) -> CacheCheckpoint:
+        """Capture a stable frontier before temporary/speculative writes."""
+        raise NotImplementedError(f"{type(self).__name__} does not support checkpoints")
+
+    def rollback(self, checkpoint: CacheCheckpoint, *, retain_tokens: int) -> None:
+        """Discard request-private KV beyond ``retain_tokens``."""
+        raise NotImplementedError(f"{type(self).__name__} does not support rollback")
+
+    def commit_checkpoint(self, checkpoint: CacheCheckpoint) -> None:
+        """Validate/close a successful transaction. Default backends reject it."""
+        raise NotImplementedError(f"{type(self).__name__} does not support checkpoints")
 
     @abstractmethod
     def ensure_capacity(self, request_id: str, total_tokens: int) -> bool:
