@@ -1,110 +1,133 @@
 # Architecture notes
 
-## Stable runtime invariant
+## Stable computed-token invariant
 
 ```text
 0 <= num_computed_tokens <= len(prompt_token_ids + output_token_ids)
 ```
 
-Every position below `num_computed_tokens` has materialized K/V. A sampled output token remains uncomputed until a later decode forward pass consumes it.
+Every position below `num_computed_tokens` must have valid, addressable K/V.
+A sampled output token remains logically known but physically uncomputed until a later forward pass consumes it.
 
-## v0.5 request admission
+## v0.6 adds invalidation
+
+Before v0.6, computed state only moved forward. Preemption adds an explicit rollback of **physical execution state**:
 
 ```text
-Engine.add_request(request)
+logical token history: prompt + output_token_ids     preserved
+physical KV frontier: num_computed_tokens             rolled back
+```
+
+This distinction is what makes recomputation possible without changing generated output history.
+
+## Pressure feedback path
+
+```text
+Scheduler.schedule()
+       │
+       ▼
+ScheduleDecision
+       │
+       ▼
+Engine asks cache.ensure_capacity()
+       │
+       ├── success -> WorkItem executes
+       │
+       └── failure
+             │
+             ▼
+Scheduler.select_preemption_victim(blocked_request)
+             │
+             ▼
+Engine releases victim active KV
+             │
+             ▼
+Request.mark_preempted()
+             │
+             ▼
+Scheduler.on_request_preempted()
+```
+
+The cache reports capacity failure but never decides which active request to sacrifice.
+
+## Victim policy
+
+The educational policy is deterministic:
+
+1. exclude the request whose allocation is currently blocked;
+2. among remaining active requests, choose the most recently admitted one;
+3. never choose finished/preempted requests.
+
+This is not claimed to be throughput-optimal. Its purpose is to make policy inspectable.
+
+## Anti-thrashing / fairness guard
+
+Immediately re-admitting a victim can produce:
+
+```text
+A preempts B
+B immediately returns
+B preempts A
+A immediately returns
+...
+```
+
+v0.6 therefore records a resume barrier. A preempted request becomes eligible only after at least one request that remained active has finished. It is kept at the front of the waiting queue, so once eligible it resumes before later normal arrivals.
+
+For bounded workloads this provides a simple liveness story without introducing priorities or aging scores.
+
+## Recompute replay
+
+A victim keeps:
+
+```text
+prompt_token_ids
+output_token_ids
+sampling_params
+```
+
+but loses active KV and sets:
+
+```text
+num_computed_tokens = 0
+cache_rebuild_required = True
+```
+
+When re-admitted:
+
+```text
+cache.prepare_request()
+        │
+        ├── reattach still-resident immutable prefix blocks
+        └── return cached-token frontier
         │
         ▼
-cache.prepare_request(prompt tokens)
-        │
-        ├── prefix miss -> 0 cached tokens
-        │
-        └── prefix hit  -> attach shared physical blocks
-                           increment active refcounts
-        │
-        ▼
-request.num_computed_tokens = cached_tokens
-        │
-        ▼
-Scheduler
+replay remaining prompt/history tokens
 ```
 
-Prefix caching therefore changes initial computed state without changing scheduler policy.
+Historical output tokens are part of `all_token_ids`. During replay, they are fed through the model but are **not sampled again**. Sampling resumes only once execution catches up to the end of the existing logical history.
 
-## Content-addressed full blocks
+## Prefix-cache compatibility
 
-For block size `B`, only complete prompt blocks are indexable.
-
-A block hash is chained:
+Preemption calls the same `cache.free(request_id)` ownership path used by normal completion.
+For shared blocks:
 
 ```text
-h0 = H(""  || tokens[0:B])
-h1 = H(h0  || tokens[B:2B])
-h2 = H(h1  || tokens[2B:3B])
+A + B -> refcount 2
+preempt B -> refcount 1
+A still owns and reads exactly the same physical block
 ```
 
-This makes the hash represent both local token content and prior prefix context.
+Cached blocks with refcount 0 may remain resident or be evicted under pressure; active blocks referenced by another request remain protected.
 
-## Ownership model
+## Why v0.6 uses recompute instead of swap
 
-Physical blocks have two independent concepts:
-
-1. **active refcount** — how many request block tables currently point to the block;
-2. **cache residency** — whether the prefix index retains the block for future reuse.
-
-Therefore:
+Recompute exposes the minimum required semantics:
 
 ```text
-refcount > 0, cached     active shared/resident block
-refcount = 0, cached     reusable resident block; eviction candidate
-refcount = 0, not cached free block
+invalidate physical state
+preserve logical history
+reconstruct state later
 ```
 
-## Immutable prefix / private tail
-
-```text
-logical blocks:   0       1       2
-                full    full    partial
-                  │       │       │
-                  ▼       ▼       ▼
-               shared  shared   private
-               cached  cached   writable
-```
-
-Appending a token never writes into a cached shared full block. The next logical block is private, which is the educational copy-on-append boundary.
-
-## Publishing a new block
-
-After a model WorkItem has executed all layers:
-
-```text
-ModelRunner.execute()
-        │
-        ▼
-cache.commit_work()
-        │
-        ├── incomplete prompt block -> remain private
-        │
-        └── completed full prompt block
-                │
-                ├── hash absent -> publish current physical block
-                └── hash exists -> switch block table to canonical block
-                                   release duplicate private block
-```
-
-Publishing after execution avoids exposing a block before all layers contain valid K/V.
-
-## Why exact full-prompt hits still compute
-
-K/V is sufficient for attention history but not for next-token sampling. The runtime needs logits from the final prompt position.
-
-v0.5 therefore never marks every prompt token as computed solely from prefix-cache lookup. Reuse remains block-granular and leaves final prompt work to execute.
-
-## Eviction vs preemption
-
-v0.5 may evict only:
-
-```text
-cached && refcount == 0
-```
-
-It never steals an actively referenced block. If all memory is actively owned, allocation fails. Deciding which runnable request should be preempted and recomputed is intentionally deferred to v0.6.
+Host/CPU KV swap adds another storage tier and transfer policy without teaching a more fundamental ownership rule, so it stays out of scope.

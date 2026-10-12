@@ -6,8 +6,8 @@ v0.2  continuous batching                            done
 v0.3  paged KV / block table / recycling             done
 v0.4  token budget / chunked prefill                  done
 v0.5  prefix caching / shared block ownership         done
-v0.6  KV-pressure preemption / recompute              next
-v0.7  speculative decoding
+v0.6  KV-pressure preemption / recompute              done
+v0.7  speculative decoding                           next
 v0.8  EngineCore / Executor / Worker boundary
 v0.9  distributed / tensor-parallel concepts
 v0.10 async streaming / cancellation

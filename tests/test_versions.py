@@ -5,6 +5,7 @@ from mini_vllm.cache.prefix import PrefixCachingPagedKVCache
 from mini_vllm.scheduler.continuous import ContinuousBatchScheduler
 from mini_vllm.scheduler.budgeted import BudgetedContinuousScheduler
 from mini_vllm.scheduler.static import StaticBatchScheduler
+from mini_vllm.scheduler.preemptive import PreemptiveBudgetedScheduler
 
 
 def configs():
@@ -30,6 +31,7 @@ def test_version_composition() -> None:
     v03 = create_engine("v0.3", engine_config=e, model_config=m, cache_config=c)
     v04 = create_engine("v0.4", engine_config=e, model_config=m, cache_config=c)
     v05 = create_engine("v0.5", engine_config=e, model_config=m, cache_config=c)
+    v06 = create_engine("v0.6", engine_config=e, model_config=m, cache_config=c)
 
     assert isinstance(v01.scheduler, StaticBatchScheduler)
     assert isinstance(v01.cache, ContiguousKVCache)
@@ -41,6 +43,8 @@ def test_version_composition() -> None:
     assert isinstance(v04.cache, PagedKVCache)
     assert isinstance(v05.scheduler, BudgetedContinuousScheduler)
     assert isinstance(v05.cache, PrefixCachingPagedKVCache)
+    assert isinstance(v06.scheduler, PreemptiveBudgetedScheduler)
+    assert isinstance(v06.cache, PrefixCachingPagedKVCache)
 
 
 def test_v03_end_to_end_finishes_and_frees_cache() -> None:

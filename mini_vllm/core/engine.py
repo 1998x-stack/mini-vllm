@@ -4,22 +4,20 @@ from collections import OrderedDict
 
 from mini_vllm.cache.base import KVCacheBackend
 from mini_vllm.config import EngineConfig
-from mini_vllm.core.request import Request
+from mini_vllm.core.request import Request, RequestStatus
 from mini_vllm.core.sampler import Sampler
 from mini_vllm.core.work import EngineStepOutput, ScheduleDecision, WorkItem, WorkTrace
 from mini_vllm.model.runner import ModelRunner
-from mini_vllm.scheduler.base import Scheduler
+from mini_vllm.scheduler.base import Scheduler, make_work_item
 
 
 class Engine:
-    """Small synchronous serving loop.
+    """Small synchronous serving loop with explicit scheduling/cache boundaries.
 
-    The important boundary is explicit:
-    scheduler -> cache capacity -> model runner -> sampler -> request update.
-
-    Since v0.4, a WorkItem may be only part of a prompt.  Computing a partial
-    prefill chunk advances KV state but must not sample a token until all tokens
-    that currently exist in that request have been computed.
+    v0.6 adds one policy feedback path: if KV reservation fails, the scheduler
+    may select another active request to preempt.  The Engine owns the state
+    transition because only it can coordinate Request + Scheduler + KV cache
+    without hiding policy inside the storage backend.
     """
 
     def __init__(
@@ -40,6 +38,11 @@ class Engine:
         self.version = version
         self._requests: OrderedDict[str, Request] = OrderedDict()
         self._step = 0
+        self._preemption_events = 0
+
+    def _validate_cached_token_count(self, request: Request, cached_tokens: int) -> None:
+        if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
+            raise RuntimeError("cache returned invalid cached-token count")
 
     def add_request(self, request: Request) -> None:
         if request.request_id in self._requests:
@@ -49,8 +52,7 @@ class Engine:
         cached_tokens = self.cache.prepare_request(
             request.request_id, request.prompt_token_ids
         )
-        if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
-            raise RuntimeError("cache returned invalid cached-token count")
+        self._validate_cached_token_count(request, cached_tokens)
         request.num_computed_tokens = cached_tokens
         self._requests[request.request_id] = request
         self.scheduler.add_request(request)
@@ -62,21 +64,75 @@ class Engine:
     def has_unfinished_requests(self) -> bool:
         return any(not request.finished for request in self._requests.values())
 
-    def _fit_cache(self, decision: ScheduleDecision) -> ScheduleDecision:
+    @property
+    def preemption_events(self) -> int:
+        return self._preemption_events
+
+    def _restore_replayed_item(self, item: WorkItem) -> WorkItem:
+        """Reattach any reusable prefix before replaying a preempted request.
+
+        The scheduler built ``item`` assuming replay starts at token 0.  Prefix
+        cache preparation may advance the valid KV frontier, so rebuild the item
+        with no more token work than the scheduler originally budgeted.
+        """
+
+        request = item.request
+        if not request.cache_rebuild_required:
+            return item
+
+        cached_tokens = self.cache.prepare_request(
+            request.request_id, request.prompt_token_ids
+        )
+        self._validate_cached_token_count(request, cached_tokens)
+        request.num_computed_tokens = cached_tokens
+        request.cache_rebuild_required = False
+        return make_work_item(request, max_tokens=item.num_tokens)
+
+    def _preempt(self, victim: Request) -> None:
+        self.cache.free(victim.request_id)
+        victim.mark_preempted()
+        self.scheduler.on_request_preempted(victim)
+        self._preemption_events += 1
+
+    def _fit_cache(
+        self, decision: ScheduleDecision
+    ) -> tuple[ScheduleDecision, tuple[str, ...]]:
         accepted: list[WorkItem] = []
-        for item in decision.work_items:
-            if self.cache.ensure_capacity(item.request_id, item.end_pos):
-                accepted.append(item)
-        if decision.work_items and not accepted:
-            raise RuntimeError(
-                "scheduled work cannot reserve KV capacity; "
-                "KV-pressure preemption is intentionally deferred to v0.6"
-            )
+        preempted_ids: list[str] = []
+
+        for original_item in decision.work_items:
+            # A victim selected while processing an earlier WorkItem may still
+            # have an entry in this already-materialized scheduling decision.
+            if original_item.request.status is RequestStatus.PREEMPTED:
+                continue
+
+            item = self._restore_replayed_item(original_item)
+            while not self.cache.ensure_capacity(item.request_id, item.end_pos):
+                victim = self.scheduler.select_preemption_victim(item.request)
+                if victim is None:
+                    raise RuntimeError(
+                        f"request {item.request_id!r} cannot reserve KV capacity "
+                        "and no eligible preemption victim exists"
+                    )
+
+                self._preempt(victim)
+                preempted_ids.append(victim.request_id)
+
+                # If the victim had already reserved work this step, discard
+                # that not-yet-executed WorkItem as well.  Its KV was released.
+                accepted = [
+                    accepted_item
+                    for accepted_item in accepted
+                    if accepted_item.request_id != victim.request_id
+                ]
+
+            accepted.append(item)
+
         decision.work_items = accepted
-        return decision
+        return decision, tuple(preempted_ids)
 
     def step(self) -> EngineStepOutput:
-        decision = self._fit_cache(self.scheduler.schedule())
+        decision, preempted_ids = self._fit_cache(self.scheduler.schedule())
         work_trace = tuple(WorkTrace.from_item(item) for item in decision.work_items)
         sampled: dict[str, int] = {}
         finished: list[str] = []
@@ -93,8 +149,8 @@ class Engine:
                 )
                 request.num_computed_tokens = item.end_pos
 
-                # A partial prompt chunk has useful KV side effects, but its
-                # final-token logits are not yet the model's next-token answer.
+                # Partial prefill and replay of historical output tokens both
+                # advance valid KV without producing a new logical output.
                 if not item.completes_current_sequence:
                     continue
 
@@ -123,6 +179,7 @@ class Engine:
             finished_request_ids=tuple(finished),
             cache_stats=self.cache.stats(),
             work=work_trace,
+            preempted_request_ids=preempted_ids,
         )
         self._step += 1
         return output

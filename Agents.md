@@ -103,7 +103,8 @@ Canonical sequence:
 - `v0.3` — paged KV cache + block table + block recycling
 - `v0.4` — token-budget scheduling + chunked prefill
 - `v0.5` — prefix caching + shared KV block ownership
-- `v0.6` — KV-pressure preemption (planned next step)
+- `v0.6` — KV-pressure preemption + recomputation
+- `v0.7` — speculative decoding + cache transaction semantics (planned next step)
 
 Every version branch must contain:
 
@@ -170,6 +171,8 @@ Examples:
 - Block allocator: blocks are recycled after request completion.
 - Model/cache equivalence: contiguous and paged storage produce equal logits.
 - Engine: cache is freed when a request finishes.
+- Preemption: discarded KV forces the computed-token frontier to roll back.
+- Replay: historical sampled tokens are recomputed without being sampled twice.
 
 ## Phase D — integrate
 

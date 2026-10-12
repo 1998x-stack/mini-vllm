@@ -296,19 +296,44 @@ A shared block must never be mutated through one request's append path.
 
 ---
 
-## v0.6 — Preemption and memory-pressure policy
+## v0.6 — Preemption and memory-pressure policy ✅ completed
 
 ### Primary question
 
 > What happens when runnable requests need more KV blocks than the physical pool can provide?
 
-### Required mechanisms
+### Implemented mechanisms
 
-- scheduler-visible allocation failure
-- preemption policy
-- recompute-based preemption first
-- request state transition back to waiting/preempted
-- fairness/starvation tests
+- cache allocation failure remains explicit through `ensure_capacity(...) -> bool`;
+- `RequestStatus.PREEMPTED`;
+- deterministic latest-admitted victim selection;
+- Engine-coordinated active-KV release;
+- computed-token rollback while preserving logical output history;
+- prefix-cache reattachment before replay;
+- replay of historical prompt/output tokens without duplicate sampling;
+- anti-thrashing resume barrier: a victim waits for one survivor completion;
+- per-step `preempted_request_ids` trace metadata;
+- deterministic equivalence tests against a roomy non-preempted run.
+
+### Critical invariants
+
+```text
+valid computed-token claim <=> corresponding KV is still addressable
+logical output history survives physical KV invalidation
+shared prefix refcounts protect other active owners
+```
+
+### Definition of Done evidence
+
+- pressure can preempt an active request and free enough blocks for another request;
+- preempted requests later re-enter and finish;
+- replay does not resample already-known output tokens;
+- shared prefix K/V remains byte-identical when another owner is preempted;
+- victim selection and anti-thrashing behavior are unit tested;
+- impossible single-request allocation fails explicitly rather than silently dropping work;
+- pressured and non-pressured deterministic executions produce equal output histories.
+
+**Status:** implemented and validated in the frozen `v0.6` snapshot. `main` integrates this version.
 
 Optional later experiment: host swap. Do not introduce swap before recompute semantics are explicit.
 

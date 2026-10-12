@@ -10,6 +10,7 @@ examples:
 	python examples/04_compare_cache_waste.py
 	python examples/05_chunked_prefill.py
 	python examples/06_prefix_caching.py
+	python examples/07_preemption.py
 
 check:
 	./scripts/check.sh

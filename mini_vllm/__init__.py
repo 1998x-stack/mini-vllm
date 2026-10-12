@@ -14,4 +14,4 @@ __all__ = [
     "create_engine",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

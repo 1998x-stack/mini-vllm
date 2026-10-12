@@ -10,12 +10,7 @@ WorkPhase = Literal["prefill", "decode"]
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
-    """A contiguous slice of tokens to compute for one request.
-
-    `WorkItem` deliberately does not mean "one whole request step". Since
-    v0.4 a prompt can be split across many work items, while decode still
-    naturally contributes a one-token work item.
-    """
+    """A contiguous slice of tokens to compute for one request."""
 
     request: Request
     token_ids: tuple[int, ...]
@@ -47,9 +42,10 @@ class WorkItem:
     def completes_current_sequence(self) -> bool:
         """Whether logits from this work item may be sampled.
 
-        A partial prefill chunk produces valid KV but must not produce an output
-        token yet. Final prefill chunks and decode work finish all tokens that
-        currently exist in the request and therefore may sample the next token.
+        This also handles v0.6 replay correctly.  After preemption, historical
+        sampled output tokens remain in ``all_token_ids``.  Replaying them does
+        not sample again until execution reaches the end of that logical token
+        history.
         """
 
         return self.end_pos == len(self.request.all_token_ids)
@@ -64,7 +60,7 @@ class WorkTrace:
     num_tokens: int
 
     @classmethod
-    def from_item(cls, item: WorkItem) -> "WorkTrace":
+    def from_item(cls, item: WorkItem) -> WorkTrace:
         return cls(
             request_id=item.request_id,
             phase=item.phase,
@@ -93,6 +89,7 @@ class EngineStepOutput:
     finished_request_ids: tuple[str, ...]
     cache_stats: dict[str, int | float]
     work: tuple[WorkTrace, ...] = ()
+    preempted_request_ids: tuple[str, ...] = ()
 
     @property
     def num_scheduled_tokens(self) -> int:

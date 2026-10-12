@@ -1,171 +1,340 @@
-# mini-vLLM v0.6 — KV-pressure preemption (planning branch)
+# mini-vLLM v0.6 — KV-pressure preemption + recomputation
 
 ## 1. Version identity
 
 - **Branch:** `v0.6`
-- **Base:** latest validated `v0.5` / `main`
 - **Previous version:** `v0.5`
-- **Theme:** scheduler-visible KV allocation failure and recompute-based preemption
-- **Status:** planning / implementation target; runtime still behaves as v0.5 until acceptance criteria pass
+- **Theme:** scheduler-visible KV pressure, active-request preemption, and deterministic replay
+- **Status:** frozen historical learning snapshot after validation
+
+v0.6 keeps v0.5 prefix caching and v0.4 token-budget scheduling, but closes the first serious resource-pressure loop:
+
+```text
+scheduled request needs KV
+        │
+        ▼
+allocation fails
+        │
+        ▼
+scheduler chooses victim
+        │
+        ▼
+release victim active KV
+        │
+        ▼
+rollback physical execution frontier
+        │
+        ▼
+resume later by recomputation
+```
+
+---
 
 ## 2. Why v0.6 follows v0.5
 
-v0.3 introduced a finite physical KV block pool. v0.5 added prefix-cache residency and shared ownership. Memory pressure can now occur even when the scheduler still has runnable work.
-
-The missing contract is:
-
-> What should the runtime do when a scheduled request cannot reserve the KV blocks it needs?
-
-v0.5 deliberately stops at allocation failure. v0.6 moves that failure into scheduling policy and teaches **preemption by recomputation** before considering host swap.
-
-## 3. Primary mental model
+v0.3 made the KV pool finite. v0.5 added resident cached blocks and shared ownership. Once active requests and cached prefixes compete for a bounded physical pool, an allocator can legitimately say:
 
 ```text
-scheduled work
-     │
-     ▼
-reserve KV capacity
-     │
-     ├── success ─────────────► execute
-     │
-     └── failure
-           │
-           ▼
-      choose victim
-           │
-           ▼
-      release victim KV
-           │
-           ▼
- victim becomes PREEMPTED/WAITING
- num_computed_tokens rolls back
-           │
-           ▼
- later recompute prompt/output history
+no evictable free/cached block remains
 ```
 
-The key trade-off is explicit:
+v0.5 stops there. v0.6 answers the next systems question:
+
+> Which active request should lose its execution state, and how can it later continue without changing logical generation semantics?
+
+---
+
+## 3. Core distinction: logical history vs physical state
+
+A request owns two kinds of state:
 
 ```text
-memory capacity  ↔  recomputation cost  ↔  fairness/latency
+logical history
+  prompt_token_ids
+  output_token_ids
+
+physical execution state
+  num_computed_tokens
+  active KV block references
 ```
 
-## 4. Required delta from v0.5
-
-### 4.1 Request lifecycle
-
-Add an explicit preempted state or equivalent transition so a request can be runnable again after its active KV ownership is released.
-
-A first reference lifecycle may be:
+Preemption discards the second category, not the first.
 
 ```text
-WAITING -> RUNNING -> PREEMPTED -> WAITING/RUNNING -> FINISHED
+before preemption
+prompt = [p0 p1 p2]
+output = [o0]
+num_computed_tokens = 4
+KV exists for p0 p1 p2 o0
+
+preempt
+prompt = [p0 p1 p2]       preserved
+output = [o0]              preserved
+num_computed_tokens = 0    rolled back
+active KV = none           released
 ```
 
-### 4.2 Cache contract
+Later replay reconstructs the physical state from the preserved logical history.
 
-The scheduler/engine must be able to distinguish:
+---
 
-- capacity available;
-- capacity unavailable after evicting unreferenced prefix-cache blocks.
+## 4. Request lifecycle delta
 
-Do not let the cache choose which active request to sacrifice. Victim choice is scheduling policy.
-
-### 4.3 Recompute preemption
-
-First implementation should release a victim's active KV and later reconstruct its model state by recomputing known token history.
-
-Do **not** add CPU swap yet.
-
-### 4.4 Victim policy
-
-Start with one deterministic policy that is easy to inspect, for example:
-
-- prefer preempting the most recently admitted eligible request;
-- never preempt a finished request;
-- avoid preempting the request currently being committed;
-- document tie-breaking explicitly.
-
-The exact production-optimal policy is not the learning goal.
-
-### 4.5 Fairness
-
-A preempted request must not starve forever. Track enough metadata to test that repeatedly preempted requests eventually make progress under a bounded workload.
-
-### 4.6 Prefix-cache compatibility
-
-Preemption must release **active request references** without corrupting shared immutable prefix blocks. Cached blocks with other owners or prefix-index residency must remain valid.
-
-## 5. Critical invariants
-
-### Ownership invariant
-
-After preemption, the victim must own no private active KV blocks from the discarded execution state.
-
-### Computed-token invariant
-
-If KV state is discarded, `num_computed_tokens` must roll back to the amount of state that remains valid and addressable. It may not claim tokens are computed when their KV was released.
-
-### Shared-prefix invariant
-
-Preempting one request must not mutate or free a shared block still referenced by another request.
-
-### Replay invariant
-
-Recomputation of a preempted request under deterministic sampling must produce the same subsequent token history as an equivalent non-preempted execution.
-
-## 6. Acceptance criteria
-
-v0.6 cannot be frozen until:
-
-- [ ] KV allocation failure is exposed to scheduling/engine policy rather than silently dropping work;
-- [ ] at least one request can be preempted to free active KV capacity;
-- [ ] preemption releases private active blocks without corrupting shared prefix blocks;
-- [ ] `num_computed_tokens` is rolled back consistently with retained KV state;
-- [ ] the request later resumes through recomputation and finishes;
-- [ ] deterministic preempted and non-preempted execution produce equivalent output tokens;
-- [ ] victim selection is deterministic and tested;
-- [ ] starvation/fairness behavior has an explicit test;
-- [ ] v0.1-v0.5 regression tests continue to pass;
-- [ ] an executable timeline example makes pressure -> preempt -> recompute visible;
-- [ ] validated implementation is synchronized to `main`.
-
-## 7. Preferred architecture
-
-Do not hide preemption inside `PrefixCachingPagedKVCache`.
-
-Preferred direction:
+v0.6 adds:
 
 ```text
-Scheduler / Engine policy
-        │
-        ├── schedule work
+WAITING
+   │
+   ▼
+RUNNING
+   │
+   ├──────────────► FINISHED
+   │
+   │ KV pressure
+   ▼
+PREEMPTED
+   │
+   │ later eligible
+   ▼
+RUNNING
+```
+
+`Request.mark_preempted()`:
+
+- preserves `prompt_token_ids`;
+- preserves `output_token_ids`;
+- sets `num_computed_tokens = 0`;
+- increments `preemption_count`;
+- marks that cache state must be reconstructed.
+
+---
+
+## 5. Scheduler policy
+
+`PreemptiveBudgetedScheduler` extends the v0.4 token-budget scheduler.
+
+Victim selection is intentionally simple:
+
+1. the blocked request cannot be its own victim;
+2. only currently `RUNNING` requests are eligible;
+3. choose the **most recently admitted** eligible request.
+
+This is deterministic and easy to inspect. It is not presented as production-optimal.
+
+### Anti-thrashing fairness rule
+
+Without a resume guard, two requests can do this forever:
+
+```text
+A blocks -> preempt B
+next step B returns
+B blocks -> preempt A
+next step A returns
+...
+```
+
+Therefore a preempted request is kept at the front of the waiting queue but remains ineligible until at least one request that survived the preemption has finished.
+
+For bounded workloads this creates a simple liveness guarantee while keeping the policy small.
+
+---
+
+## 6. Engine pressure path
+
+The cache still owns storage only. It never chooses a victim.
+
+```text
+ScheduleDecision
+      │
+      ▼
+Engine._fit_cache()
+      │
+      ├── ensure_capacity() succeeds
+      │         │
+      │         ▼
+      │      execute
+      │
+      └── ensure_capacity() fails
+                │
+                ▼
+     scheduler.select_preemption_victim()
+                │
+                ▼
+          cache.free(victim)
+                │
+                ▼
+          victim.mark_preempted()
+                │
+                ▼
+     scheduler.on_request_preempted()
+                │
+                ▼
+          retry reservation
+```
+
+If no eligible victim exists, allocation failure is explicit.
+
+---
+
+## 7. Replay semantics
+
+A sampled output token is logical history even after its KV disappears.
+
+Suppose:
+
+```text
+prompt = [p0 p1 p2]
+output = [o0]
+```
+
+After preemption the runtime may execute:
+
+```text
+recompute p0 p1 p2
+recompute historical o0
         │
         ▼
-KV capacity reservation
-        │
-        ├── success -> execute
-        │
-        └── failure -> PreemptionDecision
-                           │
-                           ▼
-                    release victim state
-                           │
-                           ▼
-                    reschedule/recompute
+only now sample o1
 ```
 
-Potential new concepts should remain small and explicit, e.g. `PreemptionDecision`, `preempt(request)`, or a scheduler callback for allocation pressure.
+The existing `WorkItem.completes_current_sequence` rule naturally prevents duplicate sampling: while replay is still behind `len(prompt + output)`, model execution only rebuilds KV.
 
-## 8. Explicit non-goals
+---
 
-- host/CPU KV swap;
-- speculative decoding — `v0.7`;
-- multiprocess Executor/Worker split — `v0.8`;
-- sophisticated priority scheduling;
+## 8. Prefix-cache compatibility
+
+When a preempted request returns, Engine calls `cache.prepare_request(...)` before replay.
+
+Therefore some physical state may be restored immediately:
+
+```text
+released active request KV
+        │
+        ▼
+shared/cache-resident immutable prefix still exists
+        │
+        ▼
+reattach cached full blocks
+        │
+        ▼
+recompute only the missing suffix/history
+```
+
+Preempting B does not invalidate A's reference to a shared prefix block:
+
+```text
+A + B: refcount = 2
+preempt B
+A only: refcount = 1
+```
+
+---
+
+## 9. Trace additions
+
+`EngineStepOutput` adds:
+
+```python
+preempted_request_ids: tuple[str, ...]
+```
+
+Requests expose:
+
+```python
+preemption_count
+```
+
+This makes pressure behavior visible without inspecting private scheduler state.
+
+---
+
+## 10. Important source files
+
+```text
+mini_vllm/core/request.py
+        ↓
+mini_vllm/scheduler/base.py
+        ↓
+mini_vllm/scheduler/preemptive.py
+        ↓
+mini_vllm/core/engine.py
+        ↓
+mini_vllm/versions/v0_6/engine.py
+        ↓
+tests/test_preemption.py
+        ↓
+examples/07_preemption.py
+```
+
+Recommended comparison:
+
+```bash
+git diff v0.5..v0.6 -- mini_vllm tests examples version.md
+```
+
+---
+
+## 11. Tests and validation
+
+v0.6 validates:
+
+- deterministic latest-admitted victim selection;
+- a victim is not immediately re-admitted before a survivor completes;
+- active KV ownership is released on preemption;
+- `num_computed_tokens` rolls back to match discarded state;
+- logical output tokens survive preemption;
+- replay later catches up and finishes;
+- pressured and roomy deterministic runs generate identical output histories;
+- preempting one shared-prefix owner does not mutate the other owner's K/V;
+- impossible allocation with no eligible victim raises explicitly;
+- all v0.1-v0.5 regressions continue to pass.
+
+The frozen local snapshot passes **22 tests** plus all seven executable examples.
+
+---
+
+## 12. Learning goals
+
+After v0.6, the learner should be able to explain:
+
+- why allocation failure belongs in the scheduler/engine feedback loop;
+- why the cache must not secretly choose an active victim;
+- the difference between logical token history and physical KV state;
+- why `num_computed_tokens` must roll back after state invalidation;
+- how historical sampled tokens can be replayed without being sampled twice;
+- how prefix caching reduces recomputation after preemption;
+- how naive immediate resume can cause preemption thrashing;
+- why recompute preemption is conceptually simpler than KV swap.
+
+---
+
+## 13. Explicit non-goals
+
+- CPU/host KV swap;
+- sophisticated priority/aging policy;
 - production admission control;
-- CUDA/Triton kernels.
+- speculative decoding;
+- multiprocess Executor / Worker split;
+- distributed execution;
+- CUDA/Triton PagedAttention.
 
-## 9. Next version
+---
 
-`v0.7` introduces **speculative decoding** with cache checkpoints and commit/rollback semantics. v0.6 is a prerequisite because it makes KV state invalidation and reconstruction explicit before speculative tokens become transactional.
+## 14. Next version
+
+`v0.7` introduces **speculative decoding** and makes KV mutation transactional:
+
+```text
+checkpoint
+   ↓
+draft tokens
+   ↓
+target verification
+   ↓
+accept prefix
+rollback rejected suffix
+   ↓
+commit
+```
+
+v0.6 is the prerequisite because it already establishes explicit KV invalidation and reconstruction semantics.
