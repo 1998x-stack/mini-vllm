@@ -1,70 +1,133 @@
-# mini-vLLM v0.4 — planning branch
+# mini-vLLM
 
-This branch is the **next learning milestone**, not a fake completed release.
+A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the systems ideas behind vLLM.
 
-The runtime code intentionally remains equivalent to the validated v0.3 implementation until the v0.4 acceptance criteria are implemented and tested.
+The project favors explicit mechanisms over production throughput. Each historical branch introduces one serving mental model and keeps earlier branches small enough to diff and understand.
 
-Before changing code, read in this order:
-
-1. `Agents.md`
-2. `version.md`
-3. `Plan.md`
-4. `mini_vllm/core/work.py`
-5. `mini_vllm/scheduler/`
-6. `mini_vllm/cache/paged.py`
-7. relevant tests
-
-## Primary question
-
-> Once continuous batching and paged KV already exist, how should the scheduler bound **token work per engine step**, rather than only the number of active sequences?
-
-Target mental model:
+## Current integrated version: v0.4
 
 ```text
-max_num_batched_tokens = step token budget
-
-step:
-  decode A       = 1 token
-  prefill B      = 64-token chunk
-  prefill C      = 31-token chunk
-                  --------
-  scheduled       96 tokens <= budget
+main  ─────────────────────────────────► newest validated state (v0.4)
+  │
+  ├── v0.1  static batching + contiguous KV
+  ├── v0.2  continuous batching
+  ├── v0.3  paged KV + block table + recycling
+  └── v0.4  token budget + chunked prefill
 ```
 
-This enables **chunked prefill**: a long prompt no longer has to monopolize one whole engine step.
+The next planned version is `v0.5`: prefix caching and shared block ownership.
 
-## Planned v0.4 delta
+## Version ladder
 
-- `max_num_batched_tokens`
-- budget-aware scheduler
-- prompt chunks represented as `WorkItem`s
-- partial prefill across multiple steps
-- compatibility with incremental paged-KV growth
-- decode/prefill interleaving experiments
-- token-budget invariant tests
-- TTFT / ITL educational step metrics
+| Branch | Scheduler | KV cache | Primary lesson |
+|---|---|---|---|
+| `v0.1` | Static cohort | Contiguous request slab | Minimal serving loop and head-of-line waste |
+| `v0.2` | Continuous batching | Contiguous request slab | Refill sequence slots every step |
+| `v0.3` | Continuous batching | Paged block pool | Logical/physical KV addressing and recycling |
+| `v0.4` | Token-budget continuous | Paged block pool | Chunked prefill and mixed prefill/decode |
+| `v0.5` | planned | shared paged blocks | Prefix reuse, refcounts and immutable shared KV |
 
-## Acceptance criteria
+Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-- every schedule satisfies `sum(work_item.num_tokens) <= max_num_batched_tokens`;
-- long prompts can span multiple engine steps;
-- decode requests can make progress while another request is still prefilling;
-- chunked and unchunked reference execution agree numerically for the same token history;
-- tests and examples make the scheduling timeline visible;
-- validated implementation is synchronized back to `main` before v0.4 is frozen.
+## v0.4 mental model
 
-## Explicit non-goals
+`max_num_seqs` answers: **How many requests may be active?**
 
-- prefix caching (`v0.5`)
-- memory-pressure preemption (`v0.6`)
-- speculative decoding (`v0.7`)
-- EngineCore / Executor / Worker split (`v0.8`)
-- Triton/CUDA PagedAttention (`v0.12`)
+`max_num_batched_tokens` answers: **How many tokens of model work may this engine step execute?**
 
-## Compare with v0.3
+The v0.4 reference scheduler is decode-first:
+
+```text
+step budget = 8
+
+A decode          1
+B decode          1
+C prefill chunk   6
+                 ---
+total             8
+```
+
+A long prompt is no longer atomic:
+
+```text
+prompt: 10 tokens
+budget: 4
+
+step 0: prefill [0:4]   no sample
+step 1: prefill [4:8]   no sample
+step 2: prefill [8:10]  sample first output
+step 3: decode 1 token  sample next output
+```
+
+The critical rule is:
+
+> **computing a partial prefill chunk grows KV state but does not produce a user-visible output token.**
+
+## Core runtime
+
+```text
+Request
+   │
+   ▼
+BudgetedContinuousScheduler
+   │  ScheduleDecision[WorkItem]
+   ▼
+PagedKVCache.ensure_capacity(end_pos)
+   │
+   ▼
+ModelRunner.execute(chunk)
+   │
+   ├── partial prefill ──► update computed-token state only
+   │
+   └── sequence caught up ──► Sampler ──► append output token
+```
+
+## Install and verify
 
 ```bash
-git diff v0.3..v0.4
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+./scripts/check.sh
 ```
 
-At branch creation this diff should be mostly planning/documentation. As v0.4 is implemented, keep each validated increment narrow and synchronize it to `main` according to `Agents.md`.
+## Learn through branch diffs
+
+```bash
+git diff v0.1..v0.2 -- mini_vllm/scheduler tests examples version.md
+git diff v0.2..v0.3 -- mini_vllm/cache mini_vllm/versions tests examples version.md
+git diff v0.3..v0.4 -- mini_vllm tests examples version.md
+```
+
+Focus on these files for v0.4:
+
+```text
+mini_vllm/config.py
+mini_vllm/core/work.py
+mini_vllm/scheduler/base.py
+mini_vllm/scheduler/budgeted.py
+mini_vllm/core/engine.py
+examples/05_chunked_prefill.py
+```
+
+Run the timeline:
+
+```bash
+python examples/05_chunked_prefill.py
+```
+
+## Next: v0.5
+
+`v0.5` will introduce a readable reference design for prefix caching:
+
+```text
+block hash
+   ↓
+prefix index
+   ↓
+shared full blocks
+   ↓
+reference counts
+   ↓
+immutable shared prefix / mutable request tail
+```

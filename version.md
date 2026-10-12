@@ -1,201 +1,163 @@
-# mini-vLLM v0.4 — active planning branch
+# mini-vLLM v0.4 — token-budget scheduling + chunked prefill
 
 ## 1. Version identity
 
 - **Branch:** `v0.4`
-- **Base:** latest validated `v0.3` / `main`
 - **Previous version:** `v0.3`
 - **Theme:** token-budget scheduling and chunked prefill
-- **Status:** planning / implementation target; not yet released
+- **Status:** frozen historical learning snapshot after validation
 
-The v0.4 branch starts from the complete v0.3 runtime. Until the mechanisms below pass their acceptance criteria, the executable serving behavior intentionally remains v0.3 behavior.
-
----
-
-## 2. Why v0.4 follows v0.3
-
-v0.2 teaches that active **sequence slots** can be refilled continuously.
-
-v0.3 teaches that KV memory can grow in fixed-size physical blocks.
-
-Those mechanisms expose the next bottleneck: sequence count alone does not describe the amount of work scheduled in one iteration.
-
-For example:
+v0.4 changes the scheduling unit from only **sequence slots** to explicit **token work per engine step**.
 
 ```text
-Request A: decode 1 token
-Request B: prefill 2,000 tokens
+v0.3
+max_num_seqs
+     ↓
+which requests run?
+
+v0.4
+max_num_seqs + max_num_batched_tokens
+     ↓                    ↓
+which requests?      how much token work?
 ```
 
-Both consume one sequence slot, but their compute cost and latency impact are radically different.
+## 2. Why this version follows v0.3
 
-v0.4 therefore changes the scheduling unit from:
+v0.2 made sequence slots refillable. v0.3 made KV growth incremental through physical blocks. The next hidden bottleneck is that two admitted requests can represent radically different work:
 
 ```text
-"How many requests fit?"
+A: decode 1 token
+B: prefill 2,000 tokens
 ```
 
-toward:
+A sequence-count limit cannot express this difference. v0.4 introduces a per-step token budget and makes long prompt prefill interruptible across engine steps.
+
+## 3. Core mechanism
+
+The reference scheduling policy is intentionally simple and deterministic:
+
+1. remove finished requests;
+2. admit waiting requests until `max_num_seqs` is full;
+3. schedule decode requests first, one token each;
+4. spend remaining token budget on prefill requests in FCFS order;
+5. truncate a prefill work item at the remaining budget boundary.
+
+The invariant is:
 
 ```text
-"How many tokens of useful model work fit in this engine step?"
+sum(work_item.num_tokens) <= max_num_batched_tokens
 ```
 
----
+## 4. Critical semantic change: compute is not sample
 
-## 3. Primary mental model
+A partial prefill chunk writes valid K/V, but it must **not** sample an output token.
 
 ```text
-step token budget = max_num_batched_tokens
+prompt = [t0 t1 t2 t3 t4]
+budget = 2
 
-running/waiting requests
-          │
-          ▼
- budget-aware scheduler
-          │
-   ┌──────┼──────────────┐
-   ▼      ▼              ▼
-decode  prefill chunk  prefill chunk
-  1        64              31
-   └──────┴──────────────┘
-             │
-             ▼
-      total = 96 <= budget
+step 0: compute [t0 t1]       -> KV grows, no sample
+step 1: compute [t2 t3]       -> KV grows, no sample
+step 2: compute [t4]          -> prompt complete, sample first output
+step 3: compute sampled token -> decode, sample next output
 ```
 
-A long prompt becomes a sequence of schedulable chunks rather than an all-or-nothing prefill operation.
+`WorkItem.completes_current_sequence` makes this boundary explicit. A sampled output token is not counted as computed until a later decode forward pass consumes it.
 
----
+## 5. Main implementation delta from v0.3
 
-## 4. Required delta from v0.3
+### Configuration
 
-### 4.1 Configuration
+`EngineConfig` adds:
 
-Add an explicit serving token budget, conceptually:
+```python
+max_num_batched_tokens: int = 16
+```
+
+### Scheduler/work contract
+
+- `make_work_item(..., max_tokens=N)` creates an arbitrary contiguous prompt chunk.
+- `BudgetedContinuousScheduler` owns token-budget policy.
+- `WorkItem.phase` distinguishes `prefill` and `decode` for traces.
+- `EngineStepOutput` exposes scheduled-token, prefill-token and decode-token counts.
+
+### Engine
+
+The Engine samples only if a `WorkItem` computed every token that currently exists for that request.
+
+### KV cache
+
+`PagedKVCache` remains storage, not scheduling policy. Each chunk calls `ensure_capacity(request_id, chunk_end_pos)`, so block allocation grows incrementally.
+
+## 6. Important source files
 
 ```text
-max_num_batched_tokens
+mini_vllm/config.py
+        ↓
+mini_vllm/core/work.py
+        ↓
+mini_vllm/scheduler/base.py
+        ↓
+mini_vllm/scheduler/budgeted.py
+        ↓
+mini_vllm/core/engine.py
+        ↓
+mini_vllm/versions/v0_4/engine.py
+        ↓
+examples/05_chunked_prefill.py
 ```
 
-Do not smuggle this policy into the model or KV backend.
+Compare directly:
 
-### 4.2 Work representation
-
-`WorkItem` must be able to represent an arbitrary contiguous range of uncomputed prompt tokens rather than assuming prefill means "all remaining prompt tokens".
-
-The invariant remains:
-
-```text
-start_pos == request.num_computed_tokens
-end_pos   == start_pos + num_tokens
+```bash
+git diff v0.3..v0.4 -- mini_vllm tests examples version.md
 ```
 
-### 4.3 Scheduler
+## 7. Tests and validation
 
-Introduce a budget-aware continuous scheduler that:
+v0.4 validates:
 
-- removes finished requests;
-- admits eligible waiting requests;
-- computes remaining token budget;
-- schedules decode work and prompt chunks without exceeding budget;
-- preserves deterministic, explainable policy ordering.
+- scheduled token count never exceeds budget;
+- a long prompt crosses multiple engine steps;
+- partial prefill chunks do not sample early;
+- decode runs before and alongside long prefill;
+- paged KV blocks grow incrementally with chunks;
+- chunked and unchunked deterministic execution generate identical output tokens;
+- invalid zero budgets/chunk sizes fail explicitly.
 
-Start with a simple FCFS/decode-aware educational policy before adding sophisticated heuristics.
-
-### 4.4 Paged KV compatibility
-
-Partial prefill must grow paged KV capacity incrementally. `PagedKVCache` should remain a storage mechanism, not become the scheduler.
-
-### 4.5 Metrics / traces
-
-Expose enough step metadata to reason about:
-
-- scheduled token count;
-- prefill chunk sizes;
-- time-to-first-token proxy in engine steps;
-- inter-token-latency proxy in engine steps.
-
----
-
-## 5. Mechanisms intentionally unchanged at the start
-
-The first v0.4 increment should keep these stable unless a contract change is clearly required:
-
-- `Request` lifecycle;
-- `PagedKVCache` block-table semantics;
-- Tiny Decoder model math;
-- sampler semantics;
-- synchronous `Engine` coordination model.
-
-The purpose is to isolate scheduler/work-contract evolution.
-
----
-
-## 6. Acceptance criteria
-
-v0.4 cannot be frozen until all applicable items are true:
-
-- [ ] each step satisfies `sum(work_item.num_tokens) <= max_num_batched_tokens`;
-- [ ] a prompt longer than one-step budget prefills across multiple steps;
-- [ ] decode can make progress while another request is still in chunked prefill;
-- [ ] paged KV capacity grows correctly across chunks;
-- [ ] chunked and unchunked reference execution produce equivalent logits/token history for deterministic sampling;
-- [ ] error behavior is explicit when one schedulable unit cannot fit policy constraints;
-- [ ] timeline examples make budget allocation visible;
-- [ ] tests demonstrate the budget invariant rather than only checking final output;
-- [ ] docs describe scheduling policy and simplifications;
-- [ ] validated implementation is synchronized to `main`;
-- [ ] `version.md` is updated from planning status to frozen status only after validation.
-
----
-
-## 7. Important implementation rule
-
-Do **not** solve v0.4 by adding version-specific branches throughout `Engine`.
-
-Preferred shape:
-
-```text
-Request
-   │
-   ▼
-BudgetedContinuousScheduler
-   │
-   ▼
-ScheduleDecision[WorkItem chunks]
-   │
-   ├────────► PagedKVCache.ensure_capacity()
-   │
-   └────────► ModelRunner.execute()
-```
-
-The token budget belongs to scheduler policy and the scheduler/work contract.
-
----
+The frozen local snapshot passes the full repository check with **14 tests**.
 
 ## 8. Learning goals
 
 After v0.4, the learner should be able to explain:
 
 - why `max_num_seqs` and `max_num_batched_tokens` constrain different resources;
-- why a huge prefill can hurt decode latency;
-- how chunked prefill changes iteration scheduling;
-- why decode and prefill have different token shapes/workloads;
-- why paged KV allocation naturally supports incremental prompt growth;
-- how scheduling policy creates TTFT/ITL trade-offs.
-
----
+- why all-at-once long prefill can hurt inter-token latency;
+- how chunked prefill allows decode and prefill to coexist;
+- why partial prefill must not sample;
+- why paged KV naturally supports incremental prompt growth;
+- how scheduler policy creates TTFT/ITL trade-offs.
 
 ## 9. Explicit non-goals
 
-- prefix caching — `v0.5`;
-- KV-pressure preemption — `v0.6`;
-- speculative decoding — `v0.7`;
-- Executor / Worker process boundary — `v0.8`;
-- optimized Triton/CUDA PagedAttention — later performance version.
-
----
+- prefix caching / shared KV ownership;
+- KV-pressure preemption;
+- speculative decoding;
+- multiprocess Executor / Worker separation;
+- CUDA/Triton PagedAttention.
 
 ## 10. Next version
 
-`v0.5` introduces **prefix caching and shared block ownership**. That version will require new invariants around block immutability, reference counts, shared-prefix lookup, mutable tails, and safe eviction.
+`v0.5` introduces **prefix caching and shared block ownership**:
+
+```text
+identical prompt prefix
+        ↓
+content-addressed full KV blocks
+        ↓
+shared ownership / refcount
+        ↓
+immutable shared prefix + mutable tail
+        ↓
+safe release / eviction
+```

@@ -6,4 +6,4 @@ from mini_vllm.versions import create_engine
 
 __all__ = ["CacheConfig", "EngineConfig", "TinyModelConfig", "Request", "RequestStatus", "SamplingParams", "create_engine"]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

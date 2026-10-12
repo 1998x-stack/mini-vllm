@@ -6,7 +6,7 @@ from mini_vllm.cache.base import KVCacheBackend
 from mini_vllm.config import EngineConfig
 from mini_vllm.core.request import Request
 from mini_vllm.core.sampler import Sampler
-from mini_vllm.core.work import EngineStepOutput, ScheduleDecision, WorkItem
+from mini_vllm.core.work import EngineStepOutput, ScheduleDecision, WorkItem, WorkTrace
 from mini_vllm.model.runner import ModelRunner
 from mini_vllm.scheduler.base import Scheduler
 
@@ -16,9 +16,22 @@ class Engine:
 
     The important boundary is explicit:
     scheduler -> cache capacity -> model runner -> sampler -> request update.
+
+    Since v0.4, a WorkItem may be only part of a prompt. Computing a partial
+    prefill chunk advances KV state but must not sample a token until all tokens
+    that currently exist in that request have been computed.
     """
 
-    def __init__(self, *, config: EngineConfig, scheduler: Scheduler, cache: KVCacheBackend, model_runner: ModelRunner, sampler: Sampler | None = None, version: str) -> None:
+    def __init__(
+        self,
+        *,
+        config: EngineConfig,
+        scheduler: Scheduler,
+        cache: KVCacheBackend,
+        model_runner: ModelRunner,
+        sampler: Sampler | None = None,
+        version: str,
+    ) -> None:
         self.config = config
         self.scheduler = scheduler
         self.cache = cache
@@ -48,11 +61,17 @@ class Engine:
         for item in decision.work_items:
             if self.cache.ensure_capacity(item.request_id, item.end_pos):
                 accepted.append(item)
+        if decision.work_items and not accepted:
+            raise RuntimeError(
+                "scheduled work cannot reserve KV capacity; "
+                "KV-pressure preemption is intentionally deferred to v0.6"
+            )
         decision.work_items = accepted
         return decision
 
     def step(self) -> EngineStepOutput:
         decision = self._fit_cache(self.scheduler.schedule())
+        work_trace = tuple(WorkTrace.from_item(item) for item in decision.work_items)
         sampled: dict[str, int] = {}
         finished: list[str] = []
 
@@ -61,11 +80,20 @@ class Engine:
             for item in decision.work_items:
                 request = item.request
                 request.num_computed_tokens = item.end_pos
-                token_id = self.sampler.sample(logits_by_request[item.request_id], request.sampling_params)
+
+                if not item.completes_current_sequence:
+                    continue
+
+                token_id = self.sampler.sample(
+                    logits_by_request[item.request_id], request.sampling_params
+                )
                 request.append_output(token_id)
                 sampled[item.request_id] = token_id
 
-                reached_eos = self.config.eos_token_id is not None and token_id == self.config.eos_token_id
+                reached_eos = (
+                    self.config.eos_token_id is not None
+                    and token_id == self.config.eos_token_id
+                )
                 reached_limit = len(request.output_token_ids) >= request.max_new_tokens
                 if reached_eos or reached_limit:
                     request.mark_finished("eos" if reached_eos else "length")
@@ -80,6 +108,7 @@ class Engine:
             sampled_token_ids=sampled,
             finished_request_ids=tuple(finished),
             cache_stats=self.cache.stats(),
+            work=work_trace,
         )
         self._step += 1
         return output

@@ -11,6 +11,7 @@ class EngineConfig:
 
     max_num_seqs: int = 4
     max_model_len: int = 128
+    max_num_batched_tokens: int = 16
     eos_token_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -18,6 +19,8 @@ class EngineConfig:
             raise ValueError("max_num_seqs must be > 0")
         if self.max_model_len <= 0:
             raise ValueError("max_model_len must be > 0")
+        if self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be > 0")
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,31 +1,20 @@
-# Version roadmap
-
-`Plan.md` is the canonical detailed roadmap. This file is the compact learning map.
+# mini-vLLM roadmap
 
 ```text
-v0.1  request lifecycle + static batching + contiguous KV
-  ↓
-v0.2  continuous batching
-  ↓
-v0.3  paged KV / block table / recycling
-  ↓
-v0.4  token budget / chunked prefill
-  ↓
-v0.5  prefix caching / shared immutable blocks
-  ↓
-v0.6  preemption under KV pressure
-  ↓
-v0.7  speculative decoding / rollback
-  ↓
-v0.8  EngineCore / Executor / Worker split
-  ↓
+v0.1  static batching + contiguous KV                 done
+v0.2  continuous batching                            done
+v0.3  paged KV / block table / recycling             done
+v0.4  token budget / chunked prefill                  done
+v0.5  prefix caching / shared block ownership         next
+v0.6  KV-pressure preemption
+v0.7  speculative decoding
+v0.8  EngineCore / Executor / Worker boundary
 v0.9  distributed / tensor-parallel concepts
-  ↓
-v0.10 async streaming / cancellation / backpressure
-  ↓
-v0.11 compile/CUDA-graph experiments
-  ↓
-v0.12 optimized PagedAttention path
+v0.10 async streaming / cancellation
+v0.11 CUDA Graph / compile experiments
+v0.12 Triton/CUDA PagedAttention
+v0.13 prefix-aware scheduling
+v1.0  integrated educational serving runtime
 ```
 
-The rule is one major mental model per version. Historical branches remain frozen learning snapshots.
+Each version should introduce one primary serving mental model and preserve earlier version branches as historical learning snapshots.
