@@ -9,6 +9,7 @@ examples:
 	python examples/03_page_table_walkthrough.py
 	python examples/04_compare_cache_waste.py
 	python examples/05_chunked_prefill.py
+	python examples/06_prefix_caching.py
 
 check:
 	./scripts/check.sh

@@ -2,84 +2,100 @@
 
 A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the systems ideas behind vLLM.
 
-The project favors explicit mechanisms over production throughput. Each historical branch introduces one serving mental model and keeps earlier branches small enough to diff and understand.
-
-## Current integrated version: v0.4
+## Current integrated version: v0.5
 
 ```text
-main  ─────────────────────────────────► newest validated state (v0.4)
+main  ─────────────────────────────────► newest validated state (v0.5)
   │
   ├── v0.1  static batching + contiguous KV
   ├── v0.2  continuous batching
-  ├── v0.3  paged KV + block table + recycling
-  └── v0.4  token budget + chunked prefill
+  ├── v0.3  paged KV + block tables
+  ├── v0.4  token budget + chunked prefill
+  └── v0.5  prefix caching + shared KV ownership
 ```
 
-The next planned version is `v0.5`: prefix caching and shared block ownership.
+Next: `v0.6` — KV-pressure preemption and recomputation policy.
 
 ## Version ladder
 
-| Branch | Scheduler | KV cache | Primary lesson |
-|---|---|---|---|
-| `v0.1` | Static cohort | Contiguous request slab | Minimal serving loop and head-of-line waste |
-| `v0.2` | Continuous batching | Contiguous request slab | Refill sequence slots every step |
-| `v0.3` | Continuous batching | Paged block pool | Logical/physical KV addressing and recycling |
-| `v0.4` | Token-budget continuous | Paged block pool | Chunked prefill and mixed prefill/decode |
-| `v0.5` | planned | shared paged blocks | Prefix reuse, refcounts and immutable shared KV |
+| Branch | Primary mechanism | Main question |
+|---|---|---|
+| `v0.1` | static batching + contiguous KV | what is the smallest serving loop? |
+| `v0.2` | continuous batching | how are free sequence slots refilled? |
+| `v0.3` | paged KV | how can growing KV avoid contiguous slabs? |
+| `v0.4` | token budget + chunked prefill | how much token work runs per step? |
+| `v0.5` | prefix cache + refcounts | how can identical prefixes share immutable KV? |
 
 Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-## v0.4 mental model
-
-`max_num_seqs` answers: **How many requests may be active?**
-
-`max_num_batched_tokens` answers: **How many tokens of model work may this engine step execute?**
-
-The v0.4 reference scheduler is decode-first:
+## v0.5 mental model
 
 ```text
-step budget = 8
-
-A decode          1
-B decode          1
-C prefill chunk   6
-                 ---
-total             8
+Request A: [system prompt blocks] [private tail A]
+                 │
+Request B: [system prompt blocks] [private tail B]
+                 │
+                 ▼
+          same physical KV blocks
+          refcounted + immutable
 ```
 
-A long prompt is no longer atomic:
+Only full prompt blocks are cached. Prefix hashes are chained with prior context, so an identical token block under a different prefix does not alias incorrectly.
+
+A warm request attaches cached blocks before scheduling:
 
 ```text
-prompt: 10 tokens
-budget: 4
+cold request
+prefill [0:5]
+   ↓
+publish full blocks [0:2], [2:4]
+   ↓
+request finishes; active refcount -> 0
+cached blocks stay resident
 
-step 0: prefill [0:4]   no sample
-step 1: prefill [4:8]   no sample
-step 2: prefill [8:10]  sample first output
-step 3: decode 1 token  sample next output
+warm identical request
+attach [0:2], [2:4]
+num_computed_tokens = 4
+   ↓
+compute only [4:5]
+   ↓
+sample first output
 ```
 
-The critical rule is:
+### Important: KV hit != logits hit
 
-> **computing a partial prefill chunk grows KV state but does not produce a user-visible output token.**
+KV cache stores K/V, not next-token logits. v0.5 intentionally leaves enough prompt work to compute the final logits even when the entire prompt exists in the prefix index.
 
-## Core runtime
+## Architecture
 
 ```text
 Request
    │
+   ├── cache.prepare_request() ──► attach immutable shared prefix
+   │
    ▼
 BudgetedContinuousScheduler
-   │  ScheduleDecision[WorkItem]
-   ▼
-PagedKVCache.ensure_capacity(end_pos)
    │
    ▼
-ModelRunner.execute(chunk)
+Paged KV allocation / private tail
    │
-   ├── partial prefill ──► update computed-token state only
+   ▼
+ModelRunner
    │
-   └── sequence caught up ──► Sampler ──► append output token
+   ├── cache.commit_work() ──► publish completed full prompt blocks
+   │
+   ▼
+Sampler
+```
+
+Stable boundaries remain:
+
+```text
+Scheduler       decides who/how much runs
+KVCacheBackend  owns storage, sharing and recycling
+ModelRunner     executes model work
+Sampler         selects next token
+Engine          coordinates lifecycle hooks
 ```
 
 ## Install and verify
@@ -91,43 +107,32 @@ pip install -e '.[dev]'
 ./scripts/check.sh
 ```
 
+Current frozen v0.5 snapshot: **18 tests + 6 examples**.
+
 ## Learn through branch diffs
 
 ```bash
 git diff v0.1..v0.2 -- mini_vllm/scheduler tests examples version.md
-git diff v0.2..v0.3 -- mini_vllm/cache mini_vllm/versions tests examples version.md
+git diff v0.2..v0.3 -- mini_vllm/cache tests examples version.md
 git diff v0.3..v0.4 -- mini_vllm tests examples version.md
+git diff v0.4..v0.5 -- mini_vllm/cache mini_vllm/core tests examples version.md
 ```
 
-Focus on these files for v0.4:
+For v0.5, focus on:
 
 ```text
-mini_vllm/config.py
-mini_vllm/core/work.py
-mini_vllm/scheduler/base.py
-mini_vllm/scheduler/budgeted.py
+mini_vllm/cache/base.py
+mini_vllm/cache/prefix.py
 mini_vllm/core/engine.py
-examples/05_chunked_prefill.py
+mini_vllm/versions/v0_5/engine.py
+tests/test_prefix_cache.py
+examples/06_prefix_caching.py
 ```
 
-Run the timeline:
+Run:
 
 ```bash
-python examples/05_chunked_prefill.py
+python examples/06_prefix_caching.py
 ```
 
-## Next: v0.5
-
-`v0.5` will introduce a readable reference design for prefix caching:
-
-```text
-block hash
-   ↓
-prefix index
-   ↓
-shared full blocks
-   ↓
-reference counts
-   ↓
-immutable shared prefix / mutable request tail
-```
+Observe the cold request publish blocks and the warm request begin from a non-zero `start_pos` while producing the same output tokens.

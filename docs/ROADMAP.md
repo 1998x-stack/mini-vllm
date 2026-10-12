@@ -5,8 +5,8 @@ v0.1  static batching + contiguous KV                 done
 v0.2  continuous batching                            done
 v0.3  paged KV / block table / recycling             done
 v0.4  token budget / chunked prefill                  done
-v0.5  prefix caching / shared block ownership         next
-v0.6  KV-pressure preemption
+v0.5  prefix caching / shared block ownership         done
+v0.6  KV-pressure preemption / recompute              next
 v0.7  speculative decoding
 v0.8  EngineCore / Executor / Worker boundary
 v0.9  distributed / tensor-parallel concepts
@@ -17,4 +17,4 @@ v0.13 prefix-aware scheduling
 v1.0  integrated educational serving runtime
 ```
 
-Each version should introduce one primary serving mental model and preserve earlier version branches as historical learning snapshots.
+Each version introduces one primary serving mental model. Historical branches remain learning snapshots rather than receiving later-version mechanisms.

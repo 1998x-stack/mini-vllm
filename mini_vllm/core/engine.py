@@ -17,7 +17,7 @@ class Engine:
     The important boundary is explicit:
     scheduler -> cache capacity -> model runner -> sampler -> request update.
 
-    Since v0.4, a WorkItem may be only part of a prompt. Computing a partial
+    Since v0.4, a WorkItem may be only part of a prompt.  Computing a partial
     prefill chunk advances KV state but must not sample a token until all tokens
     that currently exist in that request have been computed.
     """
@@ -46,6 +46,12 @@ class Engine:
             raise ValueError(f"duplicate request_id: {request.request_id}")
         if len(request.prompt_token_ids) + request.max_new_tokens > self.config.max_model_len:
             raise ValueError("prompt + max_new_tokens exceeds max_model_len")
+        cached_tokens = self.cache.prepare_request(
+            request.request_id, request.prompt_token_ids
+        )
+        if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
+            raise RuntimeError("cache returned invalid cached-token count")
+        request.num_computed_tokens = cached_tokens
         self._requests[request.request_id] = request
         self.scheduler.add_request(request)
 
@@ -79,8 +85,16 @@ class Engine:
             logits_by_request = self.model_runner.execute(decision.work_items, self.cache)
             for item in decision.work_items:
                 request = item.request
+                self.cache.commit_work(
+                    item.request_id,
+                    start_pos=item.start_pos,
+                    token_ids=item.token_ids,
+                    prompt_length=len(request.prompt_token_ids),
+                )
                 request.num_computed_tokens = item.end_pos
 
+                # A partial prompt chunk has useful KV side effects, but its
+                # final-token logits are not yet the model's next-token answer.
                 if not item.completes_current_sequence:
                     continue
 

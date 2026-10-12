@@ -1,20 +1,25 @@
 # Exercises
 
-## v0.3 recap
+## v0.1-v0.4
 
-1. Change `block_size` and observe internal fragmentation.
-2. Print block tables before and after request completion to see physical block recycling.
-3. Replace paged KV with contiguous KV and verify deterministic logits remain equal.
+Use historical branch diffs to explain static vs continuous batching, paged addressing, and chunked prefill before modifying v0.5.
 
-## v0.4
+## v0.5 prefix caching
 
-1. Set `max_num_batched_tokens=1`. Explain why decode latency is protected but prompt TTFT can increase sharply.
-2. Set the budget larger than every prompt. Show that v0.4 degenerates to effectively unchunked prefill.
-3. Modify `BudgetedContinuousScheduler` from decode-first to pure FCFS and construct a trace where a long prompt delays decode.
-4. Add round-robin prefill chunks instead of giving all remaining budget to the first FCFS prefill request. Which fairness property changes?
-5. Record the engine step where each request emits its first token. Treat this as a TTFT proxy and compare policies.
-6. Explain why sampling after every prefill chunk is semantically wrong even if the code still runs.
+1. With block size 4, calculate how many prompt tokens can be reused for prompt lengths 3, 4, 5, 8 and 9. Remember that next-token logits still need prompt execution.
+2. Explain why hashing only the local block token IDs can be wrong when identical chunks appear under different preceding context.
+3. Draw block tables for two requests sharing two full prefix blocks but having different private tails.
+4. Show the refcount transitions when A and B share a block, then A finishes, then B finishes.
+5. Modify the LRU eviction test so every cached block has `refcount > 0`. Explain why v0.5 must return allocation failure instead of evicting one.
+6. Add a third request that arrives while two requests already share a prefix. Inspect `shared_blocks` and `active_block_refs`.
+7. Implement an alternative cache-hit metric: request-level hit ratio instead of block/token-level counters. Compare what each metric hides.
 
-## Next: v0.5
+## Preview v0.6
 
-Design block reference-count invariants for two requests sharing a full immutable prefix block while each owns a different mutable tail block.
+Design a recompute-preemption state transition without implementing swap:
+
+```text
+RUNNING -> PREEMPTED/WAITING -> KV released -> later PREFILL recomputation
+```
+
+List the invariants needed to avoid stale KV ownership.

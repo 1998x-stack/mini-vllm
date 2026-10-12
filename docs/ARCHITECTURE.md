@@ -1,110 +1,110 @@
 # Architecture notes
 
-## Computed-token invariant
-
-For every request:
+## Stable runtime invariant
 
 ```text
 0 <= num_computed_tokens <= len(prompt_token_ids + output_token_ids)
 ```
 
-Every cache position `< num_computed_tokens` has passed through the model and has materialized K/V. A sampled output token may already exist in `output_token_ids` while remaining uncomputed until the next decode step.
+Every position below `num_computed_tokens` has materialized K/V. A sampled output token remains uncomputed until a later decode forward pass consumes it.
 
-## v0.4 engine step
+## v0.5 request admission
 
 ```text
-BudgetedContinuousScheduler.schedule()
-        │
-        │ token budget invariant
-        ▼
-ScheduleDecision[WorkItem chunks]
+Engine.add_request(request)
         │
         ▼
-PagedKVCache.ensure_capacity(item.end_pos)
+cache.prepare_request(prompt tokens)
+        │
+        ├── prefix miss -> 0 cached tokens
+        │
+        └── prefix hit  -> attach shared physical blocks
+                           increment active refcounts
         │
         ▼
-ModelRunner.execute(work_items)
+request.num_computed_tokens = cached_tokens
         │
         ▼
-advance num_computed_tokens
-        │
-        ├── partial prefill? ── yes ──► stop for this request
-        │
-        └── current sequence fully computed
-                         │
-                         ▼
-                       sample
-                         │
-                         ▼
-                 append output token
-```
-
-## Scheduler policy vs storage mechanism
-
-The v0.4 scheduler owns request admission, decode-first ordering, per-step token budget, and prompt chunk length.
-
-The paged KV backend owns physical block allocation, block tables, logical-position translation, and block recycling.
-
-Neither subsystem owns the other's policy.
-
-## Decode-first reference policy
-
-Given budget `B`:
-
-1. schedule each runnable decode request for one token in running-list order;
-2. give remaining budget to prefill requests in FCFS order;
-3. split a prompt at the remaining-budget boundary.
-
-This is intentionally not claimed as an optimal production policy. It is a compact reference mechanism that makes the TTFT/ITL trade-off inspectable.
-
-## Why partial prefill cannot sample
-
-Suppose a five-token prompt is chunked as `2 + 2 + 1`. Logits from the first two chunks describe positions internal to the prompt; sampling them would invent output tokens before the prompt was fully consumed.
-
-```text
-partial prefill -> KV side effect only
-final prefill   -> KV + first sample
-decode          -> KV + next sample
-```
-
-`WorkItem.completes_current_sequence` expresses this boundary.
-
-## Paged KV under chunked prefill
-
-For each work item:
-
-```text
-ensure_capacity(request_id, item.end_pos)
-```
-
-With block size 2 and chunk ends `2, 4, 5`:
-
-```text
-end=2 -> 1 physical block
-end=4 -> 2 physical blocks
-end=5 -> 3 physical blocks
-```
-
-The address invariant remains:
-
-```text
-logical_block = position // block_size
-block_offset  = position % block_size
-physical      = block_table[request_id][logical_block]
-```
-
-## Trace model
-
-`EngineStepOutput.work` records `request_id`, `phase`, `start_pos`, `end_pos`, and `num_tokens`. Derived properties expose total scheduled, prefill, and decode token counts.
-
-## Extension seams
-
-```text
 Scheduler
-KVCacheBackend
-ModelRunner
-Sampler
-Engine
 ```
 
-v0.5 should extend KV ownership/indexing for prefix sharing instead of embedding prefix-cache rules inside the model or scheduler.
+Prefix caching therefore changes initial computed state without changing scheduler policy.
+
+## Content-addressed full blocks
+
+For block size `B`, only complete prompt blocks are indexable.
+
+A block hash is chained:
+
+```text
+h0 = H(""  || tokens[0:B])
+h1 = H(h0  || tokens[B:2B])
+h2 = H(h1  || tokens[2B:3B])
+```
+
+This makes the hash represent both local token content and prior prefix context.
+
+## Ownership model
+
+Physical blocks have two independent concepts:
+
+1. **active refcount** — how many request block tables currently point to the block;
+2. **cache residency** — whether the prefix index retains the block for future reuse.
+
+Therefore:
+
+```text
+refcount > 0, cached     active shared/resident block
+refcount = 0, cached     reusable resident block; eviction candidate
+refcount = 0, not cached free block
+```
+
+## Immutable prefix / private tail
+
+```text
+logical blocks:   0       1       2
+                full    full    partial
+                  │       │       │
+                  ▼       ▼       ▼
+               shared  shared   private
+               cached  cached   writable
+```
+
+Appending a token never writes into a cached shared full block. The next logical block is private, which is the educational copy-on-append boundary.
+
+## Publishing a new block
+
+After a model WorkItem has executed all layers:
+
+```text
+ModelRunner.execute()
+        │
+        ▼
+cache.commit_work()
+        │
+        ├── incomplete prompt block -> remain private
+        │
+        └── completed full prompt block
+                │
+                ├── hash absent -> publish current physical block
+                └── hash exists -> switch block table to canonical block
+                                   release duplicate private block
+```
+
+Publishing after execution avoids exposing a block before all layers contain valid K/V.
+
+## Why exact full-prompt hits still compute
+
+K/V is sufficient for attention history but not for next-token sampling. The runtime needs logits from the final prompt position.
+
+v0.5 therefore never marks every prompt token as computed solely from prefix-cache lookup. Reuse remains block-granular and leaves final prompt work to execute.
+
+## Eviction vs preemption
+
+v0.5 may evict only:
+
+```text
+cached && refcount == 0
+```
+
+It never steals an actively referenced block. If all memory is actively owned, allocation fails. Deciding which runnable request should be preempted and recomputed is intentionally deferred to v0.6.

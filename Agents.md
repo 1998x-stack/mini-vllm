@@ -101,7 +101,9 @@ Canonical sequence:
 - `v0.1` — minimal request lifecycle + static batching + contiguous KV cache
 - `v0.2` — continuous batching
 - `v0.3` — paged KV cache + block table + block recycling
-- `v0.4` — token-budget scheduling + chunked prefill (planned/active next step)
+- `v0.4` — token-budget scheduling + chunked prefill
+- `v0.5` — prefix caching + shared KV block ownership
+- `v0.6` — KV-pressure preemption (planned next step)
 
 Every version branch must contain:
 

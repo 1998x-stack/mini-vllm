@@ -110,21 +110,103 @@ Rules:
 
 ## v0.1 — Minimal serving loop: static batching + contiguous KV
 
-Primary question: **What is the smallest complete autoregressive serving loop?**
+### Primary question
 
-Mechanisms: Request/SamplingParams/RequestStatus, prefill vs decode work items, synchronous Engine, static scheduler, contiguous per-request KV, tiny decoder-only Transformer, ModelRunner, sampler, end-to-end completion.
+> What is the smallest complete autoregressive serving loop?
+
+### Mental model
+
+```text
+Request
+  ↓
+Static cohort
+  ↓
+full prefill / one-token decode
+  ↓
+contiguous per-request KV slab
+  ↓
+Tiny Decoder
+  ↓
+Sampler
+  ↓
+request update
+```
+
+### Mechanisms
+
+- Request / SamplingParams / RequestStatus
+- prefill versus decode work items
+- central synchronous Engine loop
+- static cohort scheduler
+- contiguous per-request KV cache
+- tiny decoder-only Transformer
+- model-runner boundary
+- greedy/temperature/top-k/top-p sampler
+- end-to-end request completion
+
+### Intentionally hidden
+
+- continuous batching
+- paged KV
+- token-budget scheduling
+- prefix caching
+- preemption
+- speculative decoding
+- distributed execution
+- custom kernels
+
+---
 
 ## v0.2 — Continuous batching
 
-Primary question: **Why should batch membership be reconsidered every generation iteration?**
+### Why it follows v0.1
 
-v0.2 keeps request/model/cache mechanisms stable and changes scheduler policy so free sequence slots can be refilled immediately.
+v0.1 makes wasted batch slots visible. v0.2 changes **scheduler policy only** while keeping request, model, engine, and contiguous KV mechanisms stable.
+
+### Primary question
+
+> Why should batch membership be reconsidered every generation iteration?
+
+### Delta
+
+```text
+v0.1 static cohort
+A B
+A _
+A _
+C _
+
+v0.2 continuous refill
+A B
+A C
+A _
+```
+
+### Mechanisms
+
+- continuous admission/backfill
+- explicit scheduler-policy comparison
+- invariant test showing a new request enters immediately after a slot frees
+
+### Still unchanged
+
+- contiguous KV allocation
+- full-prompt prefill
+- sequence-count capacity policy
+
+---
 
 ## v0.3 — Paged KV cache and block tables
 
-Primary question: **How can logically contiguous token positions live in non-contiguous physical KV blocks?**
+### Why it follows v0.2
 
-Core translation:
+Once request scheduling is dynamic, memory allocation becomes the next bottleneck to expose. Reserving `max_model_len` for every active request wastes memory and couples serving capacity to worst-case sequence length.
+
+### Primary question
+
+> How can a request see logically contiguous token positions while its KV lives in non-contiguous physical blocks?
+
+### Core translation
 
 ```text
 logical_block = position // block_size
@@ -132,96 +214,298 @@ block_offset  = position % block_size
 physical      = block_table[request_id][logical_block]
 ```
 
-Mechanisms: physical block pool, per-request block table, incremental allocation, reference paged gather, recycling, utilization statistics, numerical equivalence to contiguous storage.
+### Mechanisms
+
+- fixed-size physical block pool
+- per-request block table
+- incremental block allocation
+- reference paged gather
+- block recycling on finish
+- cache-utilization statistics
+- numerical equivalence with contiguous KV
+
+### Important limitation
+
+The reference implementation gathers paged K/V into a contiguous prefix before attention. It teaches addressing semantics; it is intentionally not a fused production PagedAttention kernel.
 
 ---
 
-# 5. Planned core versions
+# 5. Current and planned core versions
 
-## v0.4 — Token-budget scheduler + chunked prefill
+## v0.4 — Token-budget scheduler + chunked prefill ✅ completed
 
-Add `max_num_batched_tokens`, step token budget, arbitrary chunk-length work items, chunked prompt prefill, decode-first/FCFS policy experiments, and TTFT/ITL step proxies.
+### Primary question
 
-Acceptance criteria: long prompts span steps; decode can progress between chunks; scheduled tokens never exceed budget; deterministic chunked and unchunked paths agree.
+> How should long prompts coexist with latency-sensitive decode tokens?
+
+### Why now
+
+`max_num_seqs` limits sequence count but not per-step token work. A 4K-token prefill and a 1-token decode are very different jobs.
+
+### Required mechanisms
+
+- `max_num_batched_tokens`
+- per-step token budget
+- arbitrary chunk-length `WorkItem`
+- chunked prompt prefill
+- decode-first versus FCFS policy experiment
+- prefill/decode token accounting
+- TTFT/ITL proxy metrics in engine steps
+
+### Acceptance criteria
+
+- a long prompt can be prefetched across multiple steps;
+- decode requests can make progress between prompt chunks;
+- total scheduled tokens never exceed step budget;
+- chunked and unchunked prefill produce equivalent logits/output under deterministic sampling.
+
+**Status:** implemented and validated in the frozen `v0.4` snapshot. `main` integrates this version.
+
+---
 
 ## v0.5 — Prefix caching and shared block ownership
 
-Add block hashes, prefix index, refcounts, immutable shared full blocks, copy-on-append mutable tails, eviction, hit/miss metrics. Shared blocks must never be mutated through another request.
+### Primary question
+
+> How can requests reuse identical immutable prompt prefixes without recomputing or duplicating KV?
+
+### Required mechanisms
+
+- block content hash
+- prefix index
+- block refcount
+- immutable shared full blocks
+- copy-on-append for mutable tails
+- eviction policy for unreferenced cached blocks
+- cache-hit/miss metrics
+
+### Critical invariant
+
+A shared block must never be mutated through one request's append path.
+
+### Definition of Done evidence
+
+- chained full-block hashes and prefix index are implemented;
+- shared blocks carry active request refcounts;
+- only full prompt blocks are shared; mutable tails remain private;
+- unreferenced cached blocks are evicted in LRU order under allocation pressure;
+- cache hit/miss/token/eviction metrics are exposed;
+- warm-prefix execution is semantically equivalent to cold execution under deterministic sampling.
+
+**Status:** implemented and validated in the frozen `v0.5` snapshot. `main` integrates this version.
+
+---
 
 ## v0.6 — Preemption and memory-pressure policy
 
-Expose allocation pressure to scheduling, add recompute-first preemption, request state transitions, fairness/starvation tests. Host swap is optional later.
+### Primary question
+
+> What happens when runnable requests need more KV blocks than the physical pool can provide?
+
+### Required mechanisms
+
+- scheduler-visible allocation failure
+- preemption policy
+- recompute-based preemption first
+- request state transition back to waiting/preempted
+- fairness/starvation tests
+
+Optional later experiment: host swap. Do not introduce swap before recompute semantics are explicit.
+
+---
 
 ## v0.7 — Speculative decoding
 
-Introduce `DraftProvider`, verification results, cache checkpoints, commit/rollback. Start with scripted draft tokens. Rejected speculative KV must not remain visible.
+### Primary question
+
+> How can cheap draft tokens reduce target-model iterations while preserving target-model correctness?
+
+### Required contracts
+
+```text
+DraftProvider
+DraftBatch
+VerificationResult
+CacheCheckpoint
+commit()
+rollback()
+```
+
+Start with a deterministic scripted draft provider before adding a second tiny model.
+
+### Critical learning target
+
+KV state is transactional: rejected speculative tokens must not remain visible to future decoding.
+
+---
 
 ## v0.8 — EngineCore / Executor / Worker split
 
-Separate centralized scheduling/KV metadata from execution. Keep a local in-process executor as reference.
+### Primary question
 
-## v0.9 — Distributed execution and tensor-parallel concepts
+> Where should centralized scheduling end and model execution begin?
 
-Introduce rank/world-size, worker groups, educational collectives, simplified tensor-parallel projections, and result comparisons against single-process reference.
+### Required architecture
+
+```text
+EngineCore
+  Scheduler + KV metadata
+        │
+        ▼
+SchedulerOutput
+        │
+        ▼
+Executor
+        │
+        ▼
+Worker / ModelRunner
+```
+
+Keep a local in-process executor as the reference implementation.
+
+---
+
+## v0.9 — Distributed execution and tensor parallel concepts
+
+### Required mechanisms
+
+- rank/world-size configuration
+- worker group
+- educational collective abstraction
+- column/row-parallel linear layers or simplified tensor-parallel projection
+- deterministic single-process reference versus multi-worker result comparison
+
+Goal: understand execution topology, not reimplement NCCL.
+
+---
 
 ## v0.10 — Async engine and streaming API
 
-Add async submission, streaming token events, cancellation, bounded queues/backpressure, timeout semantics, optionally a thin OpenAI-like HTTP layer outside scheduler/cache internals.
+### Required mechanisms
+
+- asynchronous request submission
+- streaming token events
+- cancellation
+- bounded queues/backpressure
+- request timeout semantics
+- optional OpenAI-like thin HTTP layer
+
+Networking must remain outside scheduler/cache internals.
+
+---
 
 ## v0.11 — CUDA graph / compile-aware execution experiments
 
-Study static metadata, graph capture, dynamic-shape recapture, graph breaks, and host overhead while retaining eager reference behavior.
+### Learning questions
+
+- why does static metadata help graph capture?
+- which dynamic shapes/branches cause recapture or graph breaks?
+- what overhead remains outside model kernels?
+
+Keep eager execution as a reference path.
+
+---
 
 ## v0.12 — Optimized PagedAttention path
 
-Progress from Python reference gather → vectorized PyTorch → profiling → educational Triton/CUDA kernel, always validating against the reference implementation.
+### Progression
+
+```text
+Python reference paged gather
+        ↓
+vectorized PyTorch path
+        ↓
+profile
+        ↓
+Triton/CUDA educational kernel
+        ↓
+compare numerics with reference
+```
+
+Do not delete the reference implementation.
+
+---
 
 ## v0.13 — Prefix-aware scheduling + advanced cache policy
 
-Explore cache-aware admission cost, priority, eviction comparisons, starvation prevention.
+Potential mechanisms:
+
+- prefix-aware admission cost
+- cache-aware scheduling
+- block eviction policy comparisons
+- priority scheduling
+- starvation prevention
+
+---
 
 ## v1.0 — Integrated educational serving runtime
 
-Candidate flow:
+A candidate v1.0 should make the complete path inspectable:
 
 ```text
 submit request
    ↓
-front-end queue
+async/front-end queue
    ↓
 EngineCore scheduler
    ↓
 token budget / preemption
    ↓
-prefix-aware paged KV
+prefix-aware paged KV manager
    ↓
 Executor / workers
    ↓
-model + reference/optimized attention
+model + optimized/reference attention
    ↓
 sampling / speculative verification
    ↓
 streaming output
 ```
 
-v1.0 means explicit/testable architecture boundaries, not production parity.
+v1.0 does not mean production parity. It means the major architectural boundaries are explicit and testable.
 
 ---
 
-# 6. Cross-version compatibility
+# 6. Cross-version compatibility rules
 
-Prefer `new strategy/component + new version composition` over scattering `if version == ...` through core code.
+Prefer:
 
-Stable contracts should evolve deliberately: `Request`, `WorkItem`, scheduler output, `KVCacheBackend`, `ModelRunner`, `Sampler`, `Engine`.
+```text
+new strategy/component + new version composition
+```
+
+over scattering:
+
+```python
+if version == "v0.3":
+    ...
+```
+
+through core runtime code.
+
+Stable contracts should evolve deliberately:
+
+- `Request`
+- `WorkItem` / scheduler output
+- `KVCacheBackend`
+- `ModelRunner`
+- `Sampler`
+- `Engine`
+
+When a contract must change, document why the old contract is insufficient and migrate all internal callers atomically on the new version branch.
 
 ---
 
 # 7. Validation strategy
 
+Every version should prove both behavior and mechanism.
+
+Examples:
+
 | Version | Key invariant |
 |---|---|
 | v0.1 | computed-token state advances only after forward execution |
-| v0.2 | a free sequence slot is backfilled on the next scheduler step |
+| v0.2 | a free batch slot is backfilled on the next scheduler step |
 | v0.3 | paged and contiguous KV layouts produce equal logits |
 | v0.4 | scheduled token count never exceeds token budget |
 | v0.5 | shared prefix blocks are immutable and refcounted |
@@ -231,6 +515,17 @@ Stable contracts should evolve deliberately: `Request`, `WorkItem`, scheduler ou
 
 ---
 
-# 8. Scope exclusions until justified
+# 8. What should stay out of scope until justified
 
-Do not add merely because production vLLM supports it: broad model compatibility, quantization matrix, multimodality, LoRA serving, production auth/networking, full observability stacks, platform-specific kernel tricks, or distributed fault tolerance. Add mechanisms only when their architectural dependency is ready.
+Do not add merely because production vLLM supports it:
+
+- broad Hugging Face model compatibility;
+- quantization matrix;
+- multimodal models;
+- LoRA serving;
+- production networking/auth;
+- production observability stacks;
+- platform-specific CUDA optimizations;
+- complex distributed fault tolerance.
+
+Add a mechanism only when it teaches a serving architecture dependency at the current stage.

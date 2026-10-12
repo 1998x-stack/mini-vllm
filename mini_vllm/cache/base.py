@@ -6,18 +6,59 @@ import torch
 
 
 class KVCacheBackend(ABC):
-    """Storage contract consumed by the model runner."""
+    """Storage contract consumed by the model runner.
+
+    Production vLLM has a much richer KV cache manager. This interface keeps
+    the essential operations visible and makes cache implementations swappable.
+
+    v0.5 adds two optional lifecycle hooks:
+
+    - ``prepare_request`` may attach an already-computed immutable prefix and
+      returns how many prompt tokens can be skipped.
+    - ``commit_work`` observes completed model work after every layer has
+      written K/V, allowing a cache backend to publish newly immutable blocks.
+
+    Older cache backends intentionally inherit no-op implementations so the
+    historical v0.1-v0.4 runtime semantics remain unchanged.
+    """
+
+    def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
+        """Attach reusable cache state and return cached prompt-token count."""
+        return 0
+
+    def commit_work(
+        self,
+        request_id: str,
+        *,
+        start_pos: int,
+        token_ids: tuple[int, ...],
+        prompt_length: int,
+    ) -> None:
+        """Publish cache metadata after a WorkItem has fully executed."""
+        return None
 
     @abstractmethod
     def ensure_capacity(self, request_id: str, total_tokens: int) -> bool:
         """Ensure slots [0, total_tokens) exist for request_id."""
 
     @abstractmethod
-    def write(self, layer_idx: int, request_id: str, position: int, key: torch.Tensor, value: torch.Tensor) -> None:
+    def write(
+        self,
+        layer_idx: int,
+        request_id: str,
+        position: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
         """Write one token's K/V, shape [n_kv_heads, head_dim]."""
 
     @abstractmethod
-    def read_prefix(self, layer_idx: int, request_id: str, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def read_prefix(
+        self,
+        layer_idx: int,
+        request_id: str,
+        length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return K/V for positions [0, length), shape [L, H_kv, D]."""
 
     @abstractmethod
