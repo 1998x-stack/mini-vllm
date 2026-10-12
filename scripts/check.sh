@@ -3,4 +3,5 @@ set -euo pipefail
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 python -m pytest
 python examples/01_basic_generate.py >/dev/null
+python examples/02_static_vs_continuous.py >/dev/null
 echo "all checks passed"

@@ -1,7 +1,7 @@
 from mini_vllm import CacheConfig, EngineConfig, Request, TinyModelConfig, create_engine
 
 engine = create_engine(
-    "v0.1",
+    "v0.2",
     engine_config=EngineConfig(max_num_seqs=2, max_model_len=32),
     model_config=TinyModelConfig(vocab_size=32, d_model=32, n_heads=4, n_kv_heads=4, n_layers=2),
     cache_config=CacheConfig(),

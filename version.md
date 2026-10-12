@@ -1,100 +1,93 @@
-# mini-vLLM v0.1
+# mini-vLLM v0.2
 
 ## 1. Version identity
 
-- **Branch:** `v0.1`
-- **Previous version:** none; this is the baseline
-- **Theme:** minimal autoregressive serving loop
+- **Branch:** `v0.2`
+- **Previous version:** `v0.1`
+- **Theme:** continuous batching
 - **Status:** frozen historical learning snapshot
 
 ## 2. Primary mental model
 
 ```text
-Request
-  ↓
-StaticBatchScheduler
-  ↓
-Contiguous KV cache
-  ↓
-Tiny Decoder / ModelRunner
-  ↓
-Sampler
-  ↓
-request update
+waiting queue
+    │
+    ▼
+ContinuousBatchScheduler
+    │ every engine step
+    ├── remove finished
+    └── fill newly free slots
+    │
+    ▼
+active batch changes continuously
 ```
 
-v0.1 answers:
+## 3. What changed relative to v0.1, and why?
 
-> What is the smallest complete serving runtime that can prefill prompts, decode token-by-token, cache K/V, sample outputs, and finish requests?
+v0.1 creates a static cohort. If B finishes while A is still running, B's slot remains idle until A also finishes.
 
-## 3. What changed relative to the previous version?
+v0.2 changes only the scheduling policy:
 
-There is no previous numbered version. v0.1 establishes the baseline contracts used by later versions:
+```text
+v0.1                  v0.2
+A B                   A B
+A _                   A C
+A _                   A _
+C _
+```
 
-- `Request`
-- `WorkItem` / `ScheduleDecision`
-- `Scheduler`
-- `KVCacheBackend`
-- `ModelRunner`
-- `Sampler`
-- `Engine`
+This isolates the core idea of **continuous batching**: sequence slots are resources that should be reconsidered each generation iteration.
 
 ## 4. Mechanisms added
 
-- request lifecycle and sampling parameters
-- distinction between full-prompt prefill and one-token decode
-- static cohort batching
-- contiguous per-request KV slabs
-- tiny decoder-only Transformer
-- model-runner abstraction
-- central synchronous Engine loop
-- cache release when a request finishes
+- `ContinuousBatchScheduler`
+- next-step slot refill
+- explicit static-versus-continuous example
+- invariant test proving C can enter when B finishes even while A keeps decoding
 
-## 5. Important invariant
+## 5. Mechanisms intentionally unchanged
 
-`num_computed_tokens` means tokens that have actually passed through the model and have materialized KV state.
+- Request lifecycle
+- Engine loop
+- Tiny Decoder and ModelRunner
+- sampler
+- contiguous per-request KV layout
+- full prompt prefill
 
-A sampled token is appended to output immediately, but it becomes a computed token only when a later decode step feeds it through the model.
+This is intentional: the learner should see that continuous batching is a scheduler-policy change, not a model rewrite.
 
-## 6. Important source files
+## 6. Important source delta
 
 ```text
-mini_vllm/core/request.py
-mini_vllm/core/work.py
-mini_vllm/scheduler/static.py
-mini_vllm/cache/contiguous.py
-mini_vllm/model/tiny_transformer.py
-mini_vllm/model/runner.py
-mini_vllm/core/engine.py
+mini_vllm/scheduler/continuous.py
+mini_vllm/versions/v0_2/engine.py
+examples/02_static_vs_continuous.py
 ```
 
 ## 7. Tests/examples
 
-- contiguous KV round trip
-- static cohort does not backfill while a cohort member is still running
-- end-to-end basic generation
+Run:
+
+```bash
+python examples/02_static_vs_continuous.py
+python -m pytest -q
+```
 
 ## 8. Learning goals
 
-After v0.1 you should be able to explain:
-
-- prefill versus decode;
-- why KV is cached;
-- why decode consumes the previously sampled token;
-- why a static cohort can leave idle sequence slots;
-- how Engine coordinates policy and mechanisms without owning all of them.
+- distinguish static batching from continuous batching;
+- understand waiting/running/admission state;
+- understand why batching policy can change without changing model semantics;
+- see why serving throughput/latency is a runtime concern, not merely a Transformer concern.
 
 ## 9. Non-goals
 
-- no continuous batching
-- no paged KV
-- no token budget
-- no prefix caching
-- no preemption
-- no speculative decoding
-- no distributed executor
-- no optimized attention kernel
+- paged KV
+- token-budget scheduling
+- chunked prefill
+- prefix caching
+- preemption
 
 ## 10. Next version
 
-`v0.2` changes the scheduler policy while deliberately leaving request/model/cache contracts stable.
+`v0.3` keeps continuous batching and replaces the contiguous KV allocator with fixed-size physical blocks plus a per-request block table.

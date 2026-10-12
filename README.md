@@ -1,8 +1,8 @@
-# mini-vLLM v0.1
+# mini-vLLM v0.2
 
-This is the **v0.1 historical learning snapshot**: static batching + contiguous KV cache.
+This is the **v0.2 historical learning snapshot**: continuous batching + contiguous KV cache.
 
-Study the baseline serving loop before any dynamic admission or paged memory.
+Compare this branch directly with v0.1; the key architectural delta is scheduler policy.
 
 Before changing code, read `Agents.md`. For the complete forward roadmap, read `Plan.md`. For this branch's exact scope, read `version.md`.
 
@@ -29,20 +29,23 @@ Sampler
 request update
 ```
 
-## v0.1 focus
+## v0.2 focus
 
 ```text
-Static cohort
+Continuous refill
 A B
+A C
 A _
-A _
-C _
 ```
 
-Read: `core/request.py` → `core/work.py` → `scheduler/static.py` → `cache/contiguous.py` → `model/tiny_transformer.py` → `core/engine.py`.
-
-Next, compare with v0.2:
+Run:
 
 ```bash
-git diff v0.1..v0.2
+python examples/02_static_vs_continuous.py
+```
+
+Then compare memory architecture with v0.3:
+
+```bash
+git diff v0.2..v0.3
 ```
