@@ -1,163 +1,191 @@
-# mini-vLLM v0.4 — token-budget scheduling + chunked prefill
+# mini-vLLM v0.5 — active planning branch
 
 ## 1. Version identity
 
-- **Branch:** `v0.4`
-- **Previous version:** `v0.3`
-- **Theme:** token-budget scheduling and chunked prefill
-- **Status:** frozen historical learning snapshot after validation
+- **Branch:** `v0.5`
+- **Base:** latest validated `v0.4` / `main`
+- **Previous version:** `v0.4`
+- **Theme:** prefix caching and shared KV-block ownership
+- **Status:** planning / implementation target; runtime still matches validated v0.4 until acceptance criteria pass
 
-v0.4 changes the scheduling unit from only **sequence slots** to explicit **token work per engine step**.
+---
 
-```text
-v0.3
-max_num_seqs
-     ↓
-which requests run?
+## 2. Why v0.5 follows v0.4
 
-v0.4
-max_num_seqs + max_num_batched_tokens
-     ↓                    ↓
-which requests?      how much token work?
-```
-
-## 2. Why this version follows v0.3
-
-v0.2 made sequence slots refillable. v0.3 made KV growth incremental through physical blocks. The next hidden bottleneck is that two admitted requests can represent radically different work:
+v0.3 introduced physical KV blocks and per-request block tables. v0.4 made prompt growth incremental through chunked prefill. The next obvious waste is repeated computation and storage for identical immutable prompt prefixes.
 
 ```text
-A: decode 1 token
-B: prefill 2,000 tokens
+Request A: [system prompt ........] + user A
+Request B: [system prompt ........] + user B
+
+without prefix cache:
+A owns prefix KV
+B owns duplicate prefix KV
+
+with prefix cache:
+        shared immutable full blocks
+              /          \
+        A mutable tail   B mutable tail
 ```
 
-A sequence-count limit cannot express this difference. v0.4 introduces a per-step token budget and makes long prompt prefill interruptible across engine steps.
+The primary question is:
 
-## 3. Core mechanism
+> How can multiple requests safely reuse already-computed full KV blocks without corrupting ownership, mutation, or release semantics?
 
-The reference scheduling policy is intentionally simple and deterministic:
+---
 
-1. remove finished requests;
-2. admit waiting requests until `max_num_seqs` is full;
-3. schedule decode requests first, one token each;
-4. spend remaining token budget on prefill requests in FCFS order;
-5. truncate a prefill work item at the remaining budget boundary.
-
-The invariant is:
+## 3. Primary mental model
 
 ```text
-sum(work_item.num_tokens) <= max_num_batched_tokens
+prompt tokens
+    │
+    ▼
+full-block content key / hash
+    │
+    ▼
+prefix index
+    │
+    ├── miss -> allocate + compute + publish immutable full block
+    │
+    └── hit  -> attach existing physical block
+                       │
+                       ▼
+                 increment refcount
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+       shared prefix        private tail
+       immutable blocks     mutable blocks
 ```
 
-## 4. Critical semantic change: compute is not sample
+---
 
-A partial prefill chunk writes valid K/V, but it must **not** sample an output token.
+## 4. Required delta from v0.4
+
+### 4.1 Block ownership metadata
+
+Introduce explicit metadata for physical blocks, including at minimum:
+
+- reference count;
+- immutable/shared state for cached full blocks;
+- ownership/release rules;
+- reusable/free state.
+
+### 4.2 Prefix identity
+
+Introduce a deterministic educational prefix key. Start with full-block token content and enough context to prevent unsafe reuse. The design must make hash/key assumptions explicit rather than treating matching token IDs as magic.
+
+### 4.3 Prefix index
+
+Add a lookup structure mapping reusable prefix keys to physical blocks or block chains. The index belongs to cache-management policy, not to the Transformer model.
+
+### 4.4 Request attachment
+
+On a prefix hit, a request should attach shared full blocks to its block table, advance the reusable/computed prefix state appropriately, and compute only the unmatched suffix.
+
+### 4.5 Mutable tail rule
+
+Only complete immutable prefix blocks may be shared in the first educational implementation. A partially filled tail block remains private to one request.
+
+### 4.6 Release
+
+Finishing one request decrements references. A shared block may return to the free pool only when no request/cache entry still owns it.
+
+---
+
+## 5. Core invariants
+
+### Shared-block immutability
+
+A block published to the prefix cache must never be mutated in place by a request.
+
+### Refcount correctness
 
 ```text
-prompt = [t0 t1 t2 t3 t4]
-budget = 2
-
-step 0: compute [t0 t1]       -> KV grows, no sample
-step 1: compute [t2 t3]       -> KV grows, no sample
-step 2: compute [t4]          -> prompt complete, sample first output
-step 3: compute sampled token -> decode, sample next output
+refcount(block) == number of live owners/references represented by the cache model
 ```
 
-`WorkItem.completes_current_sequence` makes this boundary explicit. A sampled output token is not counted as computed until a later decode forward pass consumes it.
+No early free and no leaked ownership.
 
-## 5. Main implementation delta from v0.3
+### Tail isolation
 
-### Configuration
+Partially filled or request-specific continuation blocks are private and must not be reused as immutable prefixes.
 
-`EngineConfig` adds:
+### Semantic equivalence
 
-```python
-max_num_batched_tokens: int = 16
-```
+Prefix-cache hit and miss execution must produce the same deterministic token history/logits as recomputing the prefix normally.
 
-### Scheduler/work contract
+### Safe release
 
-- `make_work_item(..., max_tokens=N)` creates an arbitrary contiguous prompt chunk.
-- `BudgetedContinuousScheduler` owns token-budget policy.
-- `WorkItem.phase` distinguishes `prefill` and `decode` for traces.
-- `EngineStepOutput` exposes scheduled-token, prefill-token and decode-token counts.
+Finishing request A must not invalidate a shared block still referenced by request B.
 
-### Engine
+---
 
-The Engine samples only if a `WorkItem` computed every token that currently exists for that request.
+## 6. Acceptance criteria
 
-### KV cache
+v0.5 cannot be frozen until tests demonstrate:
 
-`PagedKVCache` remains storage, not scheduling policy. Each chunk calls `ensure_capacity(request_id, chunk_end_pos)`, so block allocation grows incrementally.
+- [ ] two requests with the same full-block prefix share physical block IDs;
+- [ ] a prefix hit skips recomputation for the reusable prefix;
+- [ ] shared full blocks are immutable;
+- [ ] request-specific tail blocks remain private;
+- [ ] finishing one sharer does not free blocks still used by another;
+- [ ] the last release makes blocks recyclable according to cache policy;
+- [ ] prefix-cache hit and no-cache reference execution are semantically equivalent;
+- [ ] hash/key collision assumptions are explicit and testable;
+- [ ] block/refcount state is inspectable in an educational example;
+- [ ] all previous v0.4 scheduling and chunked-prefill tests remain green;
+- [ ] validated implementation is synchronized back to `main`.
 
-## 6. Important source files
+---
+
+## 7. Preferred architecture
 
 ```text
-mini_vllm/config.py
-        ↓
-mini_vllm/core/work.py
-        ↓
-mini_vllm/scheduler/base.py
-        ↓
-mini_vllm/scheduler/budgeted.py
-        ↓
-mini_vllm/core/engine.py
-        ↓
-mini_vllm/versions/v0_4/engine.py
-        ↓
-examples/05_chunked_prefill.py
+Scheduler
+   │ WorkItem suffix
+   ▼
+Prefix-aware KV cache manager
+   ├── prefix lookup/index
+   ├── block metadata/refcount
+   ├── shared immutable full blocks
+   └── private mutable tails
+   │
+   ▼
+ModelRunner
 ```
 
-Compare directly:
+Do not put prefix-hash lookup inside `TinyDecoderLM`, and do not make the Scheduler directly mutate physical block refcounts.
 
-```bash
-git diff v0.3..v0.4 -- mini_vllm tests examples version.md
+---
+
+## 8. Explicit non-goals
+
+- eviction under severe KV pressure — v0.6;
+- preemption/swap/recompute policy — v0.6;
+- speculative decoding — v0.7;
+- distributed prefix cache — later;
+- production-grade collision-resistant cache protocol — later;
+- CUDA/Triton optimized kernels — later.
+
+---
+
+## 9. Suggested implementation sequence
+
+```text
+v0.5.1 block metadata + refcount
+   ↓
+v0.5.2 full-block prefix key/index
+   ↓
+v0.5.3 request attach + suffix-only compute
+   ↓
+v0.5.4 release/recycling semantics
+   ↓
+v0.5.5 semantic-equivalence + sharing trace
 ```
 
-## 7. Tests and validation
-
-v0.4 validates:
-
-- scheduled token count never exceeds budget;
-- a long prompt crosses multiple engine steps;
-- partial prefill chunks do not sample early;
-- decode runs before and alongside long prefill;
-- paged KV blocks grow incrementally with chunks;
-- chunked and unchunked deterministic execution generate identical output tokens;
-- invalid zero budgets/chunk sizes fail explicitly.
-
-The frozen local snapshot passes the full repository check with **14 tests**.
-
-## 8. Learning goals
-
-After v0.4, the learner should be able to explain:
-
-- why `max_num_seqs` and `max_num_batched_tokens` constrain different resources;
-- why all-at-once long prefill can hurt inter-token latency;
-- how chunked prefill allows decode and prefill to coexist;
-- why partial prefill must not sample;
-- why paged KV naturally supports incremental prompt growth;
-- how scheduler policy creates TTFT/ITL trade-offs.
-
-## 9. Explicit non-goals
-
-- prefix caching / shared KV ownership;
-- KV-pressure preemption;
-- speculative decoding;
-- multiprocess Executor / Worker separation;
-- CUDA/Triton PagedAttention.
+---
 
 ## 10. Next version
 
-`v0.5` introduces **prefix caching and shared block ownership**:
-
-```text
-identical prompt prefix
-        ↓
-content-addressed full KV blocks
-        ↓
-shared ownership / refcount
-        ↓
-immutable shared prefix + mutable tail
-        ↓
-safe release / eviction
-```
+`v0.6` should introduce KV-pressure handling: admission failure, preemption, recompute/swap-style policy, and explicit memory-pressure decisions.
