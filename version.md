@@ -1,340 +1,162 @@
-# mini-vLLM v0.7 — speculative decoding + transactional KV
+# mini-vLLM v0.8 — EngineCore / Executor / Worker boundary (planning branch)
 
 ## 1. Version identity
 
-- **Branch:** `v0.7`
-- **Previous version:** `v0.6`
-- **Theme:** target-verified speculative decoding as a transaction over logical history and physical KV state
-- **Status:** frozen historical learning snapshot after validation
+- **Branch:** `v0.8`
+- **Base:** latest validated `v0.7` / `main`
+- **Previous version:** `v0.7`
+- **Theme:** separate centralized serving policy from execution transport
+- **Status:** planning / implementation target; runtime still behaves as v0.7 until acceptance criteria pass
 
-v0.7 keeps the v0.6 scheduler, preemption, prefix cache, and request lifecycle intact. It adds a new execution policy only after a request has reached a stable sampling frontier:
+## 2. Why v0.8 follows v0.7
 
-```text
-stable target state
-      │
-      ▼
-cache checkpoint
-      │
-      ▼
-draft proposes candidates
-      │
-      ▼
-target materializes temporary KV
-      │
-      ▼
-verify longest greedy prefix
-      │
-      ├── accepted KV stays visible
-      └── rejected suffix is rolled back
-      │
-      ▼
-commit logical output
-```
+By v0.7 the in-process runtime already has explicit semantics for:
 
----
+- request lifecycle;
+- token-budget scheduling;
+- paged KV ownership;
+- prefix sharing;
+- preemption/recompute;
+- speculative checkpoint/rollback.
 
-## 2. Why v0.7 follows v0.6
+The remaining architectural coupling is that Engine currently invokes ModelRunner/KV work directly. v0.8 asks:
 
-v0.6 introduced explicit invalidation and replay: logical token history can survive while physical KV is discarded and reconstructed.
+> Which state and decisions must remain centralized in EngineCore, and which work can move behind an Executor/Worker interface without changing semantics?
 
-Speculative decoding needs the same distinction in a more local transactional form. Draft tokens are intentionally computed before the runtime knows whether they belong to durable output history.
-
-The new systems question is:
-
-> How can temporary candidate K/V be created, verified, partially accepted, and safely discarded without leaking rejected tokens into later attention or request history?
-
----
-
-## 3. Core state model
-
-v0.7 distinguishes three frontiers:
+## 3. Primary mental model
 
 ```text
-committed logical history
-        │
-        ├── prompt_token_ids
-        └── output_token_ids
-
-stable computed frontier
-        │
-        └── num_computed_tokens
-
-speculative temporary frontier
-        │
-        └── K/V written after CacheCheckpoint
-```
-
-Draft proposals never enter `output_token_ids` before verification.
-
----
-
-## 4. New abstractions
-
-### DraftProvider
-
-```text
-Request
-   │
-   ▼
-DraftProvider.propose(max_tokens=N)
-   │
-   ▼
-DraftBatch(token_ids=(...))
-```
-
-`ScriptedDraftProvider` is the correctness tool for accept/reject tests. `IncrementDraftProvider` is a deliberately weak deterministic default; it is not presented as a production draft model.
-
-### CacheCheckpoint
-
-```python
-CacheCheckpoint(
-    request_id,
-    num_tokens,
-    block_table,
-)
-```
-
-It protects the stable block-table prefix before temporary writes.
-
-### VerificationResult
-
-Every speculation transaction records:
-
-- draft candidates;
-- accepted prefix;
-- rejected suffix;
-- target fallback token on mismatch;
-- target bonus token when all candidates match;
-- checkpoint position;
-- rollback frontier.
-
-The result is exposed through `EngineStepOutput.speculation`.
-
----
-
-## 5. Verification semantics
-
-The first v0.7 implementation deliberately uses greedy target verification.
-
-Suppose stable logits predict `t0` and the draft proposes:
-
-```text
-[d0 d1 d2]
-```
-
-Target verification is:
-
-```text
-d0 ?= greedy(stable_logits)
-d1 ?= greedy(logits after d0)
-d2 ?= greedy(logits after d1)
-```
-
-### Partial accept
-
-```text
-draft:  [A B C]
-target: [A X ...]
-
-accepted = [A]
-rejected = [B C]
-fallback = X
-```
-
-The target model may already have written K/V for all draft tokens. Rollback keeps K/V through accepted `A`, discards the rejected suffix, and leaves target fallback `X` as a logical-but-not-yet-computed output token.
-
-### Accept all
-
-```text
-draft:  [A B C]
-target: [A B C]
-```
-
-All candidate K/V remains valid. The target logits after `C` produce one bonus token `D`:
-
-```text
-committed output = [A B C D]
-computed KV      = [A B C]
-D remains pending for the next ordinary decode step
-```
-
-This preserves the sampled-but-not-yet-computed invariant used by earlier versions.
-
----
-
-## 6. Transactional cache
-
-v0.7 introduces:
-
-```text
-PrefixCachingPagedKVCache
+EngineCore
+  request state
+  Scheduler
+  admission / victim policy
         │
         ▼
-TransactionalPrefixCachingPagedKVCache
-```
-
-The subclass owns checkpoint/rollback semantics without changing v0.1-v0.6 cache behavior.
-
-### Checkpoint invariant
-
-A checkpoint is created only at the current valid KV frontier:
-
-```text
-checkpoint.num_tokens == current used-token frontier
-```
-
-### Rollback invariant
-
-Rollback may discard only request-private state created at or after the checkpoint.
-
-It may not:
-
-- cross behind the checkpoint;
-- mutate the stable block-table prefix;
-- free cached immutable prefix blocks;
-- free a shared mutable block;
-- retain block-table entries that are no longer addressable.
-
-### Cross-block rollback
-
-If speculative tokens allocate new physical blocks, partial verification can shrink the block table and recycle rejected blocks.
-
----
-
-## 7. Shared-prefix safety
-
-Prefix-cache blocks are immutable and may be shared by multiple requests. Speculation begins after the stable request prefix, so temporary K/V belongs to the request-private tail.
-
-```text
-shared prefix block
-     │
-     ├── request A
-     └── request B
-
-B speculates and rolls back
-     │
-     └── shared prefix bytes remain unchanged
-```
-
----
-
-## 8. Interaction with v0.6 preemption
-
-The scheduler remains `PreemptiveBudgetedScheduler`.
-
-Normal scheduled work still participates in v0.6 pressure handling. Speculation itself is optional acceleration:
-
-```text
-speculative extra KV fits
+ExecutionRequest
         │
-        ├── yes -> speculate
-        └── no  -> ordinary target sampling
-```
-
-v0.7 does **not** preempt another active request merely to make speculative acceleration fit.
-
----
-
-## 9. Token-budget simplification
-
-`max_num_batched_tokens` still accounts for ordinary scheduler work only. Temporary target verification tokens created inside a speculation transaction are not yet charged back into the scheduler token budget. This is intentional for the first reference implementation.
-
----
-
-## 10. Important source files
-
-```text
-mini_vllm/cache/base.py
-        ↓
-mini_vllm/cache/transactional.py
-        ↓
-mini_vllm/speculative/types.py
-mini_vllm/speculative/draft.py
-mini_vllm/speculative/engine.py
-        ↓
-mini_vllm/model/tiny_transformer.py
-mini_vllm/model/runner.py
-        ↓
-mini_vllm/versions/v0_7/engine.py
-        ↓
-tests/test_speculative.py
-examples/08_speculative_decoding.py
-```
-
-Recommended comparison:
-
-```bash
-git diff v0.6..v0.7 -- mini_vllm tests examples version.md
-```
-
----
-
-## 11. Tests and validation
-
-v0.7 validates:
-
-- accept-all draft verification;
-- target bonus token after full acceptance;
-- reject-first fallback behavior;
-- partial acceptance;
-- rejected suffix removal from logical history;
-- rollback across a physical block boundary;
-- accepted speculative K/V remains valid;
-- shared immutable prefix blocks remain byte-for-byte unchanged;
-- greedy speculative generation equals ordinary v0.6 greedy generation;
-- ordinary v0.1-v0.6 regression behavior remains valid;
-- executable transaction trace works end to end.
-
-The frozen local snapshot passes **27 tests** plus all eight executable examples.
-
----
-
-## 12. Learning goals
-
-After v0.7, the learner should be able to explain:
-
-- why draft tokens are proposals rather than output history;
-- why target verification needs per-token logits, not only final chunk logits;
-- how speculative K/V can exist before logical commit;
-- why rollback must truncate physical ownership as well as logical token lists;
-- why accepted draft tokens may keep their already-computed KV;
-- why one target fallback/bonus token remains logically committed but physically uncomputed;
-- why shared prefix blocks must lie outside the mutable speculative tail;
-- why speculation is a transaction layered on top of, not inside, the scheduler.
-
----
-
-## 13. Explicit non-goals
-
-- learned neural draft model;
-- stochastic speculative acceptance;
-- EOS-aware multi-token speculative policy;
-- charging draft/verification work to scheduler token budget;
-- Medusa / EAGLE / multi-head speculation;
-- production verification kernels;
-- distributed speculation;
-- async streaming changes;
-- Executor / Worker process separation;
-- CUDA/Triton optimization.
-
----
-
-## 14. Next version
-
-`v0.8` introduces the **EngineCore / Executor / Worker boundary**.
-
-After v0.7, request lifecycle, scheduling, cache ownership, memory pressure, and speculative transactions are explicit within one process. The next architectural question is:
-
-> Which logic belongs to the central engine core, and which work can move behind an executor/worker interface without changing semantics?
-
-```text
-EngineCore
-   │ SchedulerOutput / execution request
-   ▼
+        ▼
 Executor
-   ▼
-Worker / ModelRunner / KV backend
-   │ execution result
-   ▼
-EngineCore
+        │
+        ▼
+Worker
+  ModelRunner
+  KV backend execution
+        │
+        ▼
+ExecutionResult
+        │
+        ▼
+EngineCore commit/update
 ```
+
+The first implementation should remain single-process through `LocalExecutor`. The learning target is ownership boundaries, not multiprocessing complexity.
+
+## 4. Required abstractions
+
+Introduce small explicit data/contracts such as:
+
+```text
+EngineCore
+ExecutionRequest
+ExecutionResult
+Executor
+LocalExecutor
+Worker
+```
+
+Do not move waiting/running queues or victim selection into Worker.
+
+## 5. Ownership rules
+
+### EngineCore owns policy
+
+EngineCore should continue to own:
+
+- request registry and logical history;
+- Scheduler;
+- admission ordering;
+- token budgets;
+- preemption victim policy;
+- finishing/cancellation decisions;
+- logical commit of sampling/speculation results.
+
+### Worker owns execution mechanism
+
+Worker may own or invoke:
+
+- ModelRunner;
+- physical KV backend operations;
+- model forward execution;
+- target verification execution;
+- execution-local tensors.
+
+### Executor owns transport/orchestration
+
+Executor receives explicit execution requests and returns explicit execution results. `LocalExecutor` directly invokes a Worker but must use the same contract a future remote/multiprocess executor could use.
+
+## 6. Critical invariants
+
+### Semantic-equivalence invariant
+
+Moving execution behind `LocalExecutor` must not change deterministic outputs or request state transitions relative to v0.7.
+
+### Policy-ownership invariant
+
+Worker must not decide:
+
+- who gets admitted;
+- who gets preempted;
+- scheduler priority;
+- when a request is logically finished.
+
+### Execution-contract invariant
+
+Everything required for execution must cross the EngineCore→Executor boundary explicitly rather than being read from hidden Engine internals.
+
+### Transaction invariant
+
+Speculative checkpoint/verification/rollback semantics must survive the executor boundary without allowing rejected tokens to leak into logical history.
+
+## 7. Preferred implementation order
+
+```text
+1. define ExecutionRequest / ExecutionResult
+2. wrap current ModelRunner + cache in Worker
+3. add Executor interface
+4. add LocalExecutor reference path
+5. refactor Engine into EngineCore coordination + executor call
+6. preserve preemption behavior
+7. preserve speculative transaction behavior
+8. add equivalence tests
+```
+
+## 8. Acceptance criteria
+
+v0.8 cannot be frozen until:
+
+- [ ] normal prefill/decode work executes through `LocalExecutor`;
+- [ ] Worker contains no waiting/running queue policy;
+- [ ] EngineCore still owns admission and preemption decisions;
+- [ ] v0.7 greedy/speculative outputs remain identical after refactor;
+- [ ] prefix cache and paged block ownership remain correct;
+- [ ] preemption/recompute regressions pass;
+- [ ] speculative accept-all/reject-first/partial-accept regressions pass;
+- [ ] execution request/result payloads are inspectable and tested;
+- [ ] a local executor failure is surfaced explicitly rather than silently corrupting request state;
+- [ ] an executable example traces EngineCore → Executor → Worker → result;
+- [ ] all v0.1-v0.7 tests continue to pass;
+- [ ] validated implementation is synchronized to `main`.
+
+## 9. Explicit non-goals
+
+- multiprocessing in the first increment;
+- RPC/network transport;
+- multi-GPU execution;
+- tensor parallelism — `v0.9`;
+- async streaming — `v0.10`;
+- CUDA Graph or compiled execution;
+- Triton/CUDA PagedAttention.
+
+## 10. Next version
+
+`v0.9` introduces **distributed / tensor-parallel execution concepts**. The executor/worker boundary from v0.8 is the prerequisite: distribution should change transport/topology, not force scheduler/cache semantics to be redesigned.
