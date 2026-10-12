@@ -1,17 +1,15 @@
 # Exercises
 
-## v0.1 — inspect the baseline
+## Inspect paged KV
 
-1. Set `max_model_len=256` and inspect how much contiguous capacity is reserved per active request.
-2. Instrument `Request.num_computed_tokens` before and after prefill/decode.
-3. Add `arrival_step` and `finished_step`; compute latency in engine steps.
-4. Add a `RoundRobinScheduler` without modifying `Engine`.
-5. Add stop-token sets instead of one global `eos_token_id`.
+1. Change `block_size` from 2 to 16 and explain internal fragmentation.
+2. Print `block_table(request_id)` after every decode step and observe when a new block is allocated.
+3. Compare reserved token slots in contiguous versus paged cache.
+4. Force a tiny physical block pool and observe allocation failure.
 
-## Next exercise
+## Extend
 
-After understanding the static cohort, checkout `v0.2` and compare scheduler behavior:
-
-```bash
-git diff v0.1..v0.2 -- mini_vllm/scheduler tests examples version.md
-```
+1. Add cache-allocation failure metrics.
+2. Add a RoundRobin scheduler without changing cache/model code.
+3. Design v0.4's `BudgetedContinuousScheduler` with `sum(work_item.num_tokens) <= max_num_batched_tokens`.
+4. Explain what new ownership/refcount rules v0.5 prefix caching will require.

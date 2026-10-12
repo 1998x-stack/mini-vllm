@@ -2,61 +2,47 @@
 
 ## Core invariant
 
-For every request:
-
 ```text
 0 <= num_computed_tokens <= len(prompt_token_ids + output_token_ids)
 ```
 
-Every cache position `< num_computed_tokens` has been written by the model. The newest sampled output may exist in `output_token_ids` while remaining uncomputed until the next decode iteration.
+Every cache position below `num_computed_tokens` has been written by the model. A sampled output token may exist while still uncomputed until the next decode iteration.
 
 ## Engine step
 
 ```text
 scheduler.schedule()
-        │
-        ▼
+        ↓
 ScheduleDecision
-        │
-        ▼
+        ↓
 cache.ensure_capacity()
-        │
-        ▼
+        ↓
 model_runner.execute()
-        │
-        ▼
-logits per request
-        │
-        ▼
+        ↓
 sampler.sample()
-        │
-        ▼
-append output token
-        │
-   ┌────┴─────┐
-   │ finished?│
-   └────┬─────┘
-      yes│ no
-         │
-cache.free()  next iteration
+        ↓
+append output
+        ↓
+finish/free or next iteration
 ```
 
-## Prefill vs decode
+## Paged cache
 
-For v0.1-v0.3, prefill work is all remaining prompt tokens and decode work is exactly the newly sampled token that has not yet been computed. v0.4 will make prompt work chunkable under a step-level token budget.
+```text
+free_blocks: deque[int]
+block_tables: dict[request_id, list[physical_block_id]]
+```
 
-## Why cache is below the runner
+For logical token position `p`:
 
-The model's attention algorithm should not care whether logical positions are stored in a contiguous per-request slab or a future physical block pool. It consumes a logical storage contract.
+```text
+logical_block = p // block_size
+block_offset  = p % block_size
+physical      = block_table[logical_block]
+```
+
+The reference `read_prefix()` gathers paged K/V before ordinary PyTorch attention. A future optimized kernel may fuse the translation with attention, but must preserve identical semantics.
 
 ## Extension seams
 
-```text
-Scheduler
-KVCacheBackend
-ModelRunner
-Sampler
-Engine
-```
-
-Future versions should add strategies or richer contracts at these seams rather than scattering feature-specific conditionals through the engine.
+`Scheduler`, `KVCacheBackend`, `ModelRunner`, `Sampler`, and `Engine` are the stable boundaries. Future versions should evolve these contracts deliberately instead of scattering version conditionals.

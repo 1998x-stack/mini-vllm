@@ -22,10 +22,18 @@ class EngineConfig:
 
 @dataclass(frozen=True, slots=True)
 class CacheConfig:
-    """Cache device/dtype for the contiguous baseline."""
+    """KV-cache configuration for paged allocation."""
 
+    block_size: int = 4
+    num_blocks: int = 64
     dtype: torch.dtype = torch.float32
     device: str = "cpu"
+
+    def __post_init__(self) -> None:
+        if self.block_size <= 0:
+            raise ValueError("block_size must be > 0")
+        if self.num_blocks <= 0:
+            raise ValueError("num_blocks must be > 0")
 
 
 @dataclass(frozen=True, slots=True)

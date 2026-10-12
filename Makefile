@@ -6,6 +6,8 @@ test:
 examples:
 	python examples/01_basic_generate.py
 	python examples/02_static_vs_continuous.py
+	python examples/03_page_table_walkthrough.py
+	python examples/04_compare_cache_waste.py
 
 check:
 	./scripts/check.sh
