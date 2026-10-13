@@ -1,281 +1,209 @@
-# mini-vLLM v0.9 — distributed / tensor-parallel execution (planning branch)
+# mini-vLLM v0.9 — logical multi-rank + reference tensor parallel
 
 ## 1. Version identity
 
 - **Branch:** `v0.9`
-- **Base:** latest validated `v0.8` / `main`
 - **Previous version:** `v0.8`
-- **Theme:** WorkerGroup, rank/world-size execution, reference collectives, and educational tensor parallelism
-- **Status:** planning / implementation target; runtime still behaves as v0.8 until acceptance criteria pass
+- **Theme:** WorkerGroup, explicit rank/world-size, reference collectives, and educational tensor-parallel execution
+- **Status rule:** implementation is eligible for release only when the exact v0.9 commit has a green repository CI run; the released `main` pointer is the source of truth for validated state
 
-v0.8 created the execution boundary:
+v0.8 established `EngineCore -> Executor -> Worker`. v0.9 changes the execution topology without moving Scheduler/admission/preemption/sampling policy out of EngineCore.
 
-```text
-EngineCore -> Executor -> Worker
-```
-
-v0.9 asks the next question:
-
-> How can one logical execution request be executed by several workers/ranks without moving scheduling policy out of EngineCore or changing model semantics?
-
----
-
-## 2. Why v0.9 follows v0.8
-
-Before v0.8, adding multiple workers would have forced scheduler state, request objects, cache internals, and model execution into the same distributed design problem.
-
-v0.8 makes the boundary explicit. v0.9 can therefore change only the execution topology:
+## 2. Primary mental model
 
 ```text
-v0.8
 EngineCore
-   │
+   │ policy-free ExecutionRequest
    ▼
-Executor
-   │
-   ▼
-Worker
-
-v0.9
-EngineCore
-   │
-   ▼
-Executor
-   │
-   ▼
-WorkerGroup
- ├─ Worker(rank=0)
- ├─ Worker(rank=1)
- └─ ...
-```
-
-Scheduler/admission/preemption semantics should remain centralized and unchanged.
-
----
-
-## 3. Primary mental model
-
-Start with a deterministic, single-process simulation of ranks rather than real NCCL/multiprocessing:
-
-```text
-ExecutionRequest
-      │
-      ▼
 DistributedExecutor
-      │
+   ▼
+WorkerGroup(world_size=N)
+ ┌────┼────┐
+ ▼    ▼    ▼
+rank0 rank1 ...
+ │    │
+rank-local tensor work
+ └────┼────┘
       ▼
-WorkerGroup(world_size=2)
-   ┌──────────┴──────────┐
-   ▼                     ▼
-rank 0                 rank 1
-local shard            local shard
-   │                     │
-   └──────────┬──────────┘
-              ▼
-      reference collective
-              │
-              ▼
-       ExecutionResult
+ReferenceCollective
+      ▼
+ExecutionResult
+      ▼
+EngineCore logical commit
 ```
 
-The first version teaches topology and tensor semantics; transport/performance comes later.
-
----
-
-## 4. Required abstractions
-
-### RankConfig
-
-Represent at least:
+The first serving-integrated tensor-parallel operation shards the LM-head vocabulary rows:
 
 ```text
-rank
-world_size
+full W[V,H]
+   ├─ rank 0: W[0:k0]
+   ├─ rank 1: W[k0:k1]
+   └─ ...
+
+replicated hidden h
+   ↓
+local logits shards
+   ↓
+all_gather
+   ↓
+full logits[V]
 ```
 
-Validate `0 <= rank < world_size` and make rank ownership explicit rather than relying on global state.
+Transformer trunk and KV cache remain replicated per rank on purpose. v0.9 teaches topology and collective semantics before real process/GPU transport or distributed KV ownership.
+
+## 3. Added mechanisms
+
+### Explicit rank ownership
+
+`RankConfig(rank, world_size)` validates `world_size > 0` and `0 <= rank < world_size`. No hidden global rank state is used.
+
+### Reference collectives
+
+`ReferenceCollective` provides explicit single-process mathematical oracles:
+
+- `all_gather`
+- `all_reduce_sum`
+
+### Tensor-parallel math oracle
+
+`ReferenceTensorParallel` demonstrates:
+
+- output/column-sharded linear reconstruction through gather;
+- input/row-sharded linear reconstruction through all-reduce sum.
+
+Balanced contiguous shard ranges support uneven dimensions.
+
+### Serving-integrated vocabulary parallelism
+
+`VocabParallelLMHead` stores/computes only one vocabulary-row shard. `VocabParallelTinyRunner` executes the replicated TinyDecoder trunk against a rank-local KV cache and returns only that rank's logits shard for both normal and speculative target execution.
 
 ### WorkerGroup
 
-A WorkerGroup owns an ordered set of workers/ranks and executes one logical request across them. It must not own Scheduler queues or request admission policy.
-
-### Collective abstraction
-
-Introduce a tiny reference collective interface, initially implemented with ordinary PyTorch tensors in one process. Candidate operations:
-
-```text
-all_reduce_sum
-all_gather
-broadcast
-```
-
-Only add operations actually required by the educational tensor-parallel path.
+`WorkerGroup` owns exactly one ordered Worker per rank `0..world_size-1`. It owns execution topology only; it has no Scheduler, waiting/running queue, admission policy, or preemption-victim logic.
 
 ### DistributedExecutor
 
-Implement the existing Executor contract while routing execution through WorkerGroup. EngineCore should not need version-specific branches to know whether execution is local or distributed.
+`DistributedExecutor` satisfies the existing v0.8 `Executor` contract. EngineCore therefore needs no branch for distributed scheduling.
 
----
+## 4. TinyDecoder contract change
 
-## 5. Educational tensor parallelism
-
-Start with one simple model operation, not full production Transformer sharding.
-
-Preferred progression:
+`TinyDecoderLM` adds `forward_chunk_hidden_trace()`, which materializes K/V and returns final-normalized hidden states. The historical path remains:
 
 ```text
-reference Linear
-      │
-      ▼
-shard weight across 2 ranks
-      │
-      ├─ rank 0 local matmul
-      └─ rank 1 local matmul
-      │
-      ▼
-reference collective
-      │
-      ▼
-reconstruct full/reference output
+hidden trace -> full lm_head -> full logits
 ```
 
-Then integrate the smallest useful shard into the Tiny Decoder while retaining an unsharded correctness oracle.
+v0.9 instead uses:
 
-The purpose is to understand:
+```text
+hidden trace -> local lm_head shard -> collective -> full logits
+```
 
-- what is sharded;
-- what each rank computes locally;
-- where communication is required;
-- which tensors must become identical again;
-- why distribution is below EngineCore policy.
+This keeps model semantics shared between the reference and distributed paths.
 
----
+## 5. KV-cache scope
 
-## 6. KV-cache scope
+v0.9 uses explicit replicated caches:
 
-Do not immediately build production distributed KV management.
+```text
+rank 0 -> TransactionalPrefixCachingPagedKVCache #0
+rank 1 -> TransactionalPrefixCachingPagedKVCache #1
+...
+```
 
-The first v0.9 increment may keep each educational worker's cache ownership simple as long as the contract is explicit. If KV is replicated, document that. If KV heads are partitioned, test reconstruction/equivalence explicitly.
+WorkerGroup requires replicas to agree on reusable-prefix length, capacity outcome, and cache statistics. The version does not claim KV-head sharding or production distributed cache management.
 
-Do not hide inconsistent ownership behind global dictionaries.
+## 6. Distributed failure atomicity
 
----
+A normal forward may fail after an earlier rank has already written K/V. Therefore logical no-commit alone is insufficient.
+
+Before rank-local normal execution, WorkerGroup checkpoints every participating rank at the WorkItem start frontier:
+
+```text
+checkpoint all ranks
+      ↓
+rank-local forwards
+      ├─ all succeed -> gather logits -> keep physical work
+      └─ any failure -> rollback every rank -> surface exception
+```
+
+Only after a successful `ExecutionResult` does EngineCore advance `num_computed_tokens` or logical output.
+
+Speculative decoding already creates a transaction checkpoint before target verification. `DistributedExecutor.checkpoint/rollback` expands that transaction across all rank replicas, preserving v0.7 accept/reject/exception semantics.
 
 ## 7. Critical invariants
 
-### Policy-location invariant
+- **Policy-location:** one EngineCore/Scheduler policy exists regardless of world size.
+- **Rank consistency:** ranks agree on world size, request identity, token positions, operation ordering, prefix reuse, and replicated cache lifecycle.
+- **Collective:** rank-local shards plus the specified collective reconstruct the unsharded mathematical result.
+- **Semantic equivalence:** deterministic v0.9 world-size 1/2 execution matches the v0.8 target-model token history.
+- **Distributed failure:** a partial rank failure cannot leave surviving replicas physically advanced while EngineCore stays logically uncommitted.
 
-Multiple workers must not create multiple schedulers. Admission, token budgets, victim selection, logical sampling/commit, and finish decisions remain in EngineCore.
+## 8. Mechanisms intentionally unchanged
 
-### Rank-consistency invariant
-
-All ranks participating in one logical execution must agree on request identity, token positions, and execution step ordering.
-
-### Collective invariant
-
-Reference collective operations must produce mathematically defined results independent of call-site ordering assumptions.
-
-### Semantic-equivalence invariant
-
-For deterministic target execution:
-
-```text
-single-worker reference output
-             ==
-multi-worker/tensor-parallel output
-```
-
-within an explicit numerical tolerance for logits and exactly for greedy token histories where applicable.
-
-### Failure-visibility invariant
-
-A rank/worker execution failure must surface through Executor. EngineCore must not commit logical request state for a partially completed distributed execution.
-
----
-
-## 8. Interaction with earlier versions
-
-v0.9 must preserve:
+v0.9 preserves:
 
 - v0.4 token-budget scheduling;
 - v0.5 prefix-cache ownership semantics;
-- v0.6 preemption policy;
-- v0.7 speculative transaction correctness;
-- v0.8 policy-free execution payloads and failure-before-commit rule.
+- v0.6 preemption/recompute policy;
+- v0.7 speculative transaction semantics;
+- v0.8 policy-free execution payloads and failure-before-logical-commit rule.
 
-Distributed topology is not permission to move those semantics into WorkerGroup.
-
----
-
-## 9. Acceptance criteria
-
-v0.9 cannot be frozen until all applicable items are true:
-
-- [ ] `RankConfig` validates rank/world-size ownership;
-- [ ] `WorkerGroup` executes deterministic multi-rank reference work;
-- [ ] at least one reference collective is implemented and unit-tested;
-- [ ] one educational tensor-parallel operation reconstructs the single-worker reference result;
-- [ ] `DistributedExecutor` satisfies the existing Executor contract;
-- [ ] EngineCore requires no distributed scheduling branch;
-- [ ] WorkerGroup contains no waiting/running queues or victim policy;
-- [ ] distributed execution failure does not advance logical request state;
-- [ ] deterministic single-worker and multi-worker logits/token histories are equivalent;
-- [ ] speculative execution remains correct across the executor topology chosen for v0.9;
-- [ ] v0.1-v0.8 regression tests continue to pass;
-- [ ] an executable example makes rank-local compute + collective reconstruction visible;
-- [ ] repository CI passes on the exact release candidate;
-- [ ] validated implementation is synchronized to `main` only after that CI gate.
-
----
-
-## 10. Preferred implementation order
+## 9. Important source files
 
 ```text
-1. RankConfig
-2. reference collective interface
-3. WorkerGroup
-4. tiny sharded linear reference experiment
-5. DistributedExecutor
-6. single-vs-multi-worker equivalence tests
-7. integrate smallest Tiny Decoder shard
-8. speculative/preemption regression coverage
-9. educational trace/example
+mini_vllm/distributed/rank.py
+mini_vllm/distributed/collective.py
+mini_vllm/distributed/tensor_parallel.py
+mini_vllm/distributed/worker_group.py
+mini_vllm/distributed/executor.py
+mini_vllm/model/tensor_parallel_runner.py
+mini_vllm/model/tiny_transformer.py
+mini_vllm/versions/v0_9/engine.py
+tests/test_distributed.py
+tests/test_v09_integration.py
+examples/10_tensor_parallel.py
 ```
 
-Keep each layer inspectable before adding the next.
+Recommended comparison:
 
----
+```bash
+git diff v0.8..v0.9 -- mini_vllm tests examples version.md
+```
 
-## 11. Explicit non-goals
+## 10. Validation contract
 
-- real multi-node deployment;
-- NCCL process groups in the first increment;
-- GPU peer-to-peer optimization;
-- production tensor-parallel kernels;
-- pipeline parallelism;
-- expert parallelism / MoE routing;
-- worker autoscaling;
-- distributed fault recovery;
-- async streaming — `v0.10`;
-- CUDA Graph / compile integration — later;
-- Triton/CUDA PagedAttention — later.
+The exact commit promoted to `main` must pass GitHub Actions `./scripts/check.sh`. Coverage includes:
 
----
+- invalid rank/world-size ownership;
+- all-gather/all-reduce semantics;
+- uneven vocabulary sharding;
+- column/row parallel reconstruction;
+- DistributedExecutor/WorkerGroup composition;
+- absence of Scheduler policy in WorkerGroup;
+- v0.8 vs v0.9 deterministic token-history equivalence;
+- world-size=1 degenerate topology;
+- normal + speculative execution through WorkerGroup;
+- rank failure rollback of replicated KV before logical commit;
+- all historical regression tests;
+- executable examples through `examples/10_tensor_parallel.py`.
 
-## 12. Learning goals
+## 11. Learning goals
 
-After v0.9, the learner should be able to explain:
+After v0.9, a learner should be able to explain rank vs world size, local tensor shard vs global tensor, all-gather vs all-reduce, why Scheduler remains singular, why distribution lives below Executor, why replicated KV is an explicit simplification, and why distributed physical rollback is required in addition to logical no-commit.
 
-- why EngineCore should remain single-policy even with many workers;
-- rank vs world size;
-- local tensor shard vs reconstructed global tensor;
-- why tensor parallelism requires collectives;
-- the difference between Executor transport and WorkerGroup topology;
-- why a distributed failure must abort logical commit;
-- how single-worker reference execution acts as a correctness oracle.
+## 12. Explicit non-goals
 
----
+- multiprocessing/RPC transport;
+- NCCL/process groups;
+- real multi-GPU placement;
+- attention/MLP tensor-parallel serving integration;
+- KV-head sharding;
+- pipeline/expert parallelism;
+- production distributed fault recovery;
+- async streaming/cancellation;
+- optimized CUDA/Triton kernels.
 
 ## 13. Next version
 
-`v0.10` introduces the **async engine + streaming/cancellation** boundary. Once execution topology is explicit, request submission and output delivery can become asynchronous without hiding scheduling or worker semantics.
+`v0.10` introduces the async engine + streaming/cancellation boundary. It should wrap the synchronous EngineCore/WorkerGroup runtime without moving Scheduler or collective semantics into the delivery layer.

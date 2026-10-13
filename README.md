@@ -2,91 +2,104 @@
 
 A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the systems ideas behind vLLM.
 
-## Current integrated version
+## Current line
 
-`main` remains the latest fully released line. `v0.8` is the current release candidate until its full repository CI gate passes.
+`main` is always the newest validated release. `v0.9` is the current implementation line; a v0.9 commit is synchronized to `main` only when that exact commit passes repository CI.
 
 ```text
-main
-  ├── v0.1  static batching + contiguous KV
-  ├── v0.2  continuous batching
-  ├── v0.3  paged KV + block tables
-  ├── v0.4  token budget + chunked prefill
-  ├── v0.5  prefix caching + shared KV ownership
-  ├── v0.6  KV-pressure preemption + recomputation
-  ├── v0.7  speculative decoding + transactional KV
-  └── v0.8  EngineCore / Executor / Worker boundary   release candidate
+v0.1  static batching + contiguous KV
+v0.2  continuous batching
+v0.3  paged KV + block tables
+v0.4  token budget + chunked prefill
+v0.5  prefix caching + shared KV ownership
+v0.6  KV-pressure preemption + recomputation
+v0.7  speculative decoding + transactional KV
+v0.8  EngineCore / Executor / Worker boundary
+v0.9  logical multi-rank + reference tensor parallel   ← current
+v0.10 async engine + streaming/cancellation            ← next
 ```
-
-After the v0.8 CI gate passes, it is synchronized to `main`; the next planned branch is `v0.9` — distributed / tensor-parallel execution concepts.
-
-## Version ladder
-
-| Branch | Primary mechanism | Main question |
-|---|---|---|
-| `v0.1` | static batching + contiguous KV | what is the smallest serving loop? |
-| `v0.2` | continuous batching | how are free sequence slots refilled? |
-| `v0.3` | paged KV | how can growing KV avoid contiguous slabs? |
-| `v0.4` | token budget + chunked prefill | how much token work runs per step? |
-| `v0.5` | prefix cache + refcounts | how can identical prefixes share immutable KV? |
-| `v0.6` | recompute preemption | what happens when active KV no longer fits? |
-| `v0.7` | speculative transaction | how can temporary draft state be verified and rolled back safely? |
-| `v0.8` | EngineCore / Executor / Worker | where should centralized policy end and execution begin? |
 
 Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-## v0.8 mental model
+## v0.9 mental model
 
 ```text
 CONTROL / POLICY
 
-Request registry
-     │
-     ▼
- EngineCore
- ├─ Scheduler
- ├─ admission / token budget
- ├─ preemption victim policy
- ├─ sampling / logical commit
- └─ finish decisions
-     │
-     ▼
+EngineCore
+  Scheduler / request state / sampling / preemption
+      │
+      ▼
 ExecutionRequest
 
-================ boundary ================
+================ execution boundary ================
 
-EXECUTION
+DistributedExecutor
+      │
+      ▼
+WorkerGroup(world_size=2)
+   ┌───────────────┴───────────────┐
+   ▼                               ▼
+rank 0                            rank 1
+replicated trunk + KV             replicated trunk + KV
+LM-head rows [0:k)                LM-head rows [k:V)
+   │                               │
+   ▼                               ▼
+local logits shard                local logits shard
+   └───────────────┬───────────────┘
+                   ▼
+         ReferenceCollective
+              all_gather
+                   │
+                   ▼
+             full logits
 
- LocalExecutor
-     │
-     ▼
-   Worker
- ├─ ModelRunner
- └─ KV backend
-     │
-     ▼
-ExecutionResult
+================ execution boundary ================
 
-================ boundary ================
-
-     │
-     ▼
- EngineCore validates + commits
+                   │
+                   ▼
+              EngineCore
+          logical sample / commit
 ```
 
-The central invariant is:
+The first tensor-parallel integration intentionally shards only the vocabulary projection. Transformer trunk weights and KV cache are replicated per rank. That makes the first distributed version explicit about what is and is not distributed.
+
+## Why this order?
+
+v0.8 first separated policy from execution. v0.9 can therefore change execution topology without adding a second Scheduler or sending mutable `Request` objects to workers.
+
+Core invariants:
 
 ```text
-Execution payloads carry execution facts, not mutable Request policy objects.
+one EngineCore policy
+many execution ranks
+
+rank-local tensor shard
+      +
+reference collective
+      =
+single-worker mathematical result
 ```
 
-`ExecutionItem` contains only `request_id`, token IDs, and a start position. Worker therefore does not get scheduler queues, request status, priority, or victim-selection state through the execution payload.
+If one rank fails during an ordinary forward, WorkerGroup rolls every rank back to the pre-forward cache checkpoint and surfaces the exception. EngineCore does not advance logical request state.
 
-## Why LocalExecutor first?
+## Educational tensor parallel primitives
 
-The first executor stays synchronous and in-process. That proves ownership and message contracts before adding multiprocessing, RPC, multi-GPU topology, or distributed failure modes.
+```text
+RankConfig
+ReferenceCollective
+  ├─ all_gather
+  └─ all_reduce_sum
+ReferenceTensorParallel
+  ├─ column_parallel_linear
+  └─ row_parallel_linear
+VocabParallelLMHead
+VocabParallelTinyRunner
+WorkerGroup
+DistributedExecutor
+```
 
-Historical builders still work: if an older version supplies `cache + model_runner`, `EngineCore` automatically wraps them in `Worker + LocalExecutor`. Frozen historical branches themselves remain unchanged.
+The runtime remains single-process: logical ranks are simulated with ordinary PyTorch tensors. No NCCL, multiprocessing, or multi-node transport is hidden behind the reference implementation.
 
 ## Install and verify
 
@@ -97,36 +110,36 @@ pip install -e '.[dev]'
 ./scripts/check.sh
 ```
 
-The v0.8 boundary-focused local harness passed 5/5 tests during implementation. The repository CI runs the canonical `./scripts/check.sh` on the complete checkout and is the release gate for v0.8.
+The release rule is deliberately strict: the exact commit promoted to `main` must have a green GitHub Actions run executing `./scripts/check.sh`.
 
-Run the v0.8 architecture trace:
+Run the v0.9 trace:
 
 ```bash
-python examples/09_executor_boundary.py
+python examples/10_tensor_parallel.py
 ```
+
+It prints each rank's vocabulary shard and compares the final v0.9 token history with the v0.8 single-worker reference.
 
 ## Learn through branch diffs
 
 ```bash
-git diff v0.1..v0.2 -- mini_vllm/scheduler tests examples version.md
-git diff v0.2..v0.3 -- mini_vllm/cache tests examples version.md
-git diff v0.3..v0.4 -- mini_vllm tests examples version.md
-git diff v0.4..v0.5 -- mini_vllm/cache mini_vllm/core tests examples version.md
-git diff v0.5..v0.6 -- mini_vllm tests examples version.md
 git diff v0.6..v0.7 -- mini_vllm tests examples version.md
 git diff v0.7..v0.8 -- mini_vllm tests examples version.md
+git diff v0.8..v0.9 -- mini_vllm tests examples version.md
 ```
 
-For v0.8, focus on:
+For v0.9 focus on:
 
 ```text
-mini_vllm/execution/types.py
-mini_vllm/execution/executor.py
-mini_vllm/execution/worker.py
-mini_vllm/core/engine.py
-mini_vllm/speculative/engine.py
-mini_vllm/versions/v0_8/engine.py
-tests/test_executor_boundary.py
-tests/test_v08_integration.py
-examples/09_executor_boundary.py
+mini_vllm/distributed/rank.py
+mini_vllm/distributed/collective.py
+mini_vllm/distributed/tensor_parallel.py
+mini_vllm/distributed/worker_group.py
+mini_vllm/distributed/executor.py
+mini_vllm/model/tensor_parallel_runner.py
+mini_vllm/model/tiny_transformer.py
+mini_vllm/versions/v0_9/engine.py
+tests/test_distributed.py
+tests/test_v09_integration.py
+examples/10_tensor_parallel.py
 ```

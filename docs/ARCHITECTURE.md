@@ -1,71 +1,106 @@
-# mini-vLLM Architecture — v0.8
+# mini-vLLM Architecture — v0.9
 
-## Control plane vs execution plane
+## Control plane remains singular
 
 ```text
-CONTROL / POLICY
-
-Request registry
-     │
-     ▼
- EngineCore
- ├─ Scheduler
- ├─ admission
- ├─ token budgets
- ├─ victim policy
- ├─ sampling / logical commit
- └─ finish decisions
-     │
-     ▼
+EngineCore
+  request registry
+  Scheduler
+  token budget
+  preemption policy
+  sampling / logical commit
+        │
+        ▼
 ExecutionRequest
-
-================ boundary ================
-
-EXECUTION
-
- LocalExecutor
-     │
-     ▼
-   Worker
- ├─ ModelRunner
- └─ KV backend
-     │
-     ▼
-ExecutionResult
-
-================ boundary ================
-
-     │
-     ▼
- EngineCore validates + commits
 ```
 
-## Boundary rule
+No rank owns a Scheduler. Distribution begins below the Executor boundary.
 
-The executor payload carries execution facts, not mutable policy objects:
+## Execution topology
 
 ```text
-ExecutionItem = request_id + token_ids + start_pos
+ExecutionRequest
+      │
+      ▼
+DistributedExecutor
+      │
+      ▼
+WorkerGroup(world_size=N)
+  ┌──────┼──────┐
+  ▼      ▼      ▼
+rank0  rank1  rankN-1
+Worker Worker Worker
+  │      │      │
+  ▼      ▼      ▼
+replicated TinyDecoder trunk + replicated per-rank KV
+  │      │      │
+  ▼      ▼      ▼
+rank-local vocabulary projection shard
+  └──────┼──────┘
+         ▼
+ReferenceCollective.all_gather
+         │
+         ▼
+full target logits
+         │
+         ▼
+ExecutionResult
+         │
+         ▼
+EngineCore commit
 ```
 
-It does not carry `Request`, Scheduler queues, priority, or victim-selection state.
+## Rank ownership
 
-## Cache ownership
+`RankConfig(rank, world_size)` is explicit. WorkerGroup validates that ranks are exactly `0..world_size-1` and all agree on the same world size. No global rank variables are used.
 
-EngineCore decides *whether* a request should run or another request should be preempted. Worker/cache implement *how* physical KV is allocated, released, checkpointed, and rolled back.
+## Tensor-parallel reference path
 
-## Speculation
+The first integrated model shard is the LM head:
 
-Speculative verification also crosses Executor. Draft proposal and logical acceptance remain centralized; target-model per-token logits and temporary KV mutation live behind Worker.
+```text
+full weight W[V, H]
+        │
+        ├─ rank 0 rows [0:k0)
+        ├─ rank 1 rows [k0:k1)
+        └─ ...
 
-## Failure boundary
+same hidden h on every rank
+        │
+        ▼
+local_logits_r = W_r @ h
+        │
+        ▼
+all_gather(local_logits_0, ...)
+        │
+        ▼
+full logits[V]
+```
 
-EngineCore commits `num_computed_tokens` and logical output only after a successful `ExecutionResult`. Executor exceptions surface without pretending the forward pass completed.
+Uneven vocabulary sizes use balanced contiguous shard ranges. `ReferenceTensorParallel` also includes row-parallel linear reconstruction via `all_reduce_sum` as a mathematical teaching oracle.
 
-## Historical compatibility
+## KV scope
 
-Current-main historical builders may still provide `cache + model_runner`; EngineCore wraps them in `Worker + LocalExecutor`. Frozen historical branches themselves are not modified.
+v0.9 does **not** claim distributed KV partitioning. Each logical rank owns an independent replicated `TransactionalPrefixCachingPagedKVCache`. Prefix caching, preemption, and speculative rollback occur on every replica and WorkerGroup checks replicated metadata stays consistent.
 
-## Why LocalExecutor first?
+## Failure atomicity
 
-A local reference path proves ownership and message contracts without adding multiprocessing, serialization, RPC, or distributed failure handling. v0.9 can therefore change topology without redesigning scheduler/cache semantics.
+A normal distributed forward can fail after an earlier rank already wrote K/V. WorkerGroup therefore checkpoints every participating rank at the WorkItem start position before executing:
+
+```text
+checkpoint all ranks
+      ↓
+rank-local forwards
+      │
+      ├─ all succeed → validate/keep physical work
+      │
+      └─ any failure → rollback every rank → raise
+```
+
+EngineCore still commits `num_computed_tokens` and logical outputs only after a successful distributed `ExecutionResult`.
+
+Speculative decoding already has an outer transactional checkpoint. A rank failure during speculative target execution surfaces to SpeculativeEngine, which rolls the distributed checkpoint back on every rank.
+
+## Why no NCCL yet?
+
+The goal of v0.9 is to make rank-local tensors, collective reconstruction, topology, and failure semantics visible. Real process groups would add transport and device complexity before the mathematical ownership model is learned. A future optimized/distributed version can replace `ReferenceCollective` without moving Scheduler policy into workers.

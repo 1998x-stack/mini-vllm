@@ -28,34 +28,150 @@ class TinySelfAttention(nn.Module):
         repeats = self.n_heads // self.n_kv_heads
         return x.repeat_interleave(repeats, dim=1)
 
-    def forward_token(self,x:torch.Tensor,*,request_id:str,position:int,layer_idx:int,cache:KVCacheBackend)->torch.Tensor:
-        q=self.q_proj(x).view(self.n_heads,self.head_dim); k=self.k_proj(x).view(self.n_kv_heads,self.head_dim); v=self.v_proj(x).view(self.n_kv_heads,self.head_dim)
-        cache.write(layer_idx,request_id,position,k,v); keys,values=cache.read_prefix(layer_idx,request_id,position+1); keys=self._expand_kv(keys); values=self._expand_kv(values)
-        scores=torch.einsum("hd,lhd->hl",q,keys)/math.sqrt(self.head_dim); probs=torch.softmax(scores,dim=-1); context=torch.einsum("hl,lhd->hd",probs,values); return self.o_proj(context.reshape(-1))
+    def forward_token(
+        self,
+        x: torch.Tensor,
+        *,
+        request_id: str,
+        position: int,
+        layer_idx: int,
+        cache: KVCacheBackend,
+    ) -> torch.Tensor:
+        q = self.q_proj(x).view(self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(self.n_kv_heads, self.head_dim)
+        cache.write(layer_idx, request_id, position, k, v)
+        keys, values = cache.read_prefix(layer_idx, request_id, position + 1)
+        keys = self._expand_kv(keys)
+        values = self._expand_kv(values)
+        scores = torch.einsum("hd,lhd->hl", q, keys) / math.sqrt(self.head_dim)
+        probs = torch.softmax(scores, dim=-1)
+        context = torch.einsum("hl,lhd->hd", probs, values)
+        return self.o_proj(context.reshape(-1))
 
 
 class TinyDecoderLayer(nn.Module):
-    def __init__(self,config:TinyModelConfig)->None:
-        super().__init__(); self.ln1=nn.LayerNorm(config.d_model); self.attn=TinySelfAttention(config); self.ln2=nn.LayerNorm(config.d_model); self.mlp=nn.Sequential(nn.Linear(config.d_model,config.d_ff),nn.GELU(),nn.Linear(config.d_ff,config.d_model))
-    def forward_token(self,x:torch.Tensor,*,request_id:str,position:int,layer_idx:int,cache:KVCacheBackend)->torch.Tensor:
-        x=x+self.attn.forward_token(self.ln1(x),request_id=request_id,position=position,layer_idx=layer_idx,cache=cache); x=x+self.mlp(self.ln2(x)); return x
+    def __init__(self, config: TinyModelConfig) -> None:
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = TinySelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Linear(config.d_ff, config.d_model),
+        )
+
+    def forward_token(
+        self,
+        x: torch.Tensor,
+        *,
+        request_id: str,
+        position: int,
+        layer_idx: int,
+        cache: KVCacheBackend,
+    ) -> torch.Tensor:
+        x = x + self.attn.forward_token(
+            self.ln1(x),
+            request_id=request_id,
+            position=position,
+            layer_idx=layer_idx,
+            cache=cache,
+        )
+        return x + self.mlp(self.ln2(x))
 
 
 class TinyDecoderLM(nn.Module):
     """Tiny decoder-only LM whose attention cache is externally managed."""
-    def __init__(self,config:TinyModelConfig)->None:
-        super().__init__(); self.config=config; cpu_state=torch.random.get_rng_state(); torch.manual_seed(config.seed); self.token_embedding=nn.Embedding(config.vocab_size,config.d_model); self.position_embedding=nn.Embedding(config.max_position_embeddings,config.d_model); self.layers=nn.ModuleList([TinyDecoderLayer(config) for _ in range(config.n_layers)]); self.final_ln=nn.LayerNorm(config.d_model); self.lm_head=nn.Linear(config.d_model,config.vocab_size,bias=False); torch.random.set_rng_state(cpu_state)
+
+    def __init__(self, config: TinyModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        cpu_state = torch.random.get_rng_state()
+        torch.manual_seed(config.seed)
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.position_embedding = nn.Embedding(
+            config.max_position_embeddings, config.d_model
+        )
+        self.layers = nn.ModuleList(
+            [TinyDecoderLayer(config) for _ in range(config.n_layers)]
+        )
+        self.final_ln = nn.LayerNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        torch.random.set_rng_state(cpu_state)
 
     @torch.no_grad()
-    def forward_chunk_logits(self,*,request_id:str,token_ids:tuple[int,...],start_pos:int,cache:KVCacheBackend)->tuple[torch.Tensor,...]:
-        if not token_ids: raise ValueError("token_ids cannot be empty")
-        logits_trace=[]
-        for offset,token_id in enumerate(token_ids):
-            position=start_pos+offset; token=torch.tensor(token_id,dtype=torch.long,device=self.token_embedding.weight.device); pos=torch.tensor(position,dtype=torch.long,device=self.token_embedding.weight.device); x=self.token_embedding(token)+self.position_embedding(pos)
-            for layer_idx,layer in enumerate(self.layers): x=layer.forward_token(x,request_id=request_id,position=position,layer_idx=layer_idx,cache=cache)
-            logits_trace.append(self.lm_head(self.final_ln(x)))
-        return tuple(logits_trace)
+    def forward_chunk_hidden_trace(
+        self,
+        *,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        start_pos: int,
+        cache: KVCacheBackend,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return final-normalized hidden states while materializing K/V.
+
+        v0.9 uses this as the replicated Transformer trunk before each rank
+        applies only its local LM-head vocabulary shard.
+        """
+        if not token_ids:
+            raise ValueError("token_ids cannot be empty")
+        hidden_trace: list[torch.Tensor] = []
+        for offset, token_id in enumerate(token_ids):
+            position = start_pos + offset
+            token = torch.tensor(
+                token_id,
+                dtype=torch.long,
+                device=self.token_embedding.weight.device,
+            )
+            pos = torch.tensor(
+                position,
+                dtype=torch.long,
+                device=self.token_embedding.weight.device,
+            )
+            x = self.token_embedding(token) + self.position_embedding(pos)
+            for layer_idx, layer in enumerate(self.layers):
+                x = layer.forward_token(
+                    x,
+                    request_id=request_id,
+                    position=position,
+                    layer_idx=layer_idx,
+                    cache=cache,
+                )
+            hidden_trace.append(self.final_ln(x))
+        return tuple(hidden_trace)
 
     @torch.no_grad()
-    def forward_chunk(self,*,request_id:str,token_ids:tuple[int,...],start_pos:int,cache:KVCacheBackend)->torch.Tensor:
-        return self.forward_chunk_logits(request_id=request_id,token_ids=token_ids,start_pos=start_pos,cache=cache)[-1]
+    def forward_chunk_logits(
+        self,
+        *,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        start_pos: int,
+        cache: KVCacheBackend,
+    ) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            self.lm_head(hidden)
+            for hidden in self.forward_chunk_hidden_trace(
+                request_id=request_id,
+                token_ids=token_ids,
+                start_pos=start_pos,
+                cache=cache,
+            )
+        )
+
+    @torch.no_grad()
+    def forward_chunk(
+        self,
+        *,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        start_pos: int,
+        cache: KVCacheBackend,
+    ) -> torch.Tensor:
+        return self.forward_chunk_logits(
+            request_id=request_id,
+            token_ids=token_ids,
+            start_pos=start_pos,
+            cache=cache,
+        )[-1]

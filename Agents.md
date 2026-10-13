@@ -6,8 +6,6 @@
 
 mini-vLLM is an educational LLM-serving runtime. Optimize for architectural clarity, correctness before performance, explicit invariants, readable reference mechanisms, inspectable tests, and conceptual mapping to production serving systems.
 
-Do not optimize early for production API coverage, pretrained-model breadth, maximum throughput, distributed complexity, or custom kernels.
-
 ```text
 one version
    ↓
@@ -20,15 +18,17 @@ explicit invariant tests
 end-to-end trace/example
 ```
 
-## 2. Required reading order
+Do not optimize early for production API breadth, pretrained-model coverage, distributed complexity, or custom kernels.
 
-On `main` read: `Agents.md` → `Plan.md` → `version.md` → `docs/ROADMAP.md` → relevant architecture/tests.
+## 2. Reading order
 
-On a historical `v0.x`/`v1.x` branch read: `Agents.md` → `version.md` → relevant source/tests/examples. Historical branches are learning snapshots and must not absorb later mechanisms.
+On `main`: `Agents.md` → `Plan.md` → `version.md` → roadmap/architecture → relevant tests.
+
+On a `v0.x`/`v1.x` branch: `Agents.md` → `version.md` → relevant source/tests/examples. Historical branches are learning snapshots and must not absorb later mechanisms.
 
 ## 3. Branch model
 
-`main` must always be the newest integrated validated implementation.
+`main` must always be the newest integrated **validated** runtime. A candidate is synchronized to `main` only after its exact commit passes required tests/CI.
 
 Canonical sequence:
 
@@ -40,83 +40,59 @@ Canonical sequence:
 - `v0.6` — KV-pressure preemption + recomputation
 - `v0.7` — speculative decoding + transactional KV
 - `v0.8` — EngineCore / Executor / Worker boundary
-- `v0.9` — distributed / tensor-parallel concepts (planned next)
+- `v0.9` — WorkerGroup + reference tensor parallel
+- `v0.10` — async engine + streaming/cancellation (next)
 
-Every version branch must contain `Agents.md`, `version.md`, tests for promised mechanisms, and an executable educational example where applicable.
+Every version branch requires `Agents.md`, `version.md`, mechanism tests, error-path coverage, and an executable educational example where applicable.
 
-After a version freezes, only documentation corrections, scope-preserving tests, and narrowly scoped bug fixes are allowed.
-
-## 4. Version lifecycle
-
-Before coding: identify the primary mental model, explain dependency on the previous version, define ownership boundaries/non-goals/acceptance criteria, and align `version.md` with `Plan.md`.
-
-Implementation priority:
-
-```text
-correctness
-  ↓
-readability
-  ↓
-invariant visibility
-  ↓
-testability
-  ↓
-architecture
-  ↓
-performance
-```
-
-After validation: update docs, synchronize the validated state to `main`, confirm `main` is not behind, freeze the version branch, then create the next planning branch from latest `main`.
-
-## 5. Architecture rules
-
-### 5.1 Policy vs mechanism
+## 4. Ownership rules
 
 - Scheduler owns admission, ordering, token work, and victim policy.
 - EngineCore owns request registry, logical history, sampling/commit, finish decisions, and policy coordination.
 - Executor owns execution transport/orchestration.
-- Worker owns execution mechanism, not scheduling policy.
-- KV backend owns storage/allocation/address translation, not priority decisions.
-- ModelRunner executes model work, not queue policy.
-- DraftProvider proposes candidates only; it does not commit logical history or own KV policy.
+- WorkerGroup owns execution topology, not scheduling policy.
+- Worker owns model/cache execution mechanism, not request policy.
+- KV backend owns physical storage/allocation/address translation.
+- ModelRunner executes model work.
+- DraftProvider proposes candidates only.
+- Collective implements tensor communication semantics only; it must not know Scheduler/request priority.
 
-### 5.2 v0.8 execution boundary
-
-Preferred direction:
+Preferred dependency direction:
 
 ```text
-Request / SamplingParams
-          │
-          ▼
-      EngineCore
-   request state + policy
-          │
-          ▼
-   ExecutionRequest
-          │
-          ▼
-       Executor
-          │
-          ▼
-        Worker
-  ModelRunner + KV backend
-          │
-          ▼
-   ExecutionResult
-          │
-          ▼
-      EngineCore
+EngineCore policy
+      │
+      ▼
+ExecutionRequest
+      │
+      ▼
+Executor
+      │
+      ▼
+WorkerGroup
+  ┌───┴───┐
+  ▼       ▼
+Worker  Worker
+  │       │
+rank-local model/KV
+  └───┬───┘
+      ▼
+Collective
+      │
+      ▼
+ExecutionResult
+      │
+      ▼
+EngineCore commit
 ```
 
-`ExecutionItem` must not carry a mutable `Request` object. Only execution facts such as `request_id`, token IDs, and positions cross into Worker.
+Mutable `Request` objects must not cross the execution boundary.
 
-Future multiprocessing/distribution should replace transport/topology, not redesign scheduler semantics.
-
-## 6. Core invariants
+## 5. Core invariants
 
 ### Computed-token invariant
 
-`num_computed_tokens` counts tokens whose forward pass completed and whose K/V is valid. A sampled token is not computed until a later forward consumes it.
+`num_computed_tokens` counts tokens whose forward completed and whose K/V is valid. A sampled token is not computed until a later forward consumes it.
 
 ### Cache ownership invariant
 
@@ -136,29 +112,41 @@ Finished requests release active cache ownership exactly once.
 
 ### Semantic-equivalence invariant
 
-Changing storage layout, speculative acceleration, or executor transport must not change deterministic target-model semantics.
+Storage layout, speculation, executor transport, and tensor-parallel topology must preserve deterministic target-model semantics.
 
 ### Transaction invariant
 
-Rejected speculative tokens must not remain in committed history, visible computed state, block-table ownership beyond the retained frontier, or future attention context.
+Rejected speculative tokens must not remain in committed history or visible KV state.
 
 ### Execution-boundary invariant
 
-Worker must not decide admission, scheduler priority, preemption victim, or logical request completion. EngineCore must not depend on hidden Worker internals for normal policy execution.
+Workers/WorkerGroup must not decide admission, Scheduler priority, preemption victim, or logical completion.
 
 ### Failure-commit invariant
 
-EngineCore advances logical request state only after a successful execution result. Executor failure must surface explicitly.
+EngineCore advances logical state only after successful execution. Executor failures surface explicitly.
 
-## 7. Scope discipline
+### Rank-consistency invariant
 
-Do not add prefix caching before block ownership is explicit; speculative decoding before rollback exists; multiprocessing before the EngineCore/Executor boundary exists; distributed/tensor parallelism before LocalExecutor semantics are stable; or Triton/CUDA merely to make reference code look fast.
+All ranks in a WorkerGroup must agree on world size, request identity, token positions, operation ordering, and replicated cache lifecycle metadata.
 
-Future work belongs in `Plan.md` until its dependencies are ready.
+### Collective invariant
 
-## 8. Testing requirements
+Reference collectives implement explicit mathematical operations on rank-local tensors. Callers must not depend on hidden global rank state.
 
-Every new subsystem should include happy path, invariant/property tests, error path, reference/numerical validation where relevant, integration tests, and an educational trace/example.
+### Distributed-failure invariant
+
+A partial rank failure must not leave surviving ranks physically advanced while EngineCore remains logically uncommitted. Replicated v0.9 cache state must roll back to a common pre-forward frontier.
+
+## 6. Scope discipline
+
+Build readable references before optimized transport. Do not add multiprocessing/NCCL before rank/collective semantics are explicit; do not add async streaming before execution topology is stable; do not add custom attention kernels before the readable paged path is the correctness oracle.
+
+v0.9 deliberately replicates Transformer trunk + KV and shards only the LM head. Do not describe it as full production tensor parallelism.
+
+## 7. Testing requirements
+
+Every new subsystem should include happy path, invariant/property tests, error path, numerical/reference validation where relevant, integration tests, and an educational trace.
 
 Canonical commands:
 
@@ -167,39 +155,56 @@ python -m pytest -q
 ./scripts/check.sh
 ```
 
-Never claim tests passed unless they were actually executed on the exact reported snapshot.
+Never claim tests passed unless executed successfully on the exact reported snapshot. Repository CI is the release gate for active version candidates.
 
 Representative invariants:
 
-- static cohorts do not backfill; continuous batching does;
 - paged/contiguous KV produce equivalent logits;
-- token budget is never exceeded;
-- shared prefix blocks remain immutable/refcounted;
+- token budgets are respected;
+- prefix blocks remain immutable/refcounted;
 - preemption rolls back invalid computed state;
-- replay does not re-sample known history;
 - rejected speculative tokens disappear;
-- LocalExecutor transport preserves v0.7 semantics;
-- Worker has no waiting/running queue policy.
+- LocalExecutor preserves v0.7 semantics;
+- rank-local tensor shards reconstruct the single-worker reference;
+- rank failure cannot partially commit distributed physical state.
 
-## 9. Documentation requirements
+## 8. Version lifecycle
 
-For a version change review at minimum: `version.md`, `Agents.md`, `Plan.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, and `README.md` when user-facing behavior changes.
+Before coding: define the mental model, dependency on previous version, ownership boundaries, non-goals, and acceptance criteria.
 
-## 10. Commit rules
+Implementation priority:
+
+```text
+correctness
+  ↓
+readability
+  ↓
+invariant visibility
+  ↓
+testability
+  ↓
+architecture
+  ↓
+performance
+```
+
+After validation: update docs, synchronize the exact validated candidate to `main`, freeze the branch, then create the next planning branch from latest `main`.
+
+## 9. Documentation and commits
+
+For version changes review at minimum: `version.md`, `Agents.md`, `Plan.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, and README.
 
 Prefer intent-revealing commits such as:
 
 ```text
-feat(scheduler): add continuous slot refill
 feat(cache): add paged KV block pool
 feat(speculative): add checkpoint and rollback
 feat(executor): add local worker boundary
-test(executor): verify policy-free execution payload
+feat(distributed): add reference worker group
+feat(tp): shard vocabulary projection
 ```
 
-Do not mix unrelated mechanisms into opaque commits.
-
-## 11. Performance rule
+## 10. Performance rule
 
 ```text
 readable reference
@@ -213,24 +218,20 @@ optimized educational path
 compare against reference
 ```
 
-Examples: Python paged gather before Triton, LocalExecutor before multiprocessing/RPC, scripted draft provider before a neural draft model, reference collectives before multi-GPU kernels.
+Reference collectives precede process groups/NCCL; single-process logical ranks precede multi-GPU transport.
 
-## 12. Upstream reference policy
-
-Use official vLLM docs/source and the PagedAttention paper to verify concepts when current production behavior matters. Implement original educational equivalents; do not copy production source.
-
-## 13. Definition of Done
+## 11. Definition of Done
 
 A version freezes only when applicable items are true:
 
 - primary mental model is explicit;
-- promised mechanism is implemented;
+- promised mechanism exists;
 - unit/invariant/error tests pass;
-- reference equivalence exists where relevant;
+- reference equivalence exists;
 - integration example works;
-- `version.md` accurately describes the delta;
-- architecture/roadmap docs are synchronized;
+- version/docs agree;
 - package imports cleanly;
 - generated artifacts are not committed;
+- exact release-candidate CI succeeds;
 - `main` contains the newest validated state;
-- next-version dependency rationale is documented.
+- next-version rationale is documented.

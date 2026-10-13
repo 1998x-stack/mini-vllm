@@ -11,4 +11,5 @@ python examples/06_prefix_caching.py >/dev/null
 python examples/07_preemption.py >/dev/null
 python examples/08_speculative_decoding.py >/dev/null
 python examples/09_executor_boundary.py >/dev/null
+python examples/10_tensor_parallel.py >/dev/null
 echo "all checks passed"

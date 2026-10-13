@@ -1,4 +1,4 @@
-.PHONY: test examples check example-v07 example-v08
+.PHONY: test examples check example-v07 example-v08 example-v09
 
 test:
 	python -m pytest
@@ -13,6 +13,7 @@ examples:
 	python examples/07_preemption.py
 	python examples/08_speculative_decoding.py
 	python examples/09_executor_boundary.py
+	python examples/10_tensor_parallel.py
 
 check:
 	./scripts/check.sh
@@ -22,3 +23,6 @@ example-v07:
 
 example-v08:
 	PYTHONPATH=. python examples/09_executor_boundary.py
+
+example-v09:
+	PYTHONPATH=. python examples/10_tensor_parallel.py
