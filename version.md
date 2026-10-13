@@ -1,99 +1,88 @@
-# mini-vLLM v0.11 — compile-aware execution
+# mini-vLLM v0.12 — optimized PagedAttention (planning branch)
 
 ## Version identity
 
-- Branch: `v0.11`
-- Previous: `v0.10`
-- Theme: explicit shape signatures, rank-local compile caches, and eager fallback inside the tensor execution plane
-- Release rule: the exact implementation commit must pass repository CI before synchronization to `main`
+- Branch: `v0.12`
+- Base: validated `v0.11` / `main`
+- Previous: `v0.11`
+- Theme: extract paged attention behind a correctness oracle, then add a vectorized PyTorch gather/attention path with explicit fallback
+- Status: planning until the exact implementation commit passes repository CI
 
-## Mental model
-
-```text
-AsyncEngine / EngineCore / Scheduler                 eager
-                ↓
-DistributedExecutor / WorkerGroup                    eager
-                ↓
-rank-local Worker
-                ↓
-TinyDecoder trunk + KV read/write                    eager
-                ↓
-hidden trace [T,H]
-                ↓
-PureTensorProjectionKernel(hidden, local_weight)     compile-aware
-                ↓
-local logits [T,V_rank]
-                ↓
-ReferenceCollective                                  eager
-```
-
-v0.11 deliberately chooses a narrow real compile boundary: the rank-local vocabulary projection. It is enough to expose shape specialization and reuse without hiding Python KV ownership inside Dynamo.
-
-## Added abstractions
-
-- `ExecutionShapeSignature(token_count, hidden_dim, output_dim, dtype, device)`
-- `CompileConfig(enabled, backend, fullgraph, dynamic, fallback_on_error)`
-- `CompileStats`
-- `CompileEvent`
-- `PureTensorProjectionKernel`
-- `CompiledKernelCache`
-- `CompileAwareVocabParallelTinyRunner`
-
-## Signature lifecycle
+## Primary mental model
 
 ```text
-unseen [T,H]×[Vrank,H]
-    ↓
-cache miss + torch.compile
-    ↓
-compiled callable stored
-
-same signature
-    ↓
-cache hit
-
-new T / Vrank / dtype / device
-    ↓
-new signature + explicit recapture/recompile counter
+Paged KV physical blocks + block table
+                ↓
+ReferencePagedAttention          correctness oracle
+                ↓
+VectorizedPagedAttention         optimized PyTorch path
+                ↓
+optional future Triton/CUDA path
+                ↓
+same attention context / logits / tokens
 ```
 
-The registry is intentionally separate from PyTorch's internal Dynamo cache. It teaches the serving runtime's own specialization policy.
+The optimization replaces attention data gathering/tensor math only. Scheduler, request lifecycle, prefix ownership, preemption, speculative transactions, WorkerGroup topology, compile-aware LM-head projection, async streaming, and cancellation remain unchanged.
+
+## Required abstractions
+
+- `PagedAttentionConfig`
+- `PagedAttentionStats`
+- `PagedAttentionEvent`
+- `PagedAttentionBackend`
+- `ReferencePagedAttention`
+- `VectorizedPagedAttention`
+- `build_paged_attention_backend`
+- vectorized paged-cache prefix read that maps logical positions to physical block/offset tensors without a Python per-token loop
+
+## Addressing invariant
+
+```text
+logical_block = position // block_size
+block_offset  = position % block_size
+physical      = block_table[request_id][logical_block]
+```
+
+For logical length `L`, only positions `[0, L)` may participate in attention. Unused slots in the last physical block must remain invisible.
+
+## GQA / MQA invariant
+
+If `n_heads > n_kv_heads`, KV heads are expanded to query-head count with the same semantics as the v0.11 reference implementation. Optimized gathering must not change head mapping.
+
+## Prefix / rollback invariant
+
+Shared immutable prefix blocks, private mutable tails, preemption/recompute, and speculative rollback may change which physical blocks a request references over time. The optimized attention path must use the current block table and logical length only; stale/recycled physical slots must never leak into attention.
 
 ## Fallback
 
-Compilation is optional optimization state. If compilation or first execution fails and `fallback_on_error=True`, the same pure tensor kernel executes eagerly. No Scheduler, KV, speculative, async, or logical-token state is changed by the fallback decision.
+`backend="vectorized"` is the v0.12 default. If the cache backend cannot expose a vectorized paged read and fallback is enabled, attention executes through the reference path and records the fallback. Strict mode raises instead.
 
-## Distributed ownership
+Triton/CUDA is optional and not required for v0.12 correctness or CPU CI. Do not claim a Triton implementation unless a real kernel exists and is numerically validated.
 
-Each logical rank owns a distinct `CompiledKernelCache`. The collective stays outside compiled code. Uneven vocabulary shards therefore naturally have different `output_dim` signatures.
+## Acceptance criteria
 
-## Invariants
+- [ ] reference backend reproduces pre-v0.12 attention exactly/numerically;
+- [ ] vectorized paged read matches the reference loop for multi-block and partial-tail sequences;
+- [ ] vectorized attention matches reference for ordinary MHA and GQA/MQA;
+- [ ] block tables need not be physically contiguous;
+- [ ] partial final blocks never expose unused slots;
+- [ ] fallback/error policy is deterministic and observable;
+- [ ] shared-prefix requests preserve output equivalence;
+- [ ] deterministic v0.12 output matches v0.11 for world_size 1 and 2;
+- [ ] speculative verification, preemption, compile-aware projection, async streaming, cancellation, and backpressure regressions pass;
+- [ ] an executable example shows reference vs vectorized stats and output equivalence;
+- [ ] all historical v0.1-v0.11 tests pass;
+- [ ] exact candidate `./scripts/check.sh` passes in GitHub Actions before `main` advances.
 
-- compiled projection numerically equals eager `F.linear`;
-- only tensor data crosses the compile boundary;
-- repeated compatible signatures reuse one cached callable;
-- materially different shapes create a visible new variant;
-- compile failure has explicit eager fallback or strict error mode;
-- deterministic v0.11 token streams equal v0.10;
-- world-size 1 and 2 preserve target semantics;
-- v0.10 async cancellation/backpressure and v0.9 distributed rollback remain unchanged;
-- compile policy does not appear in EngineCore, Scheduler, AsyncEngine, or WorkerGroup.
+## Non-goals
 
-## Validation
-
-`tests/test_compile_runtime.py` covers the pure kernel, deterministic signatures, miss/hit/recapture statistics, and fallback behavior. `tests/test_v011_version.py` covers async v0.10 equivalence, world-size equivalence, and rank-local cache observability. `examples/12_compile_aware.py` prints per-rank signatures and compile modes.
-
-The exact commit promoted to `main` must pass `./scripts/check.sh` in GitHub Actions, including all historical tests and examples 01–12.
-
-## Intentional simplifications
-
-- CI uses `torch.compile(..., backend="eager")` to exercise Dynamo graph formation without claiming speedup;
-- Transformer trunk and attention remain eager in v0.11;
-- no CUDA Graph capture;
-- no dynamic-shape/bucketing policy;
-- no compiled collective;
-- no custom Triton/CUDA attention kernel.
+- production FlashAttention/vLLM kernel parity;
+- distributed KV partitioning;
+- NCCL/CUDA Graph integration;
+- production Triton tuning;
+- prefix-aware admission policy (`v0.13`);
+- claiming speedup without measurement.
 
 ## Next
 
-`v0.12` adds an optimized PagedAttention path while keeping the readable cache implementation as correctness oracle.
+`v0.13` makes prefix reuse visible to scheduling/admission policy rather than only to the cache backend.
