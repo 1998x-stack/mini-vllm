@@ -16,8 +16,8 @@ from mini_vllm.speculative.types import VerificationResult
 class EngineCore:
     """Central policy/state coordinator.
 
-    v0.8 moves physical execution behind Executor/Worker while keeping request
-    lifecycle, scheduling, preemption policy and logical commit centralized.
+    Physical execution lives behind Executor/Worker. Request lifecycle,
+    scheduling, preemption, cancellation and logical commit stay centralized.
     """
 
     def __init__(
@@ -50,14 +50,12 @@ class EngineCore:
 
     @property
     def cache(self) -> KVCacheBackend:
-        """LocalExecutor compatibility/debug view; policy must use Executor APIs."""
         if not isinstance(self.executor, LocalExecutor):
             raise RuntimeError("cache object is not directly visible through this executor")
         return self.executor.worker.cache
 
     @property
     def model_runner(self) -> ModelRunner:
-        """LocalExecutor compatibility/debug view."""
         if not isinstance(self.executor, LocalExecutor):
             raise RuntimeError("model runner is not directly visible through this executor")
         return self.executor.worker.model_runner
@@ -87,8 +85,39 @@ class EngineCore:
         return any(not request.finished for request in self._requests.values())
 
     @property
+    def unfinished_request_ids(self) -> tuple[str, ...]:
+        return tuple(
+            request_id
+            for request_id, request in self._requests.items()
+            if not request.finished
+        )
+
+    @property
     def preemption_events(self) -> int:
         return self._preemption_events
+
+    def _terminate_request(self, request_id: str, reason: str) -> bool:
+        if not reason:
+            raise ValueError("terminal reason must be non-empty")
+        request = self._requests.get(request_id)
+        if request is None:
+            return False
+        if request.finished:
+            return False
+
+        # Cancellation/error is applied only between atomic EngineCore steps.
+        # First make the request unschedulable, then release physical ownership,
+        # then publish the logical terminal state.
+        self.scheduler.cancel_request(request)
+        self.executor.free(request_id)
+        request.mark_finished(reason)
+        return True
+
+    def cancel_request(self, request_id: str) -> bool:
+        return self._terminate_request(request_id, "cancelled")
+
+    def abort_request(self, request_id: str, reason: str = "error") -> bool:
+        return self._terminate_request(request_id, reason)
 
     def _restore_replayed_item(self, item: WorkItem) -> WorkItem:
         request = item.request

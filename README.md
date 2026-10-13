@@ -4,7 +4,7 @@ A deliberately small, runnable, **branch-versioned** LLM-serving runtime for lea
 
 ## Current line
 
-`main` is always the newest validated release. `v0.9` is the current implementation line; a v0.9 commit is synchronized to `main` only when that exact commit passes repository CI.
+`main` is always the newest validated release. `v0.10` is the current implementation line; an exact version commit is synchronized to `main` only after repository CI passes on that same commit.
 
 ```text
 v0.1  static batching + contiguous KV
@@ -15,91 +15,57 @@ v0.5  prefix caching + shared KV ownership
 v0.6  KV-pressure preemption + recomputation
 v0.7  speculative decoding + transactional KV
 v0.8  EngineCore / Executor / Worker boundary
-v0.9  logical multi-rank + reference tensor parallel   ← current
-v0.10 async engine + streaming/cancellation            ← next
+v0.9  logical multi-rank + reference tensor parallel
+v0.10 async engine + streaming/cancellation/backpressure  ← current
+v0.11 graph/compile-aware execution                       ← next
 ```
 
 Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-## v0.9 mental model
+## v0.10 mental model
 
 ```text
-CONTROL / POLICY
-
-EngineCore
-  Scheduler / request state / sampling / preemption
-      │
-      ▼
-ExecutionRequest
-
-================ execution boundary ================
-
+caller
+  │ submit(Request)
+  ▼
+AsyncEngine
+  │ caller handles + bounded event queues
+  │ submit/cancel intents
+  ▼
+EngineCore                      ← only serving-policy authority
+  │ Scheduler / token budget / sampling / preemption
+  ▼
 DistributedExecutor
-      │
-      ▼
-WorkerGroup(world_size=2)
-   ┌───────────────┴───────────────┐
-   ▼                               ▼
-rank 0                            rank 1
-replicated trunk + KV             replicated trunk + KV
-LM-head rows [0:k)                LM-head rows [k:V)
-   │                               │
-   ▼                               ▼
-local logits shard                local logits shard
-   └───────────────┬───────────────┘
-                   ▼
-         ReferenceCollective
-              all_gather
-                   │
-                   ▼
-             full logits
-
-================ execution boundary ================
-
-                   │
-                   ▼
-              EngineCore
-          logical sample / commit
+  ▼
+WorkerGroup(world_size=N)
+  ▼
+rank-local model/KV + reference collective
+  ▼
+EngineStepOutput
+  │ committed_token_ids only
+  ▼
+AsyncEngine
+  ├─ TokenEvent
+  ├─ FinishedEvent
+  ├─ CancelledEvent
+  └─ ErrorEvent
 ```
 
-The first tensor-parallel integration intentionally shards only the vocabulary projection. Transformer trunk weights and KV cache are replicated per rank. That makes the first distributed version explicit about what is and is not distributed.
+`AsyncEngine` is a caller-facing lifecycle/delivery facade. It does **not** own a second Scheduler, request-priority policy, tensor-parallel topology, or speculative verification policy.
 
-## Why this order?
-
-v0.8 first separated policy from execution. v0.9 can therefore change execution topology without adding a second Scheduler or sending mutable `Request` objects to workers.
-
-Core invariants:
+## Core async invariants
 
 ```text
-one EngineCore policy
-many execution ranks
-
-rank-local tensor shard
-      +
-reference collective
-      =
-single-worker mathematical result
+commit before stream
+exactly one terminal event
+cancel means real Scheduler/KV release
+bounded queues never silently drop/reorder committed tokens
+one cooperative driver; no idle busy-spin
 ```
 
-If one rank fails during an ordinary forward, WorkerGroup rolls every rank back to the pre-forward cache checkpoint and surfaces the exception. EngineCore does not advance logical request state.
+Cancellation is applied at an EngineCore step boundary rather than interrupting a model forward in the middle. A token already committed by the current atomic step may be streamed before cancellation becomes terminal.
 
-## Educational tensor parallel primitives
-
-```text
-RankConfig
-ReferenceCollective
-  ├─ all_gather
-  └─ all_reduce_sum
-ReferenceTensorParallel
-  ├─ column_parallel_linear
-  └─ row_parallel_linear
-VocabParallelLMHead
-VocabParallelTinyRunner
-WorkerGroup
-DistributedExecutor
-```
-
-The runtime remains single-process: logical ranks are simulated with ordinary PyTorch tensors. No NCCL, multiprocessing, or multi-node transport is hidden behind the reference implementation.
+The first backpressure policy is intentionally simple: a full per-request event queue blocks the cooperative async driver from taking another EngineCore step until delivery can continue. This is easy to inspect and preserves committed-event order; it is not presented as a production throughput policy.
 
 ## Install and verify
 
@@ -110,36 +76,34 @@ pip install -e '.[dev]'
 ./scripts/check.sh
 ```
 
-The release rule is deliberately strict: the exact commit promoted to `main` must have a green GitHub Actions run executing `./scripts/check.sh`.
+The release rule is strict: the exact commit promoted to `main` must have a green GitHub Actions run executing `./scripts/check.sh`.
 
-Run the v0.9 trace:
+Run the v0.10 trace:
 
 ```bash
-python examples/10_tensor_parallel.py
+python examples/11_async_streaming.py
 ```
 
-It prints each rank's vocabulary shard and compares the final v0.9 token history with the v0.8 single-worker reference.
+It demonstrates normal streaming, committed token order, cancellation at a step boundary, and driver shutdown.
 
 ## Learn through branch diffs
 
 ```bash
-git diff v0.6..v0.7 -- mini_vllm tests examples version.md
 git diff v0.7..v0.8 -- mini_vllm tests examples version.md
 git diff v0.8..v0.9 -- mini_vllm tests examples version.md
+git diff v0.9..v0.10 -- mini_vllm tests examples version.md
 ```
 
-For v0.9 focus on:
+For v0.10 focus on:
 
 ```text
-mini_vllm/distributed/rank.py
-mini_vllm/distributed/collective.py
-mini_vllm/distributed/tensor_parallel.py
-mini_vllm/distributed/worker_group.py
-mini_vllm/distributed/executor.py
-mini_vllm/model/tensor_parallel_runner.py
-mini_vllm/model/tiny_transformer.py
-mini_vllm/versions/v0_9/engine.py
-tests/test_distributed.py
-tests/test_v09_integration.py
-examples/10_tensor_parallel.py
+mini_vllm/async_runtime/events.py
+mini_vllm/async_runtime/handle.py
+mini_vllm/async_runtime/engine.py
+mini_vllm/core/engine.py
+mini_vllm/scheduler/base.py
+mini_vllm/versions/v0_10/engine.py
+tests/test_async_runtime.py
+tests/test_v010_version.py
+examples/11_async_streaming.py
 ```

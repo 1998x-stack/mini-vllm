@@ -36,3 +36,8 @@ class StaticBatchScheduler(Scheduler):
 
     def on_request_finished(self, request: Request) -> None:
         return None
+
+    def cancel_request(self, request: Request) -> None:
+        request_id = request.request_id
+        self.waiting = deque(r for r in self.waiting if r.request_id != request_id)
+        self.running = [r for r in self.running if r.request_id != request_id]

@@ -6,42 +6,47 @@
 
 mini-vLLM removes one layer of LLM-serving “magic” at a time: request state, prefill/decode, continuous batching, paged KV, token budgets, prefix sharing, memory pressure/preemption, speculative transactions, execution boundaries, distribution, async delivery, and optimized kernels.
 
-## 2. Reference architecture after v0.9
+## 2. Reference architecture after v0.10
 
 ```text
-Client / caller
-    │
-    ▼
-Request
-    │
-    ▼
+Caller
+  │
+  ▼
+AsyncEngine
+  │ submission/cancellation intents
+  ▼
 EngineCore
   Scheduler + logical state + policy
-    │
-    ▼
+  │
+  ▼
 ExecutionRequest
-    │
-    ▼
-Executor
-    │
-    ▼
+  │
+  ▼
+DistributedExecutor
+  │
+  ▼
 WorkerGroup
  ┌──┴──┐
  ▼     ▼
 rank0 rank1 ...
- local compute
-    │
-    ▼
-reference collective
-    │
-    ▼
+  │
+  ▼
+ReferenceCollective
+  │
+  ▼
 ExecutionResult
-    │
-    ▼
-EngineCore commit
+  │
+  ▼
+EngineCore logical commit
+  │
+  ▼
+EngineStepOutput.committed_token_ids
+  │
+  ▼
+AsyncEngine bounded event delivery
 ```
 
-Policy remains centralized even when execution topology fans out.
+Policy remains centralized even when execution fans out across ranks and callers consume results asynchronously.
 
 ## 3. Version ladder
 
@@ -54,9 +59,9 @@ v0.5  prefix cache + shared ownership
 v0.6  preemption + recompute
 v0.7  speculative transaction
 v0.8  EngineCore / Executor / Worker
-v0.9  WorkerGroup + reference tensor parallel      ← current implementation
-v0.10 async engine + streaming                     ← next
-v0.11 graph/compile experiments
+v0.9  WorkerGroup + reference tensor parallel
+v0.10 async engine + streaming/cancellation/backpressure ← current implementation
+v0.11 graph/compile experiments                          ← next
 v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
 v1.0  integrated educational serving runtime
@@ -82,54 +87,47 @@ Draft tokens are temporary until target verification commits them. Rejected temp
 
 ### v0.8 — execution boundary
 
-EngineCore owns policy/logical state; Executor owns transport/orchestration; Worker owns model + physical KV mechanism. Execution payloads contain facts, not mutable Request policy objects.
+EngineCore owns policy/logical state; Executor owns transport/orchestration; Worker owns model + physical KV mechanism. Mutable policy-bearing `Request` objects do not cross the execution boundary.
 
 ### v0.9 — logical multi-rank + reference tensor parallel
 
+One centralized EngineCore fans one execution across logical ranks. Rank-local shards plus explicit reference collectives reconstruct the single-worker mathematical result. Replicated rank KV is rolled back atomically on partial execution failure.
+
+### v0.10 — async request lifecycle + streaming
+
 Primary question:
 
-> How can one logical execution fan out across ranks without multiplying schedulers or changing target-model semantics?
+> How can callers submit, stream, cancel, and apply backpressure without creating a second serving policy plane?
 
 Reference design:
 
-- explicit `RankConfig(rank, world_size)`;
-- `WorkerGroup` with exactly one ordered worker per rank;
-- single-process `ReferenceCollective` with mathematical `all_gather` and `all_reduce_sum`;
-- educational column/row parallel linear reconstruction;
-- replicated TinyDecoder trunk and per-rank KV cache;
-- vocabulary-row-sharded LM head through `VocabParallelTinyRunner`;
-- `DistributedExecutor` satisfying the existing Executor contract;
-- rank-local logits gathered into the same full logits as the v0.8 single-worker reference;
-- normal-forward rank failure rolls replicated cache state back before surfacing to EngineCore;
-- speculative verification reuses v0.7 distributed checkpoint/rollback semantics.
+- `AsyncEngine` wraps the synchronous EngineCore rather than replacing it;
+- `submit()` returns an `AsyncRequestHandle` and enqueues caller intent;
+- `TokenEvent` is generated only from `EngineStepOutput.committed_token_ids`;
+- each handle emits exactly one `FinishedEvent`, `CancelledEvent`, or `ErrorEvent`;
+- EngineCore exposes an explicit cancellation/abort primitive that removes Scheduler participation and releases active KV;
+- cancellation is applied between atomic synchronous steps, not mid-forward;
+- per-request queues are bounded;
+- the first backpressure policy blocks the cooperative driver rather than dropping/reordering committed events;
+- a single asyncio driver drains control intents, runs at most one core step at a time, publishes events, and yields to the event loop;
+- core/executor failure conservatively terminates all still-active streams with explicit error events;
+- the v0.9 WorkerGroup/distributed execution topology remains unchanged.
 
 Architectural lesson:
 
 ```text
-single centralized policy
+async caller lifecycle
         ≠
-multi-rank execution topology
+serving scheduling policy
 ```
 
-Intentional simplifications:
-
-- logical ranks run in one Python process;
-- no NCCL/process group;
-- no real GPU placement;
-- KV and Transformer trunk are replicated rather than partitioned;
-- only the vocabulary projection is integrated into the serving model as a tensor-parallel shard.
-
-Release rule: only an exact v0.9 commit with a green repository CI run may be synchronized to `main`. This statement remains the rule after release rather than encoding a transient candidate status in the plan.
+Release rule: only an exact v0.10 commit with a green repository CI run may be synchronized to `main`.
 
 ## 5. Planned versions
 
-### v0.10 — Async engine + streaming / cancellation
-
-Introduce asynchronous request submission and token delivery without hiding Scheduler or WorkerGroup semantics. Teach output queues, cancellation, backpressure, and the distinction between synchronous EngineCore steps and asynchronous caller APIs.
-
 ### v0.11 — graph/compile-aware execution
 
-Study static metadata, graph breaks, recapture conditions, and host overhead while preserving eager reference correctness.
+Study static metadata, graph breaks, recapture conditions, host overhead, and eager-vs-compiled equivalence without moving scheduling/cancellation semantics into graph-specific code.
 
 ### v0.12 — optimized PagedAttention
 
@@ -156,7 +154,8 @@ A compact runtime with explicit control plane, execution topology, paged/prefix-
 | v0.7 | rejected speculative state disappears |
 | v0.8 | executor transport preserves semantics and excludes policy objects |
 | v0.9 | rank-local shards + collective reconstruct single-worker semantics |
+| v0.10 | only committed ordered tokens stream; terminal/cancel semantics release resources exactly once |
 
 ## 7. Scope discipline
 
-Prefer a readable mathematical reference before transport/performance complexity. Distribution first means explicit topology and collective semantics, not immediate multiprocessing/NCCL. Future mechanisms remain in the roadmap until their dependencies are explicit.
+Prefer readable reference mechanisms before transport/performance complexity. The first async layer is cooperative asyncio, not threads/processes/networking. Future optimized delivery, graph capture, and kernels must preserve the synchronous EngineCore and eager execution paths as correctness oracles.

@@ -6,11 +6,12 @@ from mini_vllm.config import CacheConfig, EngineConfig, TinyModelConfig
 from mini_vllm.core.engine import Engine
 
 if TYPE_CHECKING:
+    from mini_vllm.async_runtime import AsyncEngine
     from mini_vllm.speculative.draft import DraftProvider
 
 
 def create_engine(
-    version: str = "v0.9",
+    version: str = "v0.10",
     *,
     engine_config: EngineConfig | None = None,
     model_config: TinyModelConfig | None = None,
@@ -18,7 +19,8 @@ def create_engine(
     draft_provider: DraftProvider | None = None,
     max_speculative_tokens: int | None = None,
     world_size: int | None = None,
-) -> Engine:
+    max_queue_size: int | None = None,
+) -> Engine | AsyncEngine:
     normalized = version.lower().replace("_", ".")
     kwargs = {
         "engine_config": engine_config,
@@ -38,6 +40,8 @@ def create_engine(
             raise ValueError("speculative options are only supported by v0.7+")
         if world_size is not None:
             raise ValueError("world_size is only supported by v0.9+")
+        if max_queue_size is not None:
+            raise ValueError("max_queue_size is only supported by v0.10+")
         import importlib
         return importlib.import_module(
             f"mini_vllm.versions.{builders[normalized]}"
@@ -46,6 +50,8 @@ def create_engine(
     if normalized in {"v0.7", "0.7"}:
         if world_size is not None:
             raise ValueError("world_size is only supported by v0.9+")
+        if max_queue_size is not None:
+            raise ValueError("max_queue_size is only supported by v0.10+")
         from mini_vllm.versions.v0_7 import create_engine as build
         return build(
             **kwargs,
@@ -56,6 +62,8 @@ def create_engine(
     if normalized in {"v0.8", "0.8"}:
         if world_size is not None:
             raise ValueError("world_size is only supported by v0.9+")
+        if max_queue_size is not None:
+            raise ValueError("max_queue_size is only supported by v0.10+")
         from mini_vllm.versions.v0_8 import create_engine as build
         return build(
             **kwargs,
@@ -64,12 +72,24 @@ def create_engine(
         )
 
     if normalized in {"v0.9", "0.9"}:
+        if max_queue_size is not None:
+            raise ValueError("max_queue_size is only supported by v0.10+")
         from mini_vllm.versions.v0_9 import create_engine as build
         return build(
             **kwargs,
             draft_provider=draft_provider,
             max_speculative_tokens=max_speculative_tokens,
             world_size=2 if world_size is None else world_size,
+        )
+
+    if normalized in {"v0.10", "0.10"}:
+        from mini_vllm.versions.v0_10 import create_engine as build
+        return build(
+            **kwargs,
+            draft_provider=draft_provider,
+            max_speculative_tokens=max_speculative_tokens,
+            world_size=2 if world_size is None else world_size,
+            max_queue_size=8 if max_queue_size is None else max_queue_size,
         )
 
     raise ValueError(f"unknown mini-vLLM version: {version}")

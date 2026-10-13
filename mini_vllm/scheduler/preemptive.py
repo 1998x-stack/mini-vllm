@@ -5,20 +5,7 @@ from mini_vllm.scheduler.budgeted import BudgetedContinuousScheduler
 
 
 class PreemptiveBudgetedScheduler(BudgetedContinuousScheduler):
-    """v0.6 token-budget scheduler with deterministic recompute preemption.
-
-    Victim policy is intentionally readable:
-
-    * never preempt the request whose allocation is currently blocked;
-    * among other active requests, preempt the most recently admitted one;
-    * a preempted request is placed at the front of the waiting queue;
-    * anti-thrashing guard: it becomes eligible only after at least one request
-      that remained active has finished.
-
-    The final rule is deliberately conservative.  It prevents two requests in
-    a tiny KV pool from endlessly preempting each other without making durable
-    progress, while keeping the fairness mechanism visible in a few lines.
-    """
+    """v0.6 token-budget scheduler with deterministic recompute preemption."""
 
     def __init__(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
         super().__init__(max_num_seqs, max_num_batched_tokens)
@@ -72,13 +59,21 @@ class PreemptiveBudgetedScheduler(BudgetedContinuousScheduler):
 
     def on_request_preempted(self, request: Request) -> None:
         self.running = [r for r in self.running if r.request_id != request.request_id]
-        # Wait for one surviving request completion before retrying.  This is a
-        # simple bounded-workload fairness rule, not a production priority model.
         self._resume_after_finished_count[request.request_id] = self._finished_count + 1
         self.waiting.appendleft(request)
 
     def on_request_finished(self, request: Request) -> None:
         self._finished_count += 1
+
+    def cancel_request(self, request: Request) -> None:
+        was_running = any(r.request_id == request.request_id for r in self.running)
+        super().cancel_request(request)
+        self._admission_order.pop(request.request_id, None)
+        self._resume_after_finished_count.pop(request.request_id, None)
+        if was_running:
+            # A cancelled active request vacates a real execution slot. Count
+            # that boundary so a preempted survivor cannot remain blocked forever.
+            self._finished_count += 1
 
     @property
     def finished_count(self) -> int:

@@ -19,6 +19,15 @@ class Scheduler(ABC):
     def on_request_finished(self, request: Request) -> None:
         ...
 
+    def cancel_request(self, request: Request) -> None:
+        """Remove a registered request from scheduler participation.
+
+        v0.10 keeps cancellation policy centralized in EngineCore. Concrete
+        schedulers implement only the queue/list bookkeeping needed to make a
+        request unschedulable before EngineCore releases physical KV state.
+        """
+        raise RuntimeError("this scheduler does not support cancellation")
+
     def select_preemption_victim(self, blocked_request: Request) -> Request | None:
         """Return an active victim when KV pressure needs memory, if supported."""
         return None

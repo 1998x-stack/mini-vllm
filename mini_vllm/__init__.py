@@ -1,5 +1,14 @@
 """mini-vLLM: a deliberately small LLM serving runtime for learning."""
 
+from mini_vllm.async_runtime import (
+    AsyncEngine,
+    AsyncRequestHandle,
+    CancelledEvent,
+    ErrorEvent,
+    FinishedEvent,
+    StreamEvent,
+    TokenEvent,
+)
 from mini_vllm.config import CacheConfig, EngineConfig, TinyModelConfig
 from mini_vllm.core.engine import Engine, EngineCore
 from mini_vllm.core.request import Request, RequestStatus, SamplingParams
@@ -21,7 +30,9 @@ __all__ = [
     "Engine", "EngineCore", "Executor", "LocalExecutor", "Worker",
     "RankConfig", "ReferenceCollective", "ReferenceTensorParallel",
     "WorkerGroup", "DistributedExecutor",
+    "AsyncEngine", "AsyncRequestHandle", "StreamEvent", "TokenEvent",
+    "FinishedEvent", "CancelledEvent", "ErrorEvent",
     "create_engine",
 ]
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"

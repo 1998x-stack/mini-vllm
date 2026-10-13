@@ -41,14 +41,16 @@ Canonical sequence:
 - `v0.7` — speculative decoding + transactional KV
 - `v0.8` — EngineCore / Executor / Worker boundary
 - `v0.9` — WorkerGroup + reference tensor parallel
-- `v0.10` — async engine + streaming/cancellation (next)
+- `v0.10` — async engine + streaming/cancellation/backpressure
+- `v0.11` — graph/compile-aware execution (next)
 
 Every version branch requires `Agents.md`, `version.md`, mechanism tests, error-path coverage, and an executable educational example where applicable.
 
 ## 4. Ownership rules
 
+- AsyncEngine owns caller-facing handles, submission/cancellation intent, bounded event delivery, and cooperative driving only.
 - Scheduler owns admission, ordering, token work, and victim policy.
-- EngineCore owns request registry, logical history, sampling/commit, finish decisions, and policy coordination.
+- EngineCore owns request registry, logical history, sampling/commit, finish/cancel decisions, and policy coordination.
 - Executor owns execution transport/orchestration.
 - WorkerGroup owns execution topology, not scheduling policy.
 - Worker owns model/cache execution mechanism, not request policy.
@@ -60,33 +62,30 @@ Every version branch requires `Agents.md`, `version.md`, mechanism tests, error-
 Preferred dependency direction:
 
 ```text
+Caller
+  ↓
+AsyncEngine lifecycle/delivery
+  ↓
 EngineCore policy
-      │
-      ▼
+  ↓
 ExecutionRequest
-      │
-      ▼
+  ↓
 Executor
-      │
-      ▼
+  ↓
 WorkerGroup
-  ┌───┴───┐
-  ▼       ▼
-Worker  Worker
-  │       │
-rank-local model/KV
-  └───┬───┘
-      ▼
+  ↓
+Workers / rank-local model + KV
+  ↓
 Collective
-      │
-      ▼
+  ↓
 ExecutionResult
-      │
-      ▼
+  ↓
 EngineCore commit
+  ↓
+AsyncEngine committed events
 ```
 
-Mutable `Request` objects must not cross the execution boundary.
+Mutable `Request` objects must not cross the execution boundary. AsyncEngine must not implement a shadow serving Scheduler.
 
 ## 5. Core invariants
 
@@ -108,19 +107,19 @@ physical      = block_table[request_id][logical_block]
 
 ### Release invariant
 
-Finished requests release active cache ownership exactly once.
+Finished/cancelled/aborted requests release active cache ownership exactly once.
 
 ### Semantic-equivalence invariant
 
-Storage layout, speculation, executor transport, and tensor-parallel topology must preserve deterministic target-model semantics.
+Storage layout, speculation, executor transport, tensor-parallel topology, and async delivery must preserve deterministic target-model semantics.
 
 ### Transaction invariant
 
-Rejected speculative tokens must not remain in committed history or visible KV state.
+Rejected speculative tokens must not remain in committed history, visible KV state, or async token streams.
 
 ### Execution-boundary invariant
 
-Workers/WorkerGroup must not decide admission, Scheduler priority, preemption victim, or logical completion.
+Workers/WorkerGroup must not decide admission, Scheduler priority, preemption victim, logical completion, or caller cancellation policy.
 
 ### Failure-commit invariant
 
@@ -130,19 +129,31 @@ EngineCore advances logical state only after successful execution. Executor fail
 
 All ranks in a WorkerGroup must agree on world size, request identity, token positions, operation ordering, and replicated cache lifecycle metadata.
 
-### Collective invariant
-
-Reference collectives implement explicit mathematical operations on rank-local tensors. Callers must not depend on hidden global rank state.
-
 ### Distributed-failure invariant
 
-A partial rank failure must not leave surviving ranks physically advanced while EngineCore remains logically uncommitted. Replicated v0.9 cache state must roll back to a common pre-forward frontier.
+A partial rank failure must not leave surviving ranks physically advanced while EngineCore remains logically uncommitted.
+
+### Commit-before-stream invariant
+
+AsyncEngine may emit token events only for tokens present in committed logical output history.
+
+### Terminal invariant
+
+An async request emits exactly one terminal event and no events afterward.
+
+### Cancellation-release invariant
+
+Cancellation at a cooperative EngineCore boundary removes Scheduler participation and active KV ownership before `CancelledEvent` becomes terminal.
+
+### Backpressure invariant
+
+A bounded async stream may delay the cooperative driver but may not silently drop or reorder committed events.
 
 ## 6. Scope discipline
 
-Build readable references before optimized transport. Do not add multiprocessing/NCCL before rank/collective semantics are explicit; do not add async streaming before execution topology is stable; do not add custom attention kernels before the readable paged path is the correctness oracle.
+Build readable references before optimized transport. Do not add threads/network servers while the cooperative async ownership model is still the teaching target. Do not add graph capture before eager execution is the correctness oracle; do not add custom attention kernels before the readable paged path is validated.
 
-v0.9 deliberately replicates Transformer trunk + KV and shards only the LM head. Do not describe it as full production tensor parallelism.
+v0.9/v0.10 deliberately replicate Transformer trunk + KV across logical ranks and shard only the LM head. Do not describe this as full production tensor parallelism.
 
 ## 7. Testing requirements
 
@@ -164,9 +175,13 @@ Representative invariants:
 - prefix blocks remain immutable/refcounted;
 - preemption rolls back invalid computed state;
 - rejected speculative tokens disappear;
-- LocalExecutor preserves v0.7 semantics;
 - rank-local tensor shards reconstruct the single-worker reference;
-- rank failure cannot partially commit distributed physical state.
+- rank failure cannot partially commit distributed physical state;
+- async-collected deterministic output equals the synchronous reference;
+- queued cancellation allocates no KV;
+- active cancellation releases Scheduler/KV ownership;
+- bounded queues preserve committed event order;
+- each stream has exactly one terminal event.
 
 ## 8. Version lifecycle
 
@@ -194,16 +209,6 @@ After validation: update docs, synchronize the exact validated candidate to `mai
 
 For version changes review at minimum: `version.md`, `Agents.md`, `Plan.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, and README.
 
-Prefer intent-revealing commits such as:
-
-```text
-feat(cache): add paged KV block pool
-feat(speculative): add checkpoint and rollback
-feat(executor): add local worker boundary
-feat(distributed): add reference worker group
-feat(tp): shard vocabulary projection
-```
-
 ## 10. Performance rule
 
 ```text
@@ -217,8 +222,6 @@ optimized educational path
        ↓
 compare against reference
 ```
-
-Reference collectives precede process groups/NCCL; single-process logical ranks precede multi-GPU transport.
 
 ## 11. Definition of Done
 

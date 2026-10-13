@@ -1,106 +1,160 @@
-# mini-vLLM Architecture — v0.9
+# mini-vLLM Architecture — v0.10
 
-## Control plane remains singular
+## Async delivery above a singular control plane
 
 ```text
+Caller
+  │ submit / cancel
+  ▼
+AsyncEngine
+  │ handles + bounded event queues
+  ▼
 EngineCore
   request registry
   Scheduler
   token budget
-  preemption policy
+  preemption / cancellation policy
   sampling / logical commit
         │
         ▼
 ExecutionRequest
-```
-
-No rank owns a Scheduler. Distribution begins below the Executor boundary.
-
-## Execution topology
-
-```text
-ExecutionRequest
-      │
-      ▼
+        │
+        ▼
 DistributedExecutor
-      │
-      ▼
+        │
+        ▼
 WorkerGroup(world_size=N)
-  ┌──────┼──────┐
-  ▼      ▼      ▼
-rank0  rank1  rankN-1
-Worker Worker Worker
-  │      │      │
-  ▼      ▼      ▼
-replicated TinyDecoder trunk + replicated per-rank KV
-  │      │      │
-  ▼      ▼      ▼
-rank-local vocabulary projection shard
-  └──────┼──────┘
-         ▼
-ReferenceCollective.all_gather
-         │
-         ▼
-full target logits
-         │
-         ▼
+        │
+        ▼
+rank-local model + replicated KV
+        │
+        ▼
+ReferenceCollective
+        │
+        ▼
 ExecutionResult
-         │
-         ▼
+        │
+        ▼
 EngineCore commit
+        │
+        ▼
+EngineStepOutput.committed_token_ids
+        │
+        ▼
+AsyncEngine stream events
 ```
 
-## Rank ownership
+AsyncEngine owns lifecycle/delivery coordination, not serving priority. No rank and no async handle owns a Scheduler.
 
-`RankConfig(rank, world_size)` is explicit. WorkerGroup validates that ranks are exactly `0..world_size-1` and all agree on the same world size. No global rank variables are used.
+## Commit-before-stream
 
-## Tensor-parallel reference path
-
-The first integrated model shard is the LM head:
+The async facade publishes `TokenEvent` only from `EngineStepOutput.committed_token_ids`. Temporary speculative candidates are therefore invisible to callers until target verification has committed them.
 
 ```text
-full weight W[V, H]
-        │
-        ├─ rank 0 rows [0:k0)
-        ├─ rank 1 rows [k0:k1)
-        └─ ...
-
-same hidden h on every rank
-        │
-        ▼
-local_logits_r = W_r @ h
-        │
-        ▼
-all_gather(local_logits_0, ...)
-        │
-        ▼
-full logits[V]
+draft proposal
+   ↓
+target verification
+   ↓
+accepted logical commit
+   ↓
+committed_token_ids
+   ↓
+TokenEvent
 ```
 
-Uneven vocabulary sizes use balanced contiguous shard ranges. `ReferenceTensorParallel` also includes row-parallel linear reconstruction via `all_reduce_sum` as a mathematical teaching oracle.
+Rejected drafts never enter the stream.
 
-## KV scope
+## Cooperative driver
 
-v0.9 does **not** claim distributed KV partitioning. Each logical rank owns an independent replicated `TransactionalPrefixCachingPagedKVCache`. Prefix caching, preemption, and speculative rollback occur on every replica and WorkerGroup checks replicated metadata stays consistent.
-
-## Failure atomicity
-
-A normal distributed forward can fail after an earlier rank already wrote K/V. WorkerGroup therefore checkpoints every participating rank at the WorkItem start position before executing:
+The first async implementation intentionally runs one asyncio driver task:
 
 ```text
-checkpoint all ranks
-      ↓
-rank-local forwards
-      │
-      ├─ all succeed → validate/keep physical work
-      │
-      └─ any failure → rollback every rank → raise
+drain submit/cancel intents
+       ↓
+run one synchronous EngineCore.step()
+       ↓
+publish committed events
+       ↓
+await asyncio.sleep(0)
+       ↓
+repeat while work exists
 ```
 
-EngineCore still commits `num_computed_tokens` and logical outputs only after a successful distributed `ExecutionResult`.
+There is no busy-spin while idle; once no pending/core work remains the driver task exits. A later submission starts a new driver task.
 
-Speculative decoding already has an outer transactional checkpoint. A rank failure during speculative target execution surfaces to SpeculativeEngine, which rolls the distributed checkpoint back on every rank.
+## Cancellation boundary
 
-## Why no NCCL yet?
+v0.10 does not attempt unsafe mid-forward interruption. Cancellation becomes effective between atomic EngineCore steps:
 
-The goal of v0.9 is to make rank-local tensors, collective reconstruction, topology, and failure semantics visible. Real process groups would add transport and device complexity before the mathematical ownership model is learned. A future optimized/distributed version can replace `ReferenceCollective` without moving Scheduler policy into workers.
+```text
+current step already executing
+       ↓
+step succeeds + commits
+       ↓
+committed events may be delivered
+       ↓
+cancel intent applied
+       ↓
+Scheduler removal
+       ↓
+active KV release
+       ↓
+logical finish_reason = cancelled
+       ↓
+CancelledEvent
+```
+
+Cancellation before EngineCore admission removes the pending submission and emits `CancelledEvent` without allocating KV.
+
+## Exactly one terminal event
+
+Every accepted handle terminates with exactly one of:
+
+```text
+FinishedEvent
+CancelledEvent
+ErrorEvent
+```
+
+`AsyncRequestHandle` refuses publication after a terminal event and its async iterator stops when that terminal event is consumed.
+
+## Backpressure
+
+Each request handle owns a bounded `asyncio.Queue`. The reference policy is intentionally global/cooperative:
+
+```text
+EngineCore commits
+   ↓
+AsyncEngine tries queue.put(event)
+   ↓
+queue full?
+   ├─ no  → deliver and continue
+   └─ yes → await consumer capacity
+              ↓
+            no next EngineCore step yet
+```
+
+No committed event is dropped or reordered. This is a correctness-first teaching policy, not an optimal high-throughput serving policy.
+
+## Error policy
+
+The first reference implementation treats an uncaught EngineCore/Executor step failure conservatively as a core-wide async failure: remaining active handles receive `ErrorEvent`, and the facade attempts to abort/release registered request resources before publishing terminal errors.
+
+## Distributed execution remains unchanged
+
+v0.10 retains v0.9's single-process logical-rank topology:
+
+```text
+DistributedExecutor
+  ↓
+WorkerGroup
+  ├─ rank 0: replicated trunk/KV + vocab shard
+  ├─ rank 1: replicated trunk/KV + vocab shard
+  └─ ...
+  ↓
+ReferenceCollective.all_gather
+  ↓
+full logits
+```
+
+Async delivery is above this topology. It does not alter collective semantics or distributed failure rollback.
