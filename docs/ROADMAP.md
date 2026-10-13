@@ -14,7 +14,9 @@
 | v0.10 | async streaming / cancellation / backpressure | frozen |
 | v0.11 | compile-aware rank-local tensor execution | frozen |
 | v0.12 | reference + vectorized PagedAttention | frozen |
-| v0.13 | prefix-aware scheduling / cache-aware admission | current implementation / CI release rule |
-| v1.0 | integrated educational runtime | next |
+| v0.13 | prefix-aware scheduling / cache-aware admission | frozen |
+| v1.0 | integrated public API + observability + end-to-end runtime | current implementation / exact-CI release rule |
 
 Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → attention optimization → cache-aware policy → integrated runtime.
+
+After v1.0, a new branch should exist only for a genuinely new learning target. Candidate directions include real CUDA/Triton kernels, actual multiprocessing or distributed transport, and production-style model/tokenizer loading. None is part of the v1.0 contract.

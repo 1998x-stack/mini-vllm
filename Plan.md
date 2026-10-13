@@ -17,36 +17,106 @@ v0.9  WorkerGroup + reference tensor parallel
 v0.10 async streaming/cancellation/backpressure
 v0.11 compile-aware execution
 v0.12 optimized PagedAttention
-v0.13 prefix-aware scheduling                          ← current implementation
-v1.0  integrated educational runtime                  ← next
+v0.13 prefix-aware scheduling
+v1.0  integrated educational runtime                  ← current implementation
 ```
 
-## v0.13 lesson
+## v1.0 lesson
 
-Cache reuse has three distinct meanings that must not collapse into one another:
+The final lesson is composition: a serving mechanism is only useful when its ownership boundary remains legible next to all the other mechanisms.
 
 ```text
-cache fact             policy                    execution truth
-PrefixReuseHint   →    AdmissionCost      →      prepare_request()
-                        + fairness                actual attached KV
+caller
+  ↓
+AsyncEngine                       delivery / cancellation / backpressure
+  ↓
+EngineCore                        logical truth and commit authority
+  ↓
+Scheduler                         admission / budget / fairness / victim policy
+  ↓
+Executor / WorkerGroup            topology / rank consistency / rollback
+  ↓
+Worker / ModelRunner              rank-local model execution
+  ↓
+KV + PagedAttention               storage ownership + logical reads
+  ↓
+Compile-aware projection          rank-local tensor specialization
+  ↓
+Speculative verification          transactional candidate acceptance
+  ↓
+committed output stream
 ```
 
-A side-effect-free hint may reduce expected admission cost, but it cannot reserve blocks or claim computed tokens. v0.13 therefore delays first cache attachment until actual admission, then reconciles the Scheduler's estimate against the cache's real reusable frontier.
+v1.0 intentionally avoids a new major scheduling, cache, distributed, or kernel mechanism. It adds a stable construction facade and a public read-only snapshot so the complete runtime can be reasoned about without reaching into private implementation state.
 
-Core equation:
+## Stable public surfaces
 
-```text
-expected_new_prefill = raw_prefill - estimated_reusable_prefix
-```
+### Construction
 
-This value ranks waiting work only. The normal token budget continues to count actual scheduled model tokens.
+`RuntimeConfig` composes:
 
-Fairness is explicit: requests accumulate bypass counts when warmer work is admitted ahead of them; a bounded threshold gives the older/cold request protection against indefinite starvation.
+- `EngineConfig`;
+- `TinyModelConfig`;
+- `CacheConfig`;
+- `CompileConfig`;
+- `PagedAttentionConfig`;
+- logical `world_size`;
+- async `max_queue_size`;
+- prefix-fairness threshold.
 
-Compatibility rule: preemption, speculative transactions, distribution, async delivery, compile-aware projection, and vectorized PagedAttention keep their existing ownership boundaries.
+`create_engine()` defaults to v1.0. Explicit builders for v0.1–v0.13 remain available.
 
-Release rule: only an exact v0.13 commit with a green repository CI run may be synchronized to `main`.
+### Observability
 
-## Next
+`engine.snapshot()` returns one immutable teaching view containing:
 
-- v1.0: consolidate the full educational runtime, public API, observability, documentation, and integrated end-to-end scenarios without introducing another major serving mechanism.
+- request lifecycle and computed frontiers;
+- prefix-aware scheduler observations;
+- cache statistics;
+- recent EngineStepOutput traces, including preemption, speculation and committed tokens;
+- distributed/rank execution topology;
+- attention backend counters;
+- compile registry counters;
+- async pending/cancellation/driver state.
+
+Observation must be side-effect free.
+
+## Cross-version correctness contract
+
+The stable invariant list is maintained in `docs/INVARIANTS.md`. The most important rules are:
+
+1. computed tokens imply valid addressable KV;
+2. sampled tokens are not computed until model execution catches up;
+3. physical ownership precedes K/V access;
+4. block-table translation is authoritative;
+5. prefix hints are advisory facts, never ownership;
+6. preemption rolls back to valid replayable state;
+7. rejected speculative state disappears;
+8. distributed failures cannot partially commit replicated state;
+9. async clients see committed tokens only and one terminal result;
+10. optimized attention equals the readable reference;
+11. compile-aware projection equals eager projection;
+12. warm-prefix policy cannot starve cold work;
+13. observability cannot mutate runtime state.
+
+## v1.0 integrated validation
+
+`examples/15_integrated_runtime.py` exercises a warm prefix, prefix-aware admission, token-budgeted work, speculative verification, distributed execution, vectorized PagedAttention, compile-aware projection and async streaming, then explains the run using only the public snapshot.
+
+The v1.0 test suite additionally proves:
+
+- default construction selects v1.0;
+- deterministic v1.0 output equals validated v0.13;
+- `RuntimeConfig` composes the public runtime;
+- snapshots are repeatable and side-effect free;
+- scheduler/cache/execution/speculation/committed-output observations are publicly reachable;
+- real warm-prefix cost is visible in admission traces;
+- historical builders remain available.
+
+## Release rule
+
+Only the exact v1.0 implementation commit that passes repository CI may be synchronized to `main`.
+
+## After v1.0
+
+Further versions require a genuinely new learning target—for example real GPU kernels, actual multiprocessing/distributed transport, or production-style model loading. Incremental accumulation alone is not sufficient reason for a new version.
