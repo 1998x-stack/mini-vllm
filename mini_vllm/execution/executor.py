@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from mini_vllm.cache.base import CacheCheckpoint
+from mini_vllm.cache.base import CacheCheckpoint, PrefixReuseHint
 from mini_vllm.execution.types import (
     ExecutionRequest,
     ExecutionResult,
@@ -24,6 +24,10 @@ class Executor(ABC):
         self, request: SpeculativeExecutionRequest
     ) -> SpeculativeExecutionResult:
         ...
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        """Policy-safe cache estimate; custom executors may keep the zero default."""
+        return PrefixReuseHint(0, 0, len(prompt_token_ids))
 
     @abstractmethod
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
@@ -86,6 +90,9 @@ class LocalExecutor(Executor):
     ) -> SpeculativeExecutionResult:
         self.speculative_execute_calls += 1
         return self.worker.execute_speculative(request)
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        return self.worker.estimate_prefix_reuse(prompt_token_ids)
 
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
         return self.worker.prepare_request(request_id, prompt_token_ids)

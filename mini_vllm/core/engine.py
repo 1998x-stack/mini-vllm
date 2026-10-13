@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-from mini_vllm.cache.base import KVCacheBackend
+from mini_vllm.cache.base import KVCacheBackend, PrefixReuseHint
 from mini_vllm.config import EngineConfig
 from mini_vllm.core.request import Request, RequestStatus
 from mini_vllm.core.sampler import Sampler
@@ -44,6 +44,7 @@ class EngineCore:
         self.sampler = sampler or Sampler()
         self.version = version
         self._requests: OrderedDict[str, Request] = OrderedDict()
+        self._cache_prepared: set[str] = set()
         self._step = 0
         self._preemption_events = 0
         self._step_speculation: list[VerificationResult] = []
@@ -64,16 +65,63 @@ class EngineCore:
         if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
             raise RuntimeError("cache returned invalid cached-token count")
 
-    def add_request(self, request: Request) -> None:
-        if request.request_id in self._requests:
-            raise ValueError(f"duplicate request_id: {request.request_id}")
-        if len(request.prompt_token_ids) + request.max_new_tokens > self.config.max_model_len:
-            raise ValueError("prompt + max_new_tokens exceeds max_model_len")
+    def _validate_prefix_hint(self, request: Request, hint: PrefixReuseHint) -> None:
+        if hint.prompt_tokens != len(request.prompt_token_ids):
+            raise RuntimeError("cache returned prefix hint for wrong prompt length")
+        self._validate_cached_token_count(request, hint.reusable_tokens)
+
+    def _refresh_prefix_reuse_hint(self, request: Request) -> None:
+        hint = self.executor.estimate_prefix_reuse(request.prompt_token_ids)
+        self._validate_prefix_hint(request, hint)
+        self.scheduler.update_prefix_reuse_hint(request, hint)
+
+    def _refresh_prefix_reuse_hints(self) -> None:
+        if not self.scheduler.defer_cache_prepare:
+            return
+        for request in self.scheduler.requests_needing_prefix_hints():
+            if request.finished:
+                continue
+            self._refresh_prefix_reuse_hint(request)
+
+    def _prepare_request_cache(self, request: Request) -> int:
+        hint = self.scheduler.current_prefix_reuse_hint(request)
+        estimated_reuse = 0 if hint is None else hint.reusable_tokens
         cached_tokens = self.executor.prepare_request(
             request.request_id, request.prompt_token_ids
         )
         self._validate_cached_token_count(request, cached_tokens)
         request.num_computed_tokens = cached_tokens
+        request.cache_rebuild_required = False
+        self._cache_prepared.add(request.request_id)
+        self.scheduler.on_request_cache_prepared(
+            request,
+            estimated_reuse=estimated_reuse,
+            actual_reuse=cached_tokens,
+        )
+        return cached_tokens
+
+    def add_request(self, request: Request) -> None:
+        if request.request_id in self._requests:
+            raise ValueError(f"duplicate request_id: {request.request_id}")
+        if len(request.prompt_token_ids) + request.max_new_tokens > self.config.max_model_len:
+            raise ValueError("prompt + max_new_tokens exceeds max_model_len")
+
+        if self.scheduler.defer_cache_prepare:
+            # v0.13: scheduling may inspect a side-effect-free hint before the
+            # request owns any physical KV state.
+            hint = self.executor.estimate_prefix_reuse(request.prompt_token_ids)
+            self._validate_prefix_hint(request, hint)
+            self._requests[request.request_id] = request
+            self.scheduler.add_request(request)
+            self.scheduler.update_prefix_reuse_hint(request, hint)
+            return
+
+        cached_tokens = self.executor.prepare_request(
+            request.request_id, request.prompt_token_ids
+        )
+        self._validate_cached_token_count(request, cached_tokens)
+        request.num_computed_tokens = cached_tokens
+        self._cache_prepared.add(request.request_id)
         self._requests[request.request_id] = request
         self.scheduler.add_request(request)
 
@@ -110,6 +158,7 @@ class EngineCore:
         # then publish the logical terminal state.
         self.scheduler.cancel_request(request)
         self.executor.free(request_id)
+        self._cache_prepared.discard(request_id)
         request.mark_finished(reason)
         return True
 
@@ -124,16 +173,19 @@ class EngineCore:
         if not request.cache_rebuild_required:
             return item
 
-        cached_tokens = self.executor.prepare_request(
-            request.request_id, request.prompt_token_ids
-        )
-        self._validate_cached_token_count(request, cached_tokens)
-        request.num_computed_tokens = cached_tokens
-        request.cache_rebuild_required = False
+        self._prepare_request_cache(request)
+        return make_work_item(request, max_tokens=item.num_tokens)
+
+    def _prepare_deferred_item(self, item: WorkItem) -> WorkItem:
+        request = item.request
+        if request.request_id in self._cache_prepared:
+            return item
+        self._prepare_request_cache(request)
         return make_work_item(request, max_tokens=item.num_tokens)
 
     def _preempt(self, victim: Request) -> None:
         self.executor.free(victim.request_id)
+        self._cache_prepared.discard(victim.request_id)
         victim.mark_preempted()
         self.scheduler.on_request_preempted(victim)
         self._preemption_events += 1
@@ -149,6 +201,7 @@ class EngineCore:
                 continue
 
             item = self._restore_replayed_item(original_item)
+            item = self._prepare_deferred_item(item)
             while not self.executor.ensure_capacity(item.request_id, item.end_pos):
                 victim = self.scheduler.select_preemption_victim(item.request)
                 if victim is None:
@@ -189,6 +242,7 @@ class EngineCore:
 
     def step(self) -> EngineStepOutput:
         self._step_speculation = []
+        self._refresh_prefix_reuse_hints()
         decision, preempted_ids = self._fit_cache(self.scheduler.schedule())
         work_trace = tuple(WorkTrace.from_item(item) for item in decision.work_items)
         sampled: dict[str, int] = {}
@@ -231,6 +285,7 @@ class EngineCore:
                 if reached_eos or reached_limit:
                     request.mark_finished("eos" if reached_eos else "length")
                     self.executor.free(request.request_id)
+                    self._cache_prepared.discard(request.request_id)
                     self.scheduler.on_request_finished(request)
                     finished.append(request.request_id)
 

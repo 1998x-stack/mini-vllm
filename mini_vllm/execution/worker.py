@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mini_vllm.cache.base import CacheCheckpoint, KVCacheBackend
+from mini_vllm.cache.base import CacheCheckpoint, KVCacheBackend, PrefixReuseHint
 from mini_vllm.execution.types import (
     ExecutionRequest,
     ExecutionResult,
@@ -38,6 +38,9 @@ class Worker:
             request_id=request.request_id,
             logits_trace=logits_trace,
         )
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        return self.cache.estimate_prefix_reuse(prompt_token_ids)
 
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
         return self.cache.prepare_request(request_id, prompt_token_ids)

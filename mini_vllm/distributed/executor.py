@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from mini_vllm.cache.base import PrefixReuseHint
 from mini_vllm.distributed.worker_group import DistributedCacheCheckpoint, WorkerGroup
 from mini_vllm.execution.executor import Executor
 from mini_vllm.execution.types import (
@@ -27,6 +28,9 @@ class DistributedExecutor(Executor):
         self, request: SpeculativeExecutionRequest
     ) -> SpeculativeExecutionResult:
         return self.worker_group.execute_speculative(request)
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        return self.worker_group.estimate_prefix_reuse(prompt_token_ids)
 
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
         return self.worker_group.prepare_request(request_id, prompt_token_ids)

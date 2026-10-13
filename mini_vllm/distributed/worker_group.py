@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mini_vllm.cache.base import CacheCheckpoint
+from mini_vllm.cache.base import CacheCheckpoint, PrefixReuseHint
 from mini_vllm.distributed.collective import ReferenceCollective
 from mini_vllm.distributed.rank import RankConfig
 from mini_vllm.execution.types import (
@@ -161,6 +161,13 @@ class WorkerGroup:
             request_id=request.request_id,
             logits_trace=logits_trace,
         )
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        hints = tuple(worker.estimate_prefix_reuse(prompt_token_ids) for worker in self.workers)
+        first = hints[0]
+        if any(hint != first for hint in hints[1:]):
+            raise RuntimeError("replicated ranks disagree on prefix reuse estimate")
+        return first
 
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
         counts = tuple(

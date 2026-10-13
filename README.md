@@ -4,7 +4,7 @@ A small, branch-versioned LLM-serving runtime for learning the systems ideas beh
 
 ## Current line
 
-`main` is always the newest exact-CI-validated release. v0.12 is the current optimized-PagedAttention implementation line; an exact v0.12 commit is synchronized to `main` only when that same commit has a green repository CI run.
+`main` is always the newest exact-CI-validated release. v0.13 is the prefix-aware scheduling implementation line; only an exact v0.13 commit with green repository CI may advance `main`.
 
 ```text
 v0.1  static batching + contiguous KV
@@ -18,38 +18,45 @@ v0.8  EngineCore / Executor / Worker
 v0.9  logical multi-rank + tensor parallel
 v0.10 async streaming + cancellation/backpressure
 v0.11 compile-aware rank-local tensor execution
-v0.12 reference + vectorized PagedAttention             ← current
-v0.13 prefix-aware scheduling                           ← next
+v0.12 reference + vectorized PagedAttention
+v0.13 prefix-aware scheduling + cache-aware admission  ← current
+v1.0  integrated educational runtime                  ← next
 ```
 
-## v0.12 mental model
+## v0.13 mental model
 
 ```text
-logical positions
-      ↓
-block table
-      ↓
-physical block + offset
-      ↓
-ReferencePagedAttention      correctness oracle
-      or
-VectorizedPagedAttention     tensor-indexed paged gather
-      ↓
-same attention context
-      ↓
-TinyDecoder / compile-aware LM-head / WorkerGroup / AsyncEngine
+cache estimate                Scheduler                    Engine/cache
+     │                           │                            │
+     └─ PrefixReuseHint ───────► AdmissionCost                │
+                                 │                            │
+                         expected new work                    │
+                                 │                            │
+                        warm preference + fairness            │
+                                 │                            │
+                                 └──── admit ────────────────► prepare_request()
+                                                              │
+                                                    actual reusable prefix
+                                                              │
+                                                        reconcile truth
 ```
 
-The vectorized path removes the Python per-token KV gather loop. It does **not** change Scheduler policy, cache ownership, prefix sharing, preemption, speculative rollback, distributed topology, compilation policy, or streaming semantics.
+The key rule is:
+
+```text
+hint != reservation != ownership != computed tokens
+```
+
+A waiting v0.13 request can be recognized as warm without owning KV. Only actual `prepare_request()` may advance its computed frontier.
 
 ## Verify
 
 ```bash
 pip install -e '.[dev]'
 ./scripts/check.sh
-python examples/13_paged_attention.py
+python examples/14_prefix_aware_scheduling.py
 ```
 
-The v0.12 trace compares reference and vectorized outputs and prints per-rank attention backend statistics. No speedup is claimed without measurement, and Triton/CUDA remains optional rather than a correctness dependency.
+The v0.13 example shows a warm request bypassing a colder, more expensive prefill, then exposes admission/reconciliation statistics. Fairness protection prevents repeated warm arrivals from starving cold work.
 
 Read `Agents.md`, `Plan.md`, and `version.md` before changing architecture.

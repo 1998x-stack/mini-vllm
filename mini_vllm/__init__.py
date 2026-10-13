@@ -17,6 +17,7 @@ from mini_vllm.attention import (
     ReferencePagedAttention,
     VectorizedPagedAttention,
 )
+from mini_vllm.cache.base import PrefixReuseHint
 from mini_vllm.compile_runtime import (
     CompileConfig,
     CompileEvent,
@@ -35,12 +36,18 @@ from mini_vllm.distributed import (
     WorkerGroup,
 )
 from mini_vllm.execution import Executor, LocalExecutor, Worker
+from mini_vllm.scheduler.prefix_aware import (
+    AdmissionCost,
+    PrefixAwareBudgetedScheduler,
+    PrefixSchedulingEvent,
+    PrefixSchedulingStats,
+)
 from mini_vllm.speculative import DraftProvider, IncrementDraftProvider, ScriptedDraftProvider
 from mini_vllm.versions import create_engine
 
 __all__ = [
     "CacheConfig", "EngineConfig", "TinyModelConfig",
-    "Request", "RequestStatus", "SamplingParams",
+    "Request", "RequestStatus", "SamplingParams", "PrefixReuseHint",
     "DraftProvider", "IncrementDraftProvider", "ScriptedDraftProvider",
     "Engine", "EngineCore", "Executor", "LocalExecutor", "Worker",
     "RankConfig", "ReferenceCollective", "ReferenceTensorParallel",
@@ -51,7 +58,8 @@ __all__ = [
     "ExecutionShapeSignature",
     "PagedAttentionBackend", "PagedAttentionConfig", "PagedAttentionEvent",
     "PagedAttentionStats", "ReferencePagedAttention", "VectorizedPagedAttention",
-    "create_engine",
+    "AdmissionCost", "PrefixAwareBudgetedScheduler", "PrefixSchedulingEvent",
+    "PrefixSchedulingStats", "create_engine",
 ]
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from mini_vllm.cache.base import PrefixReuseHint
 from mini_vllm.core.request import Request
 from mini_vllm.core.work import ScheduleDecision, WorkItem
 
@@ -18,6 +19,35 @@ class Scheduler(ABC):
     @abstractmethod
     def on_request_finished(self, request: Request) -> None:
         ...
+
+    @property
+    def defer_cache_prepare(self) -> bool:
+        """Whether first cache attachment should wait until admission."""
+        return False
+
+    def update_prefix_reuse_hint(
+        self, request: Request, hint: PrefixReuseHint
+    ) -> None:
+        """Receive an advisory cache fact without gaining cache ownership."""
+        return None
+
+    def current_prefix_reuse_hint(self, request: Request) -> PrefixReuseHint | None:
+        """Return the advisory hint used for the current admission decision."""
+        return None
+
+    def requests_needing_prefix_hints(self) -> tuple[Request, ...]:
+        """Waiting requests whose advisory reuse estimates may be refreshed."""
+        return ()
+
+    def on_request_cache_prepared(
+        self,
+        request: Request,
+        *,
+        estimated_reuse: int,
+        actual_reuse: int,
+    ) -> None:
+        """Observe reconciliation between advisory hint and actual attachment."""
+        return None
 
     def cancel_request(self, request: Request) -> None:
         """Remove a registered request from scheduler participation.

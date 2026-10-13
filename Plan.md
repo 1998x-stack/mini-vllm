@@ -16,39 +16,37 @@ v0.8  EngineCore / Executor / Worker
 v0.9  WorkerGroup + reference tensor parallel
 v0.10 async streaming/cancellation/backpressure
 v0.11 compile-aware execution
-v0.12 optimized PagedAttention                         ← current implementation
-v0.13 prefix-aware scheduling                          ← next
-v1.0  integrated educational runtime
+v0.12 optimized PagedAttention
+v0.13 prefix-aware scheduling                          ← current implementation
+v1.0  integrated educational runtime                  ← next
 ```
 
-## v0.12 lesson
+## v0.13 lesson
 
-PagedAttention optimization belongs below request/cache policy. The cache still owns physical blocks and block tables; attention receives only the current logical length and current storage mapping.
-
-Reference equation:
+Cache reuse has three distinct meanings that must not collapse into one another:
 
 ```text
-for logical position p:
-    logical_block = p // block_size
-    offset        = p % block_size
-    physical      = block_table[logical_block]
-    K[p], V[p]    = physical_storage[physical, offset]
+cache fact             policy                    execution truth
+PrefixReuseHint   →    AdmissionCost      →      prepare_request()
+                        + fairness                actual attached KV
 ```
 
-The reference backend follows the readable per-position cache path. The vectorized backend constructs all logical positions at once, maps them through the block table with tensor indexing, gathers K/V in one tensor operation, and then performs the same GQA/MHA attention math.
+A side-effect-free hint may reduce expected admission cost, but it cannot reserve blocks or claim computed tokens. v0.13 therefore delays first cache attachment until actual admission, then reconciles the Scheduler's estimate against the cache's real reusable frontier.
 
-Correctness rules:
+Core equation:
 
-- logical length masks unused tail slots;
-- physical blocks need not be contiguous;
-- prefix sharing and recycled blocks remain cache concerns;
-- vectorized and reference outputs must match;
-- unsupported cache layouts use explicit reference fallback when configured;
-- v0.11 compile-aware projection remains a separate rank-local optimization boundary.
+```text
+expected_new_prefill = raw_prefill - estimated_reusable_prefix
+```
 
-Release rule: only an exact v0.12 commit with a green repository CI run may be synchronized to `main`. This wording remains valid before and after release.
+This value ranks waiting work only. The normal token budget continues to count actual scheduled model tokens.
 
-## Planned
+Fairness is explicit: requests accumulate bypass counts when warmer work is admitted ahead of them; a bounded threshold gives the older/cold request protection against indefinite starvation.
 
-- v0.13: prefix-aware admission/cache-aware scheduling policy.
-- v1.0: integrated educational serving runtime.
+Compatibility rule: preemption, speculative transactions, distribution, async delivery, compile-aware projection, and vectorized PagedAttention keep their existing ownership boundaries.
+
+Release rule: only an exact v0.13 commit with a green repository CI run may be synchronized to `main`.
+
+## Next
+
+- v1.0: consolidate the full educational runtime, public API, observability, documentation, and integrated end-to-end scenarios without introducing another major serving mechanism.

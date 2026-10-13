@@ -13,8 +13,8 @@
 | v0.9 | WorkerGroup + reference tensor parallel | frozen |
 | v0.10 | async streaming / cancellation / backpressure | frozen |
 | v0.11 | compile-aware rank-local tensor execution | frozen |
-| v0.12 | reference + vectorized PagedAttention | current implementation / CI release rule |
-| v0.13 | prefix-aware scheduling/cache policy | next |
-| v1.0 | integrated educational serving runtime | planned |
+| v0.12 | reference + vectorized PagedAttention | frozen |
+| v0.13 | prefix-aware scheduling / cache-aware admission | current implementation / CI release rule |
+| v1.0 | integrated educational runtime | next |
 
-Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → attention/kernel optimization → cache-aware policy.
+Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → attention optimization → cache-aware policy → integrated runtime.

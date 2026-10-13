@@ -4,6 +4,7 @@ from collections import OrderedDict
 import hashlib
 import struct
 
+from mini_vllm.cache.base import PrefixReuseHint
 from mini_vllm.cache.paged import PagedKVCache
 
 
@@ -58,6 +59,25 @@ class PrefixCachingPagedKVCache(PagedKVCache):
             previous = self._chain_hash(previous, prompt_tokens[start:end])
             hashes.append(previous)
         return tuple(hashes)
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        """Inspect the prefix index without taking ownership or touching LRU state."""
+        prompt_tokens = tuple(int(token) for token in prompt_token_ids)
+        block_hashes = self._compute_prompt_block_hashes(prompt_tokens)
+        max_reusable_tokens = max(0, len(prompt_tokens) - 1)
+        reusable_full_blocks = max_reusable_tokens // self.block_size
+
+        cached_blocks = 0
+        for logical_block in range(reusable_full_blocks):
+            if block_hashes[logical_block] not in self._prefix_index:
+                break
+            cached_blocks += 1
+
+        return PrefixReuseHint(
+            reusable_tokens=cached_blocks * self.block_size,
+            reusable_full_blocks=cached_blocks,
+            prompt_tokens=len(prompt_tokens),
+        )
 
     def _touch(self, block_hash: str) -> None:
         if block_hash in self._cache_lru:

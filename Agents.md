@@ -26,24 +26,33 @@ v0.10 async streaming/cancellation
 v0.11 compile-aware tensor execution
 v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
+v1.0 integrated educational runtime
 ```
 
 ## Ownership
 
 - AsyncEngine: caller lifecycle, bounded event delivery, cancellation intent.
-- EngineCore/Scheduler: serving policy and logical request state.
-- Executor/WorkerGroup: execution orchestration/topology.
-- Worker/ModelRunner: rank-local model and KV mechanism.
-- KV backend: physical cache storage, block tables, allocation, sharing, and recycling.
+- EngineCore: logical truth coordination and policy/mechanism reconciliation.
+- Scheduler: admission order, token-budget policy, fairness, and victim policy.
+- Executor/WorkerGroup: execution orchestration/topology and replicated-consistency checks.
+- Worker/ModelRunner: rank-local model execution.
+- KV backend: physical cache storage, block tables, allocation, sharing, recycling, and policy-safe reuse facts.
 - PagedAttention backend: read current logical K/V view and compute attention context; it does not own blocks.
 - Compile registry: rank-local tensor specialization only.
 - Collective: communication mathematics only.
 
-Attention optimization must not choose admissions, allocate/free blocks, mutate prefix ownership, decide preemption, or alter async lifecycle.
+Scheduler policy must not inspect physical block IDs, refcounts, cache LRU internals, or free-list state. Cache reuse estimates expose quantities, not ownership handles.
 
 ## Core invariants
 
 - computed tokens imply valid KV;
+- a `PrefixReuseHint` is advisory: it is not a reservation, ownership claim, or computed-token claim;
+- side-effect-free prefix estimation cannot create block tables, change refcounts, or touch cache recency;
+- a deferred waiting request may have a warm hint while owning zero KV blocks;
+- only authoritative `prepare_request()` may advance the reusable computed frontier;
+- stale hints may affect admission quality but can never affect serving correctness;
+- warm-prefix preference must have explicit starvation protection and deterministic tie-breaking;
+- replicated ranks must agree on policy-visible cache facts;
 - paged address translation is `logical_block=p//B`, `offset=p%B`, `physical=block_table[logical_block]`;
 - attention reads only logical positions `[0, length)` even when the final physical block has unused slots;
 - reference and vectorized paged attention are numerically equivalent;
@@ -64,18 +73,18 @@ python -m pytest -q
 
 Never claim tests passed unless executed on the exact reported snapshot. An active version freezes only after its exact commit passes repository GitHub Actions, docs agree with code, `main` advances to that same commit, and the next planning branch is created from latest `main`.
 
-## Performance rule
+## Performance / policy rule
 
 ```text
-readable oracle
+mechanism fact
   ↓
-correctness tests
+explicit policy input
   ↓
-explicit optimization boundary
+invariant tests
   ↓
-measure/inspect
+observable decision
   ↓
-optimized educational path
+authoritative execution truth
 ```
 
-`torch.compile` success or vectorized PyTorch code is not itself evidence of speedup. A real Triton/CUDA path may only be claimed after an actual kernel exists, has capability checks, and is numerically validated against the reference path.
+Do not convert an estimate into ownership just because it improves scheduling. Likewise, `torch.compile` success or vectorized PyTorch code is not itself evidence of speedup. Optimizations and policies remain subordinate to the readable correctness contract.

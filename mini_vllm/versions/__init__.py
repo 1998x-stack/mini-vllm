@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 def create_engine(
-    version: str = "v0.12",
+    version: str = "v0.13",
     *,
     engine_config: EngineConfig | None = None,
     model_config: TinyModelConfig | None = None,
@@ -24,8 +24,12 @@ def create_engine(
     max_queue_size: int | None = None,
     compile_config: CompileConfig | None = None,
     attention_config: PagedAttentionConfig | None = None,
+    fairness_bypass_limit: int | None = None,
 ) -> Engine | AsyncEngine:
     normalized = version.lower().replace("_", ".")
+    if fairness_bypass_limit is not None and normalized not in {"v0.13", "0.13"}:
+        raise ValueError("fairness_bypass_limit is only supported by v0.13+")
+
     kwargs = {
         "engine_config": engine_config,
         "model_config": model_config,
@@ -125,6 +129,21 @@ def create_engine(
             max_queue_size=8 if max_queue_size is None else max_queue_size,
             compile_config=compile_config,
             attention_config=attention_config,
+        )
+
+    if normalized in {"v0.13", "0.13"}:
+        from mini_vllm.versions.v0_13 import create_engine as build
+        return build(
+            **kwargs,
+            draft_provider=draft_provider,
+            max_speculative_tokens=max_speculative_tokens,
+            world_size=2 if world_size is None else world_size,
+            max_queue_size=8 if max_queue_size is None else max_queue_size,
+            compile_config=compile_config,
+            attention_config=attention_config,
+            fairness_bypass_limit=(
+                2 if fairness_bypass_limit is None else fairness_bypass_limit
+            ),
         )
 
     raise ValueError(f"unknown mini-vLLM version: {version}")

@@ -15,8 +15,35 @@ class CacheCheckpoint:
     block_table: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PrefixReuseHint:
+    """Policy-safe, side-effect-free estimate of reusable prompt work.
+
+    This is deliberately not a reservation or ownership handle.  It contains
+    no physical block identities and may become stale before actual admission.
+    """
+
+    reusable_tokens: int
+    reusable_full_blocks: int
+    prompt_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.reusable_tokens < 0 or self.reusable_full_blocks < 0:
+            raise ValueError("prefix reuse counts must be non-negative")
+        if self.prompt_tokens < 0 or self.reusable_tokens > self.prompt_tokens:
+            raise ValueError("invalid prefix reuse hint")
+
+
 class KVCacheBackend(ABC):
     """Storage contract consumed by the model runner."""
+
+    def estimate_prefix_reuse(self, prompt_token_ids: list[int]) -> PrefixReuseHint:
+        """Return a side-effect-free reuse estimate for scheduler policy."""
+        return PrefixReuseHint(
+            reusable_tokens=0,
+            reusable_full_blocks=0,
+            prompt_tokens=len(prompt_token_ids),
+        )
 
     def prepare_request(self, request_id: str, prompt_token_ids: list[int]) -> int:
         return 0

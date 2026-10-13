@@ -15,4 +15,5 @@ python examples/10_tensor_parallel.py >/dev/null
 python examples/11_async_streaming.py >/dev/null
 python examples/12_compile_aware.py >/dev/null
 python examples/13_paged_attention.py >/dev/null
+python examples/14_prefix_aware_scheduling.py >/dev/null
 echo "all checks passed"
