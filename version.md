@@ -1,244 +1,356 @@
-# mini-vLLM v0.10 — async engine, streaming, cancellation, and backpressure
+# mini-vLLM v0.11 — graph/compile-aware execution (planning branch)
 
 ## 1. Version identity
 
-- **Branch:** `v0.10`
-- **Previous version:** `v0.9`
-- **Theme:** asynchronous caller-facing lifecycle and bounded streaming above the synchronous EngineCore
-- **Status rule:** implementation is eligible for release only when the exact v0.10 commit has a green repository CI run; released `main` is the source of truth for validated state
+- **Branch:** `v0.11`
+- **Base:** latest validated `v0.10` / `main`
+- **Previous version:** `v0.10`
+- **Theme:** make graph/capture boundaries, shape signatures, compilation reuse, graph breaks, and eager fallback explicit inside the execution plane
+- **Status:** planning / implementation target; runtime is intentionally identical to v0.10 until the acceptance criteria below pass
 
-v0.9 established a centralized synchronous EngineCore over a distributed WorkerGroup. v0.10 adds a caller-facing async layer without moving scheduling, speculation, distributed execution, or logical commit policy out of that core.
+v0.10 established an async caller facade above one synchronous EngineCore and one distributed execution topology. v0.11 asks a different question:
+
+> Which part of model execution is stable enough to compile/capture, which state must remain eager, and how do we preserve serving semantics when shapes or unsupported operations change?
 
 ## 2. Primary mental model
 
+Do **not** compile the serving control plane:
+
 ```text
-caller
-  │ submit(Request)
-  ▼
-AsyncEngine
-  │ pending intent + request handle
-  ▼
-EngineCore                         ← only serving-policy authority
+AsyncEngine                    eager lifecycle/delivery
+    ↓
+EngineCore                     eager policy/state machine
+    ↓
+Scheduler                      eager admission/token budget
+    ↓
+DistributedExecutor            eager orchestration
+    ↓
+WorkerGroup                    eager rank topology
+    ↓
+Worker / ModelRunner
+    │
+    ├── eager cache address/ownership work
+    │
+    └── compile-aware pure tensor kernel
+            │
+            ├── signature hit  → reuse compiled callable
+            ├── signature miss → compile/capture candidate
+            └── unsupported    → eager fallback
+```
+
+The learning target is a **narrow execution kernel boundary**, not a magical `torch.compile(engine)` wrapper.
+
+## 3. Why v0.11 follows v0.10
+
+The project now has explicit boundaries for:
+
+- caller lifecycle and backpressure;
+- centralized serving policy;
+- execution transport/orchestration;
+- logical multi-rank topology;
+- physical KV ownership;
+- model execution.
+
+That separation is required before compilation can be added cleanly. Compile/capture state belongs close to Worker/ModelRunner tensor execution. It must not leak upward into Scheduler, cancellation, streaming, or request-priority policy.
+
+## 4. Required abstractions
+
+The first implementation should introduce inspectable concepts similar to:
+
+```text
+ExecutionShapeSignature
+CompileConfig
+CompileStats
+CompiledKernelCache / CompileRegistry
+CompileAwareTinyRunner
+PureTensorStepKernel
+```
+
+Exact names may evolve, but the responsibilities must remain separated.
+
+## 5. Pure tensor boundary
+
+Current TinyDecoder execution mixes two different kinds of work:
+
+```text
+Python/control/storage work
+  - request IDs
+  - KV block tables
+  - cache read/write
+  - allocation/lifecycle
+
+Tensor math
+  - projections
+  - attention score/value math
+  - normalization
+  - MLP
+  - final hidden/logit projection
+```
+
+v0.11 should make this boundary explicit enough that compilation only sees tensor inputs/outputs.
+
+Preferred shape:
+
+```text
+ModelRunner
+  │
+  ├── read logical prefix / prepare tensor inputs      eager
   │
   ▼
-DistributedExecutor / WorkerGroup ← unchanged v0.9 topology
+PureTensorStepKernel(tensors only)                     compile-aware
+  │
+  ├── hidden/logits
+  └── newly computed K/V tensors
   │
   ▼
-EngineStepOutput
-  │ committed logical changes only
-  ▼
-AsyncEngine
-  ├─ TokenEvent
-  ├─ FinishedEvent
-  ├─ CancelledEvent
-  └─ ErrorEvent
+ModelRunner writes new K/V through KV backend          eager
 ```
 
-The async layer is a lifecycle/delivery boundary, not a second Scheduler.
+Do not put mutable cache dictionaries, block tables, Scheduler objects, Request objects, or asyncio queues inside the compiled function.
 
-## 3. Added abstractions
+## 6. Shape signature
 
-### `AsyncEngine`
+Compilation reuse must be explicit rather than hidden behind framework internals.
 
-Owns caller-facing handles, pending submissions, cancellation intent, one cooperative asyncio driver, and bounded event delivery. It delegates all serving policy to one synchronous EngineCore.
-
-### `AsyncRequestHandle`
-
-A per-request async iterator over a bounded `asyncio.Queue`. It exposes cancellation and enforces terminal-event finality.
-
-### Stream events
+A first educational signature may include values such as:
 
 ```text
-StreamEvent
-  ├─ TokenEvent(token_id, output_index)
-  ├─ FinishedEvent(output_token_ids, finish_reason)
-  ├─ CancelledEvent(output_token_ids)
-  └─ ErrorEvent(error_type, message)
+ExecutionShapeSignature(
+    chunk_tokens,
+    context_tokens,
+    dtype,
+    device,
+    model dimensions,
+    rank-local output width,
+)
 ```
 
-Only committed logical tokens become `TokenEvent`.
+Only fields that materially affect captured tensor shape/layout should be included.
 
-## 4. Submission
-
-`submit()` returns a handle immediately in the active event loop and puts the request into AsyncEngine's pending intent registry. The driver later calls `EngineCore.add_request()` at a cooperative boundary.
-
-Request IDs are one-shot within an AsyncEngine instance. Duplicate submission fails deterministically before a second handle is accepted.
-
-## 5. Commit-before-stream
-
-AsyncEngine publishes token events exclusively from `EngineStepOutput.committed_token_ids`:
+The learner should be able to observe:
 
 ```text
-speculative proposal
-      ↓
-target verify
-      ↓
-logical commit
-      ↓
-committed_token_ids
-      ↓
-TokenEvent
+first signature
+    ↓
+compile miss
+    ↓
+compiled callable stored
+
+same signature later
+    ↓
+cache hit / reuse
+
+new shape
+    ↓
+new signature
+    ↓
+recapture / recompile
 ```
 
-Rejected speculative tokens never become stream events. Multi-token speculative commits are emitted in committed order with monotonically increasing output indices.
+## 7. Compile backend policy
 
-## 6. Cancellation semantics
+CI must remain CPU-friendly and deterministic.
 
-### Before EngineCore registration
+Preferred reference approach:
+
+- use `torch.compile` through a small adapter;
+- default tests may use a lightweight tracing backend such as `backend="eager"` to exercise Dynamo graph formation without depending on GPU/Inductor availability;
+- optional local experiments may use `inductor` when supported;
+- eager execution remains the correctness oracle;
+- unsupported backend/device combinations must fail clearly or use an explicitly documented eager fallback.
+
+Do not claim a speedup merely because a callable was compiled.
+
+## 8. Graph-break visibility
+
+v0.11 should teach graph breaks rather than hide them.
+
+Introduce at least one observable diagnostic path for:
 
 ```text
-pending submission
-   ↓ cancel intent
-remove pending request
-   ↓
-CancelledEvent
+compile attempts
+compiled signatures
+cache hits
+cache misses
+fallbacks
+recompilations / recaptures
 ```
 
-No KV allocation or Scheduler registration occurs.
+If useful, include a deliberately unsupported or dynamic operation in a focused example/test to demonstrate why it cannot stay inside the pure tensor boundary. The production path should avoid that operation rather than swallowing the break silently.
 
-### After EngineCore registration
+## 9. Eager fallback
 
-EngineCore now exposes explicit cancellation/abort lifecycle primitives. At the next cooperative boundary:
+Compilation is an optimization mode, not a correctness dependency.
+
+Required rule:
 
 ```text
-Scheduler.cancel_request(request)
+compile unavailable / unsupported signature / compile failure
         ↓
-Executor.free(request_id)
+explicit policy decision
         ↓
-Request.mark_finished("cancelled")
+eager reference kernel
         ↓
-CancelledEvent
+same logical result
 ```
 
-The operation is idempotent from the async facade's perspective: once a handle is terminal, later cancellation returns false and cannot emit another terminal event.
+A fallback must not:
 
-### In-flight step
+- change token history;
+- skip KV writes;
+- duplicate KV writes;
+- weaken distributed rollback;
+- bypass speculative transaction semantics;
+- alter async terminal/cancellation behavior.
 
-v0.10 does not interrupt a model forward mid-execution. If cancellation becomes runnable while one EngineCore step is already executing, that atomic step may complete and its committed token events may be delivered; cancellation is applied before the next scheduling step.
+## 10. Distributed ownership
 
-## 7. Terminal-event invariant
-
-Each accepted request has exactly one terminal event:
+v0.9/v0.10 use logical ranks with rank-local model runners and replicated KV. Compile state should therefore be rank-local execution state:
 
 ```text
-FinishedEvent
-or CancelledEvent
-or ErrorEvent
+WorkerGroup
+  ├── rank 0 Worker
+  │      └── compile registry for rank-0 tensor kernel
+  ├── rank 1 Worker
+  │      └── compile registry for rank-1 tensor kernel
+  └── ...
 ```
 
-After terminal publication, AsyncRequestHandle rejects further event emission. Its async iterator ends when the terminal event is consumed.
+The collective remains outside the rank-local compiled tensor kernel unless a later version explicitly proves a stable distributed capture boundary.
 
-## 8. Bounded backpressure
+WorkerGroup still owns topology; EngineCore still knows nothing about graph signatures.
 
-Every handle owns a bounded queue. The first educational policy is intentionally conservative:
+## 11. Speculative execution
+
+Speculative target verification must use the same eager/compiled correctness boundary.
+
+For deterministic input:
 
 ```text
-publish committed event
-      ↓
-queue full?
-  ├─ no  → continue
-  └─ yes → await queue capacity
-              ↓
-           driver pauses
-              ↓
-      no new EngineCore step yet
+eager target verification logits trace
+              ==
+compile-aware target verification logits trace
 ```
 
-A slow consumer therefore delays global cooperative progress, but committed tokens are never silently dropped or reordered. Backpressure remains above WorkerGroup and collective execution.
+Rejected draft rollback remains a cache transaction outside the compiled kernel. Compilation must not retain hidden rejected state.
 
-## 9. Driver lifecycle
+## 12. Async compatibility
 
-One cooperative driver performs:
+v0.10 AsyncEngine should require no scheduling/lifecycle redesign.
+
+From the caller perspective:
 
 ```text
-drain queued cancellation
-   ↓
-admit pending submissions
-   ↓
-cancel registered requests
-   ↓
-run one EngineCore.step()
-   ↓
-publish committed events
-   ↓
-yield to asyncio event loop
+v0.10 eager collected token stream
+              ==
+v0.11 compile-aware collected token stream
 ```
 
-When no pending intents and no unfinished core requests remain, the task exits instead of busy-spinning. A future submission starts another driver task.
+Cancellation is still applied at EngineCore step boundaries. Bounded output queues still live above EngineCore. Backpressure must not be encoded into compile signatures.
 
-## 10. Failure semantics
+## 13. Static vs dynamic shapes
 
-The reference policy is deliberately conservative. An uncaught EngineCore/Executor step failure becomes a core-wide async failure:
+The first version should prefer visible static signatures and deliberate recapture over aggressive dynamic-shape magic.
 
-- no fabricated token is emitted;
-- all nonterminal handles receive one `ErrorEvent`;
-- AsyncEngine attempts to abort registered requests and free their active KV before terminal publication;
-- the original execution exception remains the caller-facing error cause.
-
-More selective distributed recovery is outside v0.10 scope.
-
-## 11. Critical invariants
-
-- **Single-policy:** AsyncEngine does not own a shadow serving Scheduler.
-- **Commit-before-stream:** only committed output history is streamable.
-- **Event order:** token events match `Request.output_token_ids` order.
-- **Terminal:** exactly one terminal event; nothing afterward.
-- **Cancellation release:** a cancelled registered request stops scheduling and releases active KV once.
-- **Async equivalence:** collected deterministic v0.10 tokens equal the v0.9 synchronous reference.
-- **Backpressure:** bounded queues may delay progress but cannot silently drop/reorder committed events.
-- **Distributed preservation:** v0.9 WorkerGroup/tensor-parallel semantics remain unchanged beneath the facade.
-
-## 12. Important source files
+This teaches the serving tradeoff:
 
 ```text
-mini_vllm/async_runtime/events.py
-mini_vllm/async_runtime/handle.py
-mini_vllm/async_runtime/engine.py
-mini_vllm/core/engine.py
-mini_vllm/scheduler/base.py
-mini_vllm/versions/v0_10/engine.py
-tests/test_async_runtime.py
-tests/test_v010_version.py
-examples/11_async_streaming.py
+more shape specialization
+    → potentially better optimized kernels
+    → more compile/capture variants
+    → more warmup/recapture cost
+
+more dynamic behavior
+    → fewer variants
+    → potentially weaker optimization / more graph complexity
 ```
 
-Recommended comparison:
+Do not introduce elaborate production bucketing before basic signature behavior is measured and tested.
 
-```bash
-git diff v0.9..v0.10 -- mini_vllm tests examples version.md
+## 14. Metrics / trace requirements
+
+Expose enough data to print a trace such as:
+
+```text
+step | rank | signature | mode     | cache
+-----+------+-----------+----------+------
+0    | 0    | p4-c0     | compile  | miss
+0    | 1    | p4-c0     | compile  | miss
+1    | 0    | d1-c4     | compile  | miss
+1    | 1    | d1-c4     | compile  | miss
+2    | 0    | d1-c4     | compiled | hit
+2    | 1    | d1-c4     | compiled | hit
 ```
 
-## 13. Validation contract
+Naming can differ, but compilation reuse must be inspectable.
 
-The exact commit promoted to `main` must pass GitHub Actions `./scripts/check.sh`. Coverage includes:
+## 15. Preferred implementation order
 
-- async-collected output vs deterministic v0.9 synchronous output;
-- committed token ordering and exactly one terminal event;
-- duplicate request rejection;
-- cancellation before registration with no KV allocation;
-- active cancellation with Scheduler removal and KV release;
-- bounded-queue backpressure without token loss/reordering;
-- core/executor failure to explicit `ErrorEvent` with resource cleanup;
-- v0.10 composition over the v0.9 DistributedExecutor/WorkerGroup;
-- all historical v0.1-v0.9 regression tests;
-- executable examples through `examples/11_async_streaming.py`.
+```text
+1. extract/define pure tensor execution kernel boundary
+2. prove eager kernel matches current TinyDecoder path
+3. define ExecutionShapeSignature
+4. add CompileConfig + stats/registry
+5. add compile adapter with eager backend for CI
+6. integrate CompileAwareTinyRunner rank-locally
+7. prove same-signature reuse
+8. prove shape change causes explicit new variant
+9. add compile-failure/eager-fallback path
+10. validate speculative logits-trace equivalence
+11. validate distributed world-size 1/2 equivalence
+12. validate v0.10 async stream equivalence/cancellation
+13. add executable graph-signature trace
+14. run exact-candidate CI before main synchronization
+```
 
-## 14. Intentional simplifications
+## 16. Acceptance criteria
 
-- one asyncio event loop;
-- one cooperative driver task;
-- synchronous model/core step execution inside that task;
-- global driver stall when any event queue applies backpressure;
-- no FastAPI/SSE/WebSocket server;
-- no threads/processes for frontend driving;
-- no mid-forward interruption;
-- no production distributed recovery;
-- no per-request independent delivery task optimization.
+v0.11 cannot freeze until all applicable items are true:
 
-## 15. Learning goals
+- [ ] compile/capture boundary accepts tensor data only and excludes Request/Scheduler/async objects;
+- [ ] eager extracted kernel reproduces the pre-v0.11 reference numerically;
+- [ ] `ExecutionShapeSignature` is explicit and deterministic;
+- [ ] first unseen signature records a compile/cache miss;
+- [ ] repeated compatible signature reuses the same compiled callable;
+- [ ] materially different tensor shape produces a new signature/variant;
+- [ ] compilation statistics are observable in tests/example traces;
+- [ ] compile failure or unsupported mode has deterministic explicit fallback/error behavior;
+- [ ] eager fallback preserves KV and logical commit semantics;
+- [ ] v0.11 deterministic greedy output matches v0.10 eager output;
+- [ ] speculative verification eager vs compile-aware logits/token history match;
+- [ ] world-size 1/2 distributed semantics remain equivalent to the target reference;
+- [ ] cancellation/streaming/backpressure regressions still pass;
+- [ ] no compile-specific policy appears in EngineCore/Scheduler/AsyncEngine;
+- [ ] all v0.1-v0.10 regression tests continue to pass;
+- [ ] an executable example shows miss → compile → hit → recapture/fallback behavior;
+- [ ] exact release-candidate GitHub Actions `./scripts/check.sh` passes before synchronization to `main`.
 
-After v0.10, a learner should be able to explain sync EngineCore vs async facade, commit-before-stream, queued vs registered cancellation, terminal exactly-once semantics, where backpressure belongs, why async does not require a second Scheduler, and why v0.9 distributed execution can remain unchanged below the delivery layer.
+## 17. Explicit non-goals
 
-## 16. Next version
+- production CUDA Graph capture/replay;
+- claiming GPU speedups from CPU CI;
+- aggressive dynamic-shape optimization;
+- automatic production bucketing heuristics;
+- compiling Scheduler, EngineCore, AsyncEngine, or Python KV ownership logic;
+- moving collectives into captured graphs;
+- real multi-GPU/NCCL graph capture;
+- custom Triton/CUDA PagedAttention — v0.12;
+- prefix-aware scheduling policy — v0.13.
 
-`v0.11` studies graph/compile-aware execution: eager correctness oracles, static metadata, graph breaks, capture/recapture boundaries, and host-overhead reduction without moving serving or async lifecycle policy into graph-specific code.
+## 18. Learning goals
+
+After v0.11, a learner should be able to explain:
+
+- eager control plane vs compilable tensor plane;
+- why Python KV ownership is a poor graph boundary;
+- what a shape signature represents;
+- compile cache hit vs recompilation/recapture;
+- what graph breaks are and why they occur;
+- why eager fallback is necessary for correctness-first serving;
+- why compilation state belongs near rank-local model execution;
+- why `torch.compile` and CUDA Graph are related optimization ideas but not the same mechanism;
+- why a compiled serving runtime still needs the exact same Scheduler, transactions, cancellation, and streaming semantics.
+
+## 19. Next version
+
+`v0.12` introduces an **optimized PagedAttention path**: preserve the readable Python/cache reference, add a vectorized PyTorch oracle first, then optionally an educational Triton/CUDA kernel with numerical equivalence and fallback checks.
