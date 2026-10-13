@@ -1,6 +1,6 @@
-# mini-vLLM v1.0 invariant contract
+# mini-vLLM v1.1 invariant contract
 
-v1.0 integrates the mechanisms introduced from v0.1 through v0.13. These invariants are the stable correctness contract across the complete runtime.
+v1.1 preserves the v1.0 serving semantics while turning the Executor/Worker boundary into a real operating-system process boundary. These invariants are the stable correctness contract across the complete runtime.
 
 ## Logical token state
 
@@ -22,45 +22,62 @@ physical      = block_table[logical_block]
 6. Attention reads only logical positions `[0, length)`; unused physical tail slots are never visible.
 7. Shared prefix blocks are immutable while referenced.
 8. Finished or cancelled requests release active ownership exactly once.
+9. In v1.1 the child process owns its physical KV/cache structures; the parent may not use block tables/refcounts/cache objects as remote ownership handles.
 
 ## Prefix reuse and scheduling
 
-9. `PrefixReuseHint` is advisory. It is not a reservation, block-table entry, refcount, or computed-token claim.
-10. Side-effect-free prefix estimation cannot create request ownership or change LRU/refcount state.
-11. Only authoritative `prepare_request()` establishes the actual reusable computed frontier.
-12. Stale hints may reduce scheduling quality but cannot change serving correctness.
-13. Warm-prefix preference has deterministic tie-breaking and explicit starvation protection.
+10. `PrefixReuseHint` is advisory. It is not a reservation, block-table entry, refcount, or computed-token claim.
+11. Side-effect-free prefix estimation cannot create request ownership or change LRU/refcount state.
+12. Only authoritative `prepare_request()` establishes the actual reusable computed frontier.
+13. Stale hints may reduce scheduling quality but cannot change serving correctness.
+14. Warm-prefix preference has deterministic tie-breaking and explicit starvation protection.
 
 ## Preemption and transactions
 
-14. A preempted request cannot claim KV that was released.
-15. Recompute replays known prompt/output history without resampling historical tokens.
-16. Rejected speculative state disappears from both logical history and physical KV state.
-17. Speculative rollback never mutates a shared immutable prefix.
+15. A preempted request cannot claim KV that was released.
+16. Recompute replays known prompt/output history without resampling historical tokens.
+17. Rejected speculative state disappears from both logical history and physical KV state.
+18. Speculative rollback never mutates a shared immutable prefix.
+19. A transport-safe checkpoint handle identifies child-owned transaction state; it is not itself physical cache ownership.
 
 ## Execution and distribution
 
-18. EngineCore owns logical commit decisions; Executor/Worker performs physical execution only.
-19. Distributed ranks must agree on replicated cache capacity, checkpoints, and policy-visible prefix facts.
-20. A rank failure cannot leave another rank's speculative or ordinary execution partially committed.
-21. Tensor-parallel gathered logits are equivalent to the readable unsharded reference for the supported educational model.
+20. EngineCore owns logical commit decisions; Executor/Worker performs physical execution only.
+21. Replicated ranks must agree on cache capacity, checkpoints, and policy-visible prefix facts.
+22. A rank failure cannot leave another reachable rank's speculative or ordinary execution knowingly committed while EngineCore rejects the step.
+23. Tensor-parallel gathered logits are equivalent to the readable unsharded reference for the supported educational model.
+24. Deterministic world-size 1 and 2 v1.1 output is equivalent to v1.0 under equivalent configuration.
+
+## Multiprocessing transport
+
+25. IPC messages contain serializable logical values/copies, not live parent references to child Workers, caches, model runners, block tables, refcounts or tensor storage.
+26. Every command/result exchange has a correlation ID. A response with the wrong ID is not eligible for logical commit.
+27. Sending a command is not evidence that physical execution succeeded. Logical commit requires an acknowledged successful response.
+28. Child-reported execution/model errors and transport/process-death failures are distinct failure classes.
+29. A child-reported error may preserve worker health only when the process remains reachable and required rollback succeeds.
+30. Unexpected EOF, timeout, process exit, or unprovable physical consistency makes the relevant executor unhealthy; EngineCore may not guess and commit.
+31. After failed ordinary execution, rollback is attempted on every reachable checkpointed rank/request before the failure is surfaced.
+32. Parent-side checkpoint handles do not expose child physical block identity.
+33. Normal shutdown sends an explicit shutdown intent and joins child processes. No child worker may remain alive after successful `close()`/`aclose()`.
+34. Termination is a cleanup fallback, not the normal request-cancellation mechanism.
 
 ## Optimization correctness
 
-22. Vectorized PagedAttention is numerically equivalent to the readable reference attention path.
-23. Compile-aware LM-head projection is numerically equivalent to eager projection.
-24. Optimization fallback may change execution mode, never serving semantics.
-25. No speedup claim is valid without measurement; correctness does not imply performance.
+35. Vectorized PagedAttention is numerically equivalent to the readable reference attention path.
+36. Compile-aware LM-head projection is numerically equivalent to eager projection.
+37. Optimization fallback may change execution mode, never serving semantics.
+38. No speedup claim is valid without measurement; multiprocessing isolation is not itself a performance claim.
 
 ## Async delivery
 
-26. Async clients observe committed tokens only.
-27. Each request exposes exactly one terminal outcome: finished, cancelled, or error.
-28. Backpressure can delay delivery but cannot cause hidden logical commits or duplicate tokens.
-29. Cancellation is applied between atomic EngineCore steps.
+39. Async clients observe committed tokens only.
+40. Each request exposes exactly one terminal outcome: finished, cancelled, or error.
+41. Backpressure can delay delivery but cannot cause hidden logical commits or duplicate tokens.
+42. Cancellation is applied between atomic EngineCore steps; it does not arbitrarily kill a healthy child worker.
 
 ## Observability
 
-30. `snapshot()` is read-only: observing the runtime cannot schedule work, attach KV, mutate cache recency, or advance request state.
-31. Public snapshots report mechanism facts and decisions without exposing physical ownership handles as policy inputs.
-32. The same deterministic configuration must produce the same committed output in v1.0 as validated v0.13.
+43. `snapshot()` is read-only: observing the runtime cannot schedule work, attach KV, mutate cache recency, advance request state, or change serving-command counters.
+44. Public snapshots report mechanism/transport facts without exposing physical ownership handles as policy inputs.
+45. Snapshot transport reads such as execution observations and cache statistics are non-serving reads and must not make two otherwise identical snapshots differ.
+46. The same deterministic v1.0 configuration remains the semantic oracle for v1.1 committed output.

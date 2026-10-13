@@ -18,105 +18,152 @@ v0.10 async streaming/cancellation/backpressure
 v0.11 compile-aware execution
 v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
-v1.0  integrated educational runtime                  ← current implementation
+v1.0  integrated educational runtime                  frozen
+v1.1  real multiprocessing executor transport         current
 ```
 
-## v1.0 lesson
+## v1.1 learning target
 
-The final lesson is composition: a serving mechanism is only useful when its ownership boundary remains legible next to all the other mechanisms.
+v1.0 proved that all serving mechanisms can coexist behind clean logical ownership boundaries. v1.1 asks the next systems question: what changes when the Executor/Worker boundary becomes a real OS isolation boundary?
 
 ```text
-caller
-  ↓
-AsyncEngine                       delivery / cancellation / backpressure
-  ↓
-EngineCore                        logical truth and commit authority
-  ↓
-Scheduler                         admission / budget / fairness / victim policy
-  ↓
-Executor / WorkerGroup            topology / rank consistency / rollback
-  ↓
-Worker / ModelRunner              rank-local model execution
-  ↓
-KV + PagedAttention               storage ownership + logical reads
-  ↓
-Compile-aware projection          rank-local tensor specialization
-  ↓
-Speculative verification          transactional candidate acceptance
-  ↓
-committed output stream
+parent process
+EngineCore / Scheduler
+        ↓
+MultiprocessExecutor
+        ↓ explicit serializable IPC
+child process per logical rank
+Worker + ModelRunner + KV
+        ↓ acknowledged result / structured error
+parent gather / logical commit
 ```
 
-v1.0 intentionally avoids a new major scheduling, cache, distributed, or kernel mechanism. It adds a stable construction facade and a public read-only snapshot so the complete runtime can be reasoned about without reaching into private implementation state.
+This version is about transport, ownership, lifecycle and failure isolation. It is not a throughput claim and it does not introduce a new scheduling, KV, speculative or attention algorithm.
 
-## Stable public surfaces
+## New mechanism
 
-### Construction
+### 1. Explicit transport protocol
 
-`RuntimeConfig` composes:
+Transport uses a fixed command/result vocabulary and monotonically increasing correlation IDs. Commands move only logical serializable values: request IDs, token IDs, positions, transport-safe checkpoint handles, copied tensor payloads and observations.
 
-- `EngineConfig`;
-- `TinyModelConfig`;
-- `CacheConfig`;
-- `CompileConfig`;
-- `PagedAttentionConfig`;
-- logical `world_size`;
-- async `max_queue_size`;
-- prefix-fairness threshold.
+The parent must never treat a live child `Worker`, cache backend, block table, model runner or tensor storage as a local object.
 
-`create_engine()` defaults to v1.0. Explicit builders for v0.1–v0.13 remain available.
+### 2. Process-owned physical state
 
-### Observability
+Each child constructs its own:
 
-`engine.snapshot()` returns one immutable teaching view containing:
+```text
+RankConfig
+TinyDecoderLM
+TransactionalPrefixCachingPagedKVCache
+CompileAwareVocabParallelTinyRunner
+Worker
+```
 
-- request lifecycle and computed frontiers;
-- prefix-aware scheduler observations;
-- cache statistics;
-- recent EngineStepOutput traces, including preemption, speculation and committed tokens;
-- distributed/rank execution topology;
-- attention backend counters;
-- compile registry counters;
-- async pending/cancellation/driver state.
+The parent owns only `WorkerSpec`, IPC endpoints and logical runtime state.
 
-Observation must be side-effect free.
+### 3. Remote checkpoint/rollback
 
-## Cross-version correctness contract
+Ordinary execution crosses a transaction boundary too:
 
-The stable invariant list is maintained in `docs/INVARIANTS.md`. The most important rules are:
+```text
+checkpoint every participating request/rank
+        ↓
+execute remote model work
+        ↓
+all rank results acknowledged?
+  yes → gather → commit checkpoints → EngineCore may commit
+  no  → rollback reachable checkpoints → no logical commit
+```
 
-1. computed tokens imply valid addressable KV;
-2. sampled tokens are not computed until model execution catches up;
-3. physical ownership precedes K/V access;
-4. block-table translation is authoritative;
-5. prefix hints are advisory facts, never ownership;
-6. preemption rolls back to valid replayable state;
-7. rejected speculative state disappears;
-8. distributed failures cannot partially commit replicated state;
-9. async clients see committed tokens only and one terminal result;
-10. optimized attention equals the readable reference;
-11. compile-aware projection equals eager projection;
-12. warm-prefix policy cannot starve cold work;
-13. observability cannot mutate runtime state.
+Speculative decoding reuses the existing v0.7 logical contract; the difference is that the real cache checkpoint stays in the child and the parent carries only a `CheckpointHandle`.
 
-## v1.0 integrated validation
+### 4. Worker lifecycle and health
 
-`examples/15_integrated_runtime.py` exercises a warm prefix, prefix-aware admission, token-budgeted work, speculative verification, distributed execution, vectorized PagedAttention, compile-aware projection and async streaming, then explains the run using only the public snapshot.
+A remote worker moves through explicit lifecycle states around startup/readiness, normal operation, death and shutdown. Parent-side transport distinguishes:
 
-The v1.0 test suite additionally proves:
+- child-reported runtime/model errors;
+- correlation/protocol failures;
+- command timeout;
+- unexpected EOF/process death;
+- clean shutdown.
 
-- default construction selects v1.0;
-- deterministic v1.0 output equals validated v0.13;
-- `RuntimeConfig` composes the public runtime;
-- snapshots are repeatable and side-effect free;
-- scheduler/cache/execution/speculation/committed-output observations are publicly reachable;
-- real warm-prefix cost is visible in admission traces;
-- historical builders remain available.
+A child-reported error can leave the worker healthy after successful rollback. Unknown physical state cannot: the executor becomes unhealthy and refuses further logical progress.
+
+### 5. Explicit cleanup
+
+v1.1 introduces engine cleanup because child processes are owned resources:
+
+```python
+engine.close()
+await engine.aclose()
+```
+
+Normal close sends `shutdown`, joins children, and uses terminate only as cleanup fallback. Tests prove worker processes are not left alive.
+
+## Public construction
+
+`create_engine()` defaults to v1.1. `RuntimeConfig` retains all v1.0 fields and adds `MultiprocessConfig`:
+
+```text
+start_method
+command_timeout_s
+shutdown_timeout_s
+```
+
+Explicit `create_engine("v1.0")` remains the in-process integration reference. Historical v0.x builders remain frozen.
+
+## Public observability
+
+`engine.snapshot()` remains the single teaching surface. v1.1 extends execution observations with:
+
+- parent/child boundary type;
+- child PID;
+- worker lifecycle state;
+- serving commands sent/completed;
+- remote-error count;
+- transport-failure count.
+
+Pure snapshot/cache-stat reads do not increment serving-command counters. Therefore repeated snapshots with no intervening serving action remain equal.
+
+## Cross-process correctness contract
+
+In addition to the v1.0 invariants in `docs/INVARIANTS.md`, v1.1 requires:
+
+1. logical commit requires an acknowledged successful physical result;
+2. correlation IDs must match before a result is accepted;
+3. IPC carries copies/logical handles, never live physical ownership objects;
+4. child-reported errors are distinct from process/transport failures;
+5. remote checkpoint identity remains child-owned;
+6. rollback must be attempted on every reachable participating rank after failed execution;
+7. if complete physical consistency cannot be proven, the executor is unhealthy;
+8. unexpected worker death is surfaced explicitly as `WorkerProcessDied`;
+9. shutdown joins every child process;
+10. deterministic world-size 1 and 2 output equals v1.0 under equivalent configuration.
+
+## Validation
+
+`tests/test_multiprocess_runtime.py` proves:
+
+- protocol dataclasses are pickle-serializable;
+- workers have real child PIDs distinct from the parent;
+- default v1.1 construction uses the process boundary;
+- snapshot remains read-only;
+- world-size 1 and 2 outputs match v1.0;
+- speculative execution crosses IPC;
+- prefix reuse/cache lifecycle crosses IPC;
+- child-reported errors remain structured and do not kill healthy workers;
+- unexpected child death is explicitly detected;
+- close joins/reaps child processes.
+
+`examples/16_multiprocess_transport.py` shows parent PID → command transport → child worker PIDs → committed output → public transport observations → clean shutdown.
+
+The first implementation candidate passed 91 pytest tests plus examples 01–16. The final exact release SHA must independently pass the same gate.
 
 ## Release rule
 
-Only the exact v1.0 implementation commit that passes repository CI may be synchronized to `main`.
+Only the exact v1.1 implementation commit with green repository CI may advance `main`. Before release, branch history is reduced to the planning commit plus one implementation commit so the learning diff remains inspectable.
 
-## After v1.0
+## After v1.1
 
-Further versions require a genuinely new learning target—for example real GPU kernels, actual multiprocessing/distributed transport, or production-style model loading. Incremental accumulation alone is not sufficient reason for a new version.
+The next version must again have a genuinely new learning target. Production-style model/tokenizer loading is a strong candidate because it introduces another ownership boundary—external model artifacts → validated runtime weights—without conflating transport work with GPU-kernel optimization.

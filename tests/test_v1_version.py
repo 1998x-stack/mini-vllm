@@ -61,8 +61,8 @@ async def collect(version: str):
     return engine, tokens
 
 
-def test_default_builder_is_integrated_v1_runtime() -> None:
-    engine = create_engine()
+def test_v10_builder_remains_integrated_in_process_runtime() -> None:
+    engine = create_engine("v1.0")
     assert isinstance(engine, IntegratedAsyncEngine)
     assert engine.version == "v1.0"
     assert engine.core.version == "v1.0"
@@ -89,14 +89,14 @@ def test_runtime_config_facade_constructs_integrated_runtime() -> None:
         max_queue_size=3,
         fairness_bypass_limit=3,
     )
-    engine = create_engine(runtime_config=config)
+    engine = create_engine("v1.0", runtime_config=config)
     assert engine.max_queue_size == 3
     snapshot = engine.snapshot()
     assert snapshot.core.execution.world_size == 1
     assert snapshot.core.scheduler.name == "PrefixAwareBudgetedScheduler"
 
     with pytest.raises(ValueError, match="runtime_config cannot be combined"):
-        create_engine(runtime_config=config, world_size=2)
+        create_engine("v1.0", runtime_config=config, world_size=2)
 
 
 def test_snapshot_is_side_effect_free_and_exposes_execution_paths() -> None:
@@ -177,3 +177,4 @@ def test_historical_builders_remain_available() -> None:
     assert create_engine("v0.1").version == "v0.1"
     assert create_engine("v0.6").version == "v0.6"
     assert create_engine("v0.13").version == "v0.13"
+    assert create_engine("v1.0").version == "v1.0"

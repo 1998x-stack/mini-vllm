@@ -8,11 +8,29 @@ from mini_vllm.config import CacheConfig, EngineConfig, TinyModelConfig
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeConfig:
-    """Stable v1.0 construction facade for the integrated educational runtime.
+class MultiprocessConfig:
+    """Public transport knobs for the educational OS-process boundary."""
 
-    Internal storage structures stay hidden.  The facade exposes only the
-    serving knobs a learner should reason about when constructing the runtime.
+    start_method: str = "spawn"
+    command_timeout_s: float = 30.0
+    shutdown_timeout_s: float = 2.0
+
+    def __post_init__(self) -> None:
+        if not self.start_method:
+            raise ValueError("start_method must be non-empty")
+        if self.command_timeout_s <= 0:
+            raise ValueError("command_timeout_s must be > 0")
+        if self.shutdown_timeout_s <= 0:
+            raise ValueError("shutdown_timeout_s must be > 0")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    """Stable v1 construction facade for the integrated educational runtime.
+
+    Internal storage structures stay hidden. The facade exposes only the
+    serving and transport knobs a learner should reason about when constructing
+    the runtime.
     """
 
     engine: EngineConfig = field(default_factory=EngineConfig)
@@ -20,6 +38,7 @@ class RuntimeConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     attention: PagedAttentionConfig = field(default_factory=PagedAttentionConfig)
+    multiprocess: MultiprocessConfig = field(default_factory=MultiprocessConfig)
     world_size: int = 2
     max_queue_size: int = 8
     fairness_bypass_limit: int = 2

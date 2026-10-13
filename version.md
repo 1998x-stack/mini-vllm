@@ -1,263 +1,366 @@
-# mini-vLLM v1.1 — real multiprocessing executor transport (planning branch)
+# mini-vLLM v1.1 — real multiprocessing executor transport
 
 ## Version identity
 
 - Branch: `v1.1`
-- Base: validated `v1.0` / `main`
-- Previous: `v1.0`
-- Theme: turn the existing logical Executor/Worker boundary into an actual process boundary with explicit IPC, lifecycle, health and failure semantics
-- Status: planning; runtime remains exactly v1.0 until v1.1 acceptance criteria pass
+- Previous: validated `v1.0`
+- Theme: make the existing Executor/Worker abstraction a real operating-system process boundary with explicit IPC, lifecycle, health and failure semantics
+- Package version: `1.1.0`
+- Status: implementation complete; freeze requires the exact final release commit to pass repository CI
 
-## Why this version exists
+## Why v1.1
 
-v0.8 introduced `EngineCore → Executor → Worker` as an architectural boundary, and v0.9 added logical multi-rank execution. In v1.0 those boundaries are clean but still live inside one Python process.
+v0.8 introduced the architectural `EngineCore → Executor → Worker` boundary. v0.9 added logical ranks. v1.0 integrated those mechanisms coherently, but every Worker/model/cache still lived in the same Python process.
 
-v1.1 has a genuinely new learning target:
+v1.1 adds a genuinely new systems lesson:
 
-> What changes when execution crosses a real operating-system process boundary?
+> An abstraction boundary becomes materially different when it crosses an OS process boundary.
 
-This is not a throughput optimization project. It is a transport, ownership, serialization and failure-isolation lesson.
+Serialization becomes explicit, physical ownership becomes remote, command completion must be acknowledged, process lifecycle must be managed, and failures become transport events rather than ordinary in-process exceptions.
 
 ## Primary mental model
 
 ```text
-AsyncEngine / EngineCore
-        │
-        │ logical ExecutionRequest
-        ▼
-MultiprocessExecutor
-        │
-        │ serialized IPC command
-        ▼
-worker process
-        │
-        ├─ ModelRunner
-        ├─ KV cache
-        └─ rank-local execution state
-        │
-        │ serialized result / error
-        ▼
-MultiprocessExecutor
-        │
-        ▼
-EngineCore logical commit
-```
+PARENT PROCESS
 
-For multiple logical ranks:
-
-```text
-EngineCore
+AsyncEngine
    ↓
-MultiprocessExecutor
-   ├─ worker process rank 0
-   ├─ worker process rank 1
-   └─ ...
-        ↓
-transport-level result coordination
-        ↓
-collective / gathered logits
-        ↓
-logical commit
+EngineCore                         logical request truth
+   ↓
+Scheduler                          policy
+   ↓
+MultiprocessExecutor               IPC / health / coordination
+   ├──────── command ────────┐
+   ▼                          ▼
+CHILD rank 0             CHILD rank 1 ...
+Worker                   Worker
+├─ ModelRunner           ├─ ModelRunner
+└─ KV cache              └─ KV cache
+   │                          │
+   └──── result / error ──────┘
+               ↓
+        parent-side gather
+               ↓
+       EngineCore commit
 ```
 
-## Core design rule
-
-The process boundary must strengthen—not blur—the v1.0 ownership contract.
+Core ownership equation:
 
 ```text
-EngineCore owns logical request truth
-Worker process owns physical model/KV execution state
-IPC carries explicit messages
+parent owns logical truth
+child owns physical model/KV truth
+IPC acknowledgment is the evidence connecting them
 ```
 
-The parent process must not rely on direct Python object access to child `Worker`, cache tensors, block tables or model runner internals.
+## Implementation
 
-## Planned abstractions
+### Explicit protocol
 
-Names may change during implementation, but the concepts should remain explicit.
+New `mini_vllm/multiprocess/protocol.py` defines transport-safe dataclasses:
 
-### `MultiprocessExecutor`
+- `WorkerSpec`;
+- `TransportCommand` / `TransportResponse`;
+- `TensorPayload`;
+- `CheckpointHandle` / `MultiprocessCacheCheckpoint`;
+- serialized normal/speculative execution results;
+- worker readiness and execution observations.
 
-An `Executor` implementation that sends execution/cache lifecycle commands across IPC rather than invoking a local Worker directly.
+Every serving command receives a monotonically increasing correlation ID. A response is accepted only when the ID matches the outstanding command.
 
-Responsibilities:
+The protocol carries logical values and copies. It never transports live Scheduler objects, Worker references, cache objects, block-table ownership or live tensor storage.
 
-- worker startup and readiness handshake;
-- request/result correlation;
-- serialization boundary;
-- timeout/EOF/process-death detection;
-- orderly shutdown;
-- converting child failures into explicit parent-side execution failures.
+### Child-owned Worker construction
 
-### Transport protocol
-
-Prefer a small explicit message vocabulary over arbitrary remote method invocation.
-
-Candidate commands:
+`MultiprocessExecutor` starts one `multiprocessing.Process` per logical rank. The child receives only `WorkerSpec` and constructs locally:
 
 ```text
-PREPARE_REQUEST
-ESTIMATE_PREFIX_REUSE
-ENSURE_CAPACITY
-EXECUTE
-EXECUTE_SPECULATIVE
-COMMIT_WORK
-CHECKPOINT
-ROLLBACK
-COMMIT_CHECKPOINT
-FREE
-CACHE_STATS
-SNAPSHOT_EXECUTION
-SHUTDOWN
+RankConfig
+TinyDecoderLM
+TransactionalPrefixCachingPagedKVCache
+CompileAwareVocabParallelTinyRunner
+Worker
 ```
 
-Each request should carry a monotonically increasing correlation ID so a response can be matched deterministically.
+Therefore the parent never constructs or directly invokes the child-owned Worker/model/cache used for v1.1 serving.
 
-### Worker process lifecycle
+### Tensor transport
+
+Rank-local logits are converted into a simple explicit CPU wire representation:
 
 ```text
-CREATED
-  ↓
+TensorPayload
+├─ shape
+├─ dtype
+└─ flat copied values
+```
+
+The parent reconstructs fresh tensors, then uses the existing readable `ReferenceCollective` to gather vocabulary shards. v1.1 intentionally avoids shared-memory/CUDA-IPC optimization so transport ownership remains obvious.
+
+### Ordinary execution transaction
+
+Normal execution is protected across IPC, not merely speculative execution.
+
+```text
+for every scheduled request:
+    checkpoint every child rank
+        ↓
+all checkpoint handles acknowledged
+        ↓
+execute work on every rank
+        ↓
+validate all correlated successful results
+        ↓
+parent all-gather
+        ↓
+commit child checkpoints
+        ↓
+return ExecutionResult
+        ↓
+EngineCore may advance logical state
+```
+
+If any execution fails before logical commit, the executor attempts rollback on every reachable checkpointed rank/request. If rollback cannot be proven complete, the executor becomes unhealthy rather than allowing EngineCore to guess.
+
+### Child-private checkpoint registry
+
+Actual `CacheCheckpoint` objects remain inside the child. The parent receives only `CheckpointHandle(checkpoint_id, request_id, num_tokens)`.
+
+This keeps physical block-table identity private while still allowing rollback/commit commands to reference a transaction deterministically.
+
+### Speculative transport
+
+`EXECUTE_SPECULATIVE` crosses the same process boundary. The pre-existing v0.7/v1.0 speculative flow remains authoritative:
+
+```text
+checkpoint
+→ remote candidate execution
+→ target verification
+→ rollback to accepted frontier
+→ commit accepted/fallback logical tokens
+```
+
+No speculative token becomes caller-visible merely because a child executed it.
+
+### Prefix/cache lifecycle
+
+The following operations now cross IPC in v1.1:
+
+- side-effect-free prefix reuse estimation;
+- authoritative prefix attachment;
+- capacity reservation;
+- normal/speculative execution;
+- work publication;
+- checkpoint/rollback/commit;
+- request free;
+- cache statistics.
+
+The Scheduler still observes only logical reuse quantities, never physical child block IDs or refcounts.
+
+## Worker lifecycle
+
+Each rank client performs a readiness handshake before the runtime becomes usable.
+
+Conceptual lifecycle:
+
+```text
 STARTING
-  ↓
+   ↓ readiness acknowledged
 READY
-  ↓
-RUNNING
-  ├─ healthy commands
-  ├─ execution error -> ERROR response
-  └─ process death -> DEAD
-  ↓
-STOPPING
-  ↓
+   ├─ normal command → READY
+   ├─ structured child error → READY when state remains provable
+   ├─ timeout/protocol uncertainty → UNHEALTHY
+   └─ unexpected exit/EOF → DEAD
+   ↓ explicit shutdown
 STOPPED
 ```
 
-The parent must be able to distinguish a model/runtime error response from an unexpected process exit.
+`MultiprocessAsyncEngine` adds:
 
-## Serialization contract
-
-IPC messages must contain logical/serializable data, not live cache/model objects.
-
-Good transport payloads include:
-
-- request IDs;
-- token ID tuples;
-- start positions;
-- prompt lengths;
-- checkpoint metadata expressed as transport-safe values;
-- logits/results represented in an explicit tensor-transfer format;
-- cache statistics and observability counters.
-
-Avoid transporting:
-
-- Python bound methods;
-- live `Worker` references;
-- cache backend objects;
-- Scheduler objects;
-- block-table ownership handles as policy inputs.
-
-## Checkpoint / rollback across processes
-
-v1.0 already requires physical execution to remain atomic with respect to EngineCore logical commit. v1.1 must preserve that invariant when the cache lives in a child process.
-
-```text
-parent asks child to checkpoint
-        ↓
-child acknowledges checkpoint identity
-        ↓
-child executes
-        ↓
-result success
-   ├─ yes -> commit checkpoint / return result
-   └─ no  -> rollback before surfacing failure
+```python
+engine.close()
+await engine.aclose()
 ```
 
-A transport failure after mutation but before an acknowledged result is the difficult case. The educational reference implementation should choose a conservative rule: if physical state cannot be proven consistent, mark that worker/executor unhealthy and do not logically commit the step.
+`close()` requires an idle async driver. `aclose()` waits for idle, then sends shutdown and joins workers. Termination is used only as a final cleanup fallback.
 
-## Failure semantics
+## Failure taxonomy
 
-v1.1 should teach several distinct failures explicitly.
+### Structured child error
 
-### Child reports execution error
+An ordinary child exception is serialized as a failed `TransportResponse` and surfaced as `WorkerRemoteError`. The child can remain alive; successful repair/rollback may preserve executor health.
 
-The process remains alive but returns a structured error. Parent surfaces the error only after required rollback succeeds.
+### Unexpected process death
 
-### Child exits unexpectedly
+A dead child is surfaced explicitly as `WorkerProcessDied`. The parent never treats the absence of a response as success.
 
-The parent detects EOF/process death. No logical step may commit from an unacknowledged result.
+### Timeout / protocol uncertainty
 
-### Parent cancellation
+A timeout, EOF, invalid response or correlation mismatch means the parent cannot prove the physical result. Such uncertainty cannot authorize logical commit.
 
-Cancellation remains an EngineCore/AsyncEngine lifecycle concern. It should send explicit release/abort commands only at atomic step boundaries rather than killing a healthy worker process arbitrarily.
+### Rollback failure
 
-### Shutdown
+If failed ordinary execution may have mutated child state and complete rollback cannot be proven, the executor enters unhealthy state and rejects further logical progress.
 
-Normal shutdown must terminate and join every child process. Tests must prove there are no orphan workers after engine teardown.
+## Public construction
 
-## Distributed compatibility
+`create_engine()` now defaults to v1.1.
 
-v1.1 is about real process transport, not real multi-node/NCCL serving.
+`RuntimeConfig` adds:
 
-An educational implementation may run one process per logical rank on one machine while preserving the existing reference collective semantics in the parent or through a narrow coordination layer.
-
-Required invariant:
-
-```text
-world_size=1 and world_size=2
-produce the same deterministic committed output
-as v1.0 for equivalent configuration
+```python
+MultiprocessConfig(
+    start_method="spawn",
+    command_timeout_s=30.0,
+    shutdown_timeout_s=2.0,
+)
 ```
+
+Explicit `create_engine("v1.0")` remains the in-process semantic oracle, and v0.1–v0.13 builders remain available as frozen learning snapshots.
 
 ## Observability
 
-The v1.0 `snapshot()` contract should remain the public teaching surface.
+The stable v1.0 `engine.snapshot()` path remains the public teaching API.
 
-v1.1 may extend execution observations with transport facts such as:
+v1.1 extends `ExecutionSnapshot` / `RankExecutionSnapshot` with:
 
-- process ID;
-- worker lifecycle state;
-- commands sent/completed;
-- transport failures;
-- worker restarts, if restart is implemented;
-- parent/child boundary type.
+- boundary type (`multiprocess-ipc`);
+- child PID;
+- lifecycle state;
+- serving commands sent/completed;
+- structured remote-error count;
+- transport-failure count;
+- executor health.
 
-It must not expose child-process physical cache handles to Scheduler policy.
+Attention and compile observations are read from the real child-owned runner.
 
-## Preferred implementation order
+Pure observation commands (`CACHE_STATS`, `SNAPSHOT_EXECUTION`) do not increment serving-command counters. Therefore two snapshots with no intervening serving work compare equal.
 
-1. Define transport-safe command/result dataclasses.
-2. Add one child-process Worker with startup/shutdown handshake.
-3. Implement ordinary `execute()` through IPC.
-4. Move cache lifecycle calls behind the same process boundary.
-5. Add checkpoint/rollback semantics.
-6. Add speculative execution transport.
-7. Generalize to one process per logical rank.
-8. Add public transport observability.
-9. Prove deterministic equivalence and failure cleanup.
+## Stable invariants added in v1.1
 
-## Acceptance criteria
+The full contract lives in `docs/INVARIANTS.md`. New process-boundary rules include:
 
-- [ ] at least one real `multiprocessing.Process` owns a Worker/model/cache;
-- [ ] EngineCore/parent does not directly invoke methods on the child Worker object;
-- [ ] command/result protocol is explicit and serializable;
-- [ ] ordinary execution crosses IPC and returns correct logits;
-- [ ] prefix prepare/estimate/capacity/free operations cross the same boundary;
-- [ ] checkpoint/rollback and speculative execution remain correct across IPC;
-- [ ] child-reported execution failure cannot partially commit EngineCore logical state;
-- [ ] unexpected worker death is detected and surfaced explicitly;
-- [ ] normal shutdown joins child processes with no orphan worker left running;
-- [ ] world-size 1 and 2 deterministic output matches validated v1.0;
-- [ ] v1.0 public snapshot remains usable and gains transport-level observations without exposing physical ownership handles;
-- [ ] all v0.1–v1.0 regression tests continue to pass;
-- [ ] executable example demonstrates parent process → IPC → worker process → result flow;
-- [ ] exact release candidate passes repository CI before `main` advances.
+```text
+command sent != execution success
+```
+
+```text
+logical commit requires
+correlation-matched acknowledged remote success
+```
+
+```text
+CheckpointHandle != physical KV ownership
+```
+
+```text
+unknown child physical consistency
+    => executor unhealthy
+    => no logical commit
+```
+
+and:
+
+```text
+normal shutdown => every owned child joined/reaped
+```
+
+All v1.0 logical/KV/prefix/preemption/speculation/attention/compile/async invariants remain in force.
+
+## Tests
+
+New `tests/test_multiprocess_runtime.py` covers:
+
+1. transport protocol pickle serialization;
+2. actual child PID isolation from parent;
+3. default v1.1 builder and process boundary;
+4. repeated snapshot equality;
+5. world-size 1 output equivalence to v1.0;
+6. world-size 2 output equivalence to v1.0;
+7. speculative verification over IPC;
+8. prefix reuse/cache lifecycle over IPC;
+9. vectorized attention observations from child state;
+10. structured remote error while worker remains alive;
+11. explicit unexpected worker-death detection;
+12. shutdown/join with no live worker remaining.
+
+Historical v1.0 regression tests are explicitly version-pinned so changing the default builder does not rewrite the prior lesson.
+
+The first complete implementation candidate passed:
+
+```text
+91 pytest tests
+examples 01–16
+all checks passed
+```
+
+The exact final release SHA must independently pass the same repository CI gate before `main` advances.
+
+## Example
+
+`examples/16_multiprocess_transport.py` demonstrates:
+
+```text
+parent PID
+→ child rank PIDs
+→ request submit
+→ IPC model/cache execution
+→ committed token stream
+→ public transport/attention/compile observations
+→ aclose()
+→ workers alive = false
+```
+
+## Files added
+
+- `mini_vllm/multiprocess/protocol.py`
+- `mini_vllm/multiprocess/executor.py`
+- `mini_vllm/multiprocess/__init__.py`
+- `mini_vllm/versions/v1_1/engine.py`
+- `mini_vllm/versions/v1_1/__init__.py`
+- `tests/test_multiprocess_runtime.py`
+- `examples/16_multiprocess_transport.py`
+
+## Important files updated
+
+- `mini_vllm/runtime.py`
+- `mini_vllm/observability.py`
+- `mini_vllm/versions/__init__.py`
+- `mini_vllm/__init__.py`
+- `scripts/check.sh`
+- `tests/test_v1_version.py`
+- `README.md`
+- `Agents.md`
+- `Plan.md`
+- `docs/ARCHITECTURE.md`
+- `docs/INVARIANTS.md`
+- `docs/ROADMAP.md`
+- `docs/EXERCISES.md`
+- `version.md`
+
+## Acceptance evidence
+
+- real `multiprocessing.Process` owns each serving Worker/model/cache: implemented and PID-tested;
+- parent does not directly invoke child Worker: implemented via `WorkerSpec` + commands;
+- explicit serializable command/result protocol: implemented and pickle-tested;
+- ordinary execution over IPC: implemented;
+- prefix/cache lifecycle over IPC: implemented;
+- checkpoint/rollback and speculative execution over IPC: implemented;
+- child-reported errors cannot silently commit logical state: structured response + rollback contract;
+- unexpected worker death: explicit `WorkerProcessDied` path;
+- normal shutdown joins workers: tested;
+- world-size 1/2 deterministic output equals v1.0: tested;
+- public snapshot exposes transport state without physical handles: implemented;
+- v0.1–v1.0 regression suite: preserved in first full CI candidate;
+- example 16: included in release check script;
+- final release requirement: exact final implementation commit must pass GitHub Actions before `main` moves.
 
 ## Non-goals
 
 - multi-node networking;
 - NCCL/Gloo production collectives;
+- shared-memory optimized tensor transport;
 - GPU process isolation or CUDA IPC;
-- process pools optimized for throughput;
+- throughput-oriented process pools;
 - automatic elastic worker replacement;
 - OpenAI-compatible HTTP serving;
 - production model/tokenizer loading;
@@ -266,8 +369,8 @@ It must not expose child-process physical cache handles to Scheduler policy.
 
 ## Learning goal
 
-By the end of v1.1 a reader should understand the difference between an architectural abstraction boundary and a real OS isolation boundary: serialization becomes explicit, ownership becomes remote, lifecycle must be managed, and failures become transport events rather than ordinary in-process exceptions.
+By v1.1 a reader should be able to explain why a clean Python abstraction is not yet a distributed-systems boundary: once a Worker lives in another process, serialization, correlation, acknowledgment, transaction repair, process health and cleanup become part of correctness.
 
 ## Next direction
 
-After v1.1, genuinely new learning targets may include real GPU kernels or production-style model loading. Neither belongs in this transport-focused version.
+The preferred next distinct learning target is production-style model/tokenizer loading: turn external model artifacts into validated runtime-owned weights while keeping artifact identity/configuration separate from serving execution state. That belongs in a later version, not in the v1.1 transport mechanism.

@@ -59,6 +59,13 @@ class RankExecutionSnapshot:
     compile_cache_misses: int
     compile_fallbacks: int
     eager_projection_calls: int
+    boundary: str = "in-process"
+    process_id: int | None = None
+    worker_state: str = "local"
+    transport_commands_sent: int = 0
+    transport_commands_completed: int = 0
+    remote_errors: int = 0
+    transport_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +75,8 @@ class ExecutionSnapshot:
     execute_calls: int
     speculative_execute_calls: int
     ranks: tuple[RankExecutionSnapshot, ...] = ()
+    boundary: str = "in-process"
+    healthy: bool = True
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,12 +9,12 @@ if TYPE_CHECKING:
     from mini_vllm.async_runtime import AsyncEngine
     from mini_vllm.attention import PagedAttentionConfig
     from mini_vllm.compile_runtime import CompileConfig
-    from mini_vllm.runtime import RuntimeConfig
+    from mini_vllm.runtime import MultiprocessConfig, RuntimeConfig
     from mini_vllm.speculative.draft import DraftProvider
 
 
 def create_engine(
-    version: str = "v1.0",
+    version: str = "v1.1",
     *,
     runtime_config: RuntimeConfig | None = None,
     engine_config: EngineConfig | None = None,
@@ -27,13 +27,18 @@ def create_engine(
     compile_config: CompileConfig | None = None,
     attention_config: PagedAttentionConfig | None = None,
     fairness_bypass_limit: int | None = None,
+    multiprocess_config: MultiprocessConfig | None = None,
 ) -> Engine | AsyncEngine:
     normalized = version.lower().replace("_", ".")
-    is_v1 = normalized in {"v1.0", "1.0"}
+    is_v10 = normalized in {"v1.0", "1.0"}
+    is_v11 = normalized in {"v1.1", "1.1"}
+    is_v1 = is_v10 or is_v11
     if runtime_config is not None and not is_v1:
         raise ValueError("runtime_config is only supported by v1.0+")
+    if multiprocess_config is not None and not is_v11:
+        raise ValueError("multiprocess_config is only supported by v1.1+")
     if fairness_bypass_limit is not None and normalized not in {
-        "v0.13", "0.13", "v1.0", "1.0"
+        "v0.13", "0.13", "v1.0", "1.0", "v1.1", "1.1"
     }:
         raise ValueError("fairness_bypass_limit is only supported by v0.13+")
 
@@ -153,7 +158,7 @@ def create_engine(
             ),
         )
 
-    if is_v1:
+    if is_v10:
         from mini_vllm.versions.v1_0 import create_engine as build
         return build(
             runtime_config=runtime_config,
@@ -165,6 +170,21 @@ def create_engine(
             compile_config=compile_config,
             attention_config=attention_config,
             fairness_bypass_limit=fairness_bypass_limit,
+        )
+
+    if is_v11:
+        from mini_vllm.versions.v1_1 import create_engine as build
+        return build(
+            runtime_config=runtime_config,
+            **kwargs,
+            draft_provider=draft_provider,
+            max_speculative_tokens=max_speculative_tokens,
+            world_size=world_size,
+            max_queue_size=max_queue_size,
+            compile_config=compile_config,
+            attention_config=attention_config,
+            fairness_bypass_limit=fairness_bypass_limit,
+            multiprocess_config=multiprocess_config,
         )
 
     raise ValueError(f"unknown mini-vLLM version: {version}")

@@ -15,8 +15,28 @@
 | v0.11 | compile-aware rank-local tensor execution | frozen |
 | v0.12 | reference + vectorized PagedAttention | frozen |
 | v0.13 | prefix-aware scheduling / cache-aware admission | frozen |
-| v1.0 | integrated public API + observability + end-to-end runtime | current implementation / exact-CI release rule |
+| v1.0 | integrated public API + observability + end-to-end runtime | frozen |
+| v1.1 | real multiprocessing Executor/Worker transport | current implementation / exact-CI release rule |
 
-Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → attention optimization → cache-aware policy → integrated runtime.
+Dependency order:
 
-After v1.0, a new branch should exist only for a genuinely new learning target. Candidate directions include real CUDA/Triton kernels, actual multiprocessing or distributed transport, and production-style model/tokenizer loading. None is part of the v1.0 contract.
+```text
+serving semantics
+→ memory
+→ scheduling
+→ sharing
+→ pressure recovery
+→ transactions
+→ execution boundary
+→ logical distribution
+→ async delivery
+→ compile awareness
+→ attention optimization
+→ cache-aware policy
+→ integrated runtime
+→ real OS process isolation / IPC
+```
+
+v1.1 intentionally stops at one-machine multiprocessing. It does not claim multi-node transport, NCCL, CUDA IPC, shared-memory tensor transport, or throughput improvement.
+
+After v1.1, a new branch again requires a genuinely new learning target. The preferred next direction is production-style model/tokenizer loading: validating external model artifacts, mapping weights into runtime-owned modules, tokenizer/model compatibility, and separating artifact identity from serving execution state. Real CUDA/Triton kernels remain a later independent learning line.

@@ -4,7 +4,7 @@ A small, branch-versioned LLM-serving runtime for learning the systems ideas beh
 
 ## Current line
 
-`main` is always the newest exact-CI-validated release. v1.0 integrates the mechanisms introduced from v0.1 through v0.13 into one coherent public construction API and one read-only observability path.
+`main` is always the newest exact-CI-validated release. v1.1 turns the v1.0 logical Executor/Worker boundary into a real operating-system process boundary while preserving the same serving semantics.
 
 ```text
 v0.1  static batching + contiguous KV
@@ -20,112 +20,195 @@ v0.10 async streaming + cancellation/backpressure
 v0.11 compile-aware rank-local tensor execution
 v0.12 reference + vectorized PagedAttention
 v0.13 prefix-aware scheduling + cache-aware admission
-v1.0  integrated educational runtime                  ← current
+v1.0  integrated educational runtime
+v1.1  real multiprocessing executor transport         ← current
 ```
 
-Historical version builders remain available so each mechanism can still be studied in isolation.
+Historical builders remain available so each mechanism can still be studied in isolation.
 
-## v1.0 mental model
+## v1.1 mental model
 
 ```text
+parent process
+
 caller
   ↓
 AsyncEngine
   ↓
-EngineCore
+EngineCore                     logical request truth
   ↓
-PrefixAwareBudgetedScheduler
-  ├─ token budget / chunked prefill
-  ├─ prefix-aware admission + fairness
-  └─ KV-pressure preemption
+PrefixAwareBudgetedScheduler   policy
   ↓
-DistributedExecutor / WorkerGroup
-  ↓
-rank-local Worker
-  ↓
-TinyDecoder
-  ├─ transactional prefix-shared paged KV
-  ├─ vectorized PagedAttention
-  └─ compile-aware vocabulary projection
-  ↓
-Speculative verification / Sampler
-  ↓
-committed async stream events
+MultiprocessExecutor
+  │
+  ├──── explicit command + correlation ID ────┐
+  │                                            │ IPC
+  ▼                                            ▼
+child rank 0                              child rank 1
+Worker                                    Worker
+├─ ModelRunner                            ├─ ModelRunner
+├─ transactional paged KV                ├─ transactional paged KV
+├─ vectorized PagedAttention             ├─ vectorized PagedAttention
+└─ compile-aware projection              └─ compile-aware projection
+  │                                            │
+  └──── serialized tensor result / error ──────┘
+                       ↓
+              parent-side gather
+                       ↓
+              EngineCore logical commit
+                       ↓
+              committed async events
 ```
 
-v1.0 does not introduce another major serving algorithm. It makes the existing stack readable as one runtime.
+The central v1.1 ownership rule is:
+
+```text
+parent owns logical truth
+child owns physical model/KV state
+IPC owns the evidence crossing that boundary
+```
+
+The parent never reaches into a live child `Worker`, cache backend, model runner, block table, or tensor storage.
 
 ## Stable construction API
 
-The default builder now creates v1.0:
+The default builder creates v1.1:
 
 ```python
 from mini_vllm import Request, RuntimeConfig, create_engine
 
 engine = create_engine(runtime_config=RuntimeConfig())
-handle = engine.submit(Request("R", [1, 2, 3], max_new_tokens=4))
 ```
 
-`RuntimeConfig` groups the important educational knobs—engine limits, model shape, KV layout, compile mode, attention mode, logical world size, async queue size, and prefix-fairness threshold—without exposing block tables, refcounts, or other physical ownership structures.
+`RuntimeConfig` now also contains `MultiprocessConfig`:
+
+```python
+from mini_vllm import MultiprocessConfig, RuntimeConfig
+
+config = RuntimeConfig(
+    multiprocess=MultiprocessConfig(
+        start_method="spawn",
+        command_timeout_s=30.0,
+        shutdown_timeout_s=2.0,
+    )
+)
+```
+
+The transport knobs control process creation and lifecycle timeouts, not Scheduler policy or physical KV addressing.
 
 Historical comparisons remain explicit:
 
 ```python
-v03 = create_engine("v0.3")
 v13 = create_engine("v0.13")
-v10 = create_engine("v1.0")
+v10 = create_engine("v1.0")   # in-process integrated runtime
+v11 = create_engine("v1.1")   # process-isolated execution runtime
 ```
+
+## Explicit IPC protocol
+
+v1.1 uses a small fixed command vocabulary instead of arbitrary remote method invocation. Commands cover:
+
+```text
+prefix estimate / prepare
+KV capacity
+normal execute
+speculative execute
+commit work
+checkpoint / rollback / checkpoint commit
+free
+cache stats
+execution snapshot
+shutdown
+```
+
+Every command carries a monotonically increasing correlation ID. Child-side exceptions become structured error responses; unexpected EOF, timeout, or process exit is a transport failure.
+
+Logits cross the boundary through an explicit CPU `TensorPayload`. No live tensor storage or cache object is treated as a parent-owned handle.
+
+## Failure atomicity across IPC
+
+Ordinary execution is protected by remote checkpoints:
+
+```text
+parent asks every rank for checkpoint
+              ↓
+      all checkpoints acknowledged
+              ↓
+       execute on child ranks
+              ↓
+       all results acknowledged?
+        ├─ yes → gather → commit checkpoint → logical commit
+        └─ no  → rollback reachable ranks → no logical commit
+```
+
+A child-reported model/runtime error does not automatically kill that child; if rollback succeeds, the process can remain healthy. An unexpected process death is surfaced as `WorkerProcessDied`. If physical state can no longer be proven consistent, the executor becomes unhealthy and EngineCore does not commit the step.
+
+Speculative decoding keeps the v0.7 transaction contract, but the checkpoint identities are now transport-safe handles whose real cache checkpoints remain inside each child process.
+
+## Lifecycle and shutdown
+
+A v1.1 engine owns child processes and therefore exposes explicit cleanup:
+
+```python
+await engine.aclose()   # async-safe: wait idle, then shutdown/join workers
+# or, when the driver is already idle:
+engine.close()
+```
+
+Normal shutdown sends an explicit `shutdown` command, joins each process, and terminates only as a final cleanup fallback. The test suite verifies no worker remains alive after close.
 
 ## One public observability path
 
-After or during a run, v1.0 users inspect the runtime with:
+The v1.0 API remains intact:
 
 ```python
 snapshot = engine.snapshot()
 ```
 
-The snapshot exposes, without private-field access:
+v1.1 extends rank observations with:
 
-- request lifecycle, computed frontier, output history and preemption count;
-- waiting/running sets, prefix-aware admission costs, fairness and estimate-vs-attach reconciliation;
-- cache statistics and prefix reuse counters;
-- scheduled prefill/decode work and committed tokens for recent steps;
-- speculative accept/reject/rollback observations;
-- distributed world size and rank-local vocabulary ranges;
-- vectorized/reference attention call counts and fallbacks;
-- compile attempts, cache hits/misses and eager fallbacks;
-- async pending/cancellation/driver state.
+- execution boundary (`multiprocess-ipc`);
+- child process ID;
+- worker lifecycle state;
+- serving commands sent/completed;
+- structured remote-error count;
+- transport-failure count.
 
-Observation is read-only. Calling `snapshot()` cannot schedule work, attach KV, change LRU state, or advance a request.
+Existing request, Scheduler, cache, speculation, attention and compile observations remain available. Pure observability reads are deliberately excluded from serving-command counters, so two snapshots with no intervening runtime action remain equal.
 
 ## Core correctness contract
 
-The condensed v1.0 invariants live in `docs/INVARIANTS.md`. The most important separation remains:
+The condensed invariants live in `docs/INVARIANTS.md`. v1.1 adds another separation:
 
 ```text
-logical history
-    !=
-computed-token frontier
-    !=
-physical KV ownership
+logical commit
+    requires
+acknowledged remote physical execution
 ```
 
-Likewise:
+and:
 
 ```text
+unknown child physical state
+    => executor unhealthy
+    => no logical commit
+```
+
+The earlier distinctions still hold:
+
+```text
+logical history != computed-token frontier != physical KV ownership
 PrefixReuseHint != reservation != ownership != computed tokens
 ```
 
-Optimization paths remain subordinate to readable oracles: vectorized PagedAttention must equal reference attention, and compile-aware projection must equal eager projection.
-
-## Integrated walkthrough
+## Walkthrough
 
 ```bash
 pip install -e '.[dev]'
-python examples/15_integrated_runtime.py
+python examples/16_multiprocess_transport.py
 ```
 
-The example warms a reusable prompt, submits cold and warm requests, streams committed output, then explains admission/reconciliation, recent work, speculation, cache state, and rank-local attention/compile execution through the public snapshot.
+The example prints the parent PID and child worker PIDs, streams committed output, exposes transport/attention/compile counters through `snapshot()`, then closes the runtime and proves all workers are gone.
 
 ## Verify
 
@@ -133,6 +216,6 @@ The example warms a reusable prompt, submits cold and warm requests, streams com
 ./scripts/check.sh
 ```
 
-The release gate runs every historical regression plus examples 01–15. A v1.0 commit may advance `main` only when that exact commit has a green repository CI run.
+The v1.1 gate runs all historical regressions plus examples 01–16. The first implementation candidate reached 91 passing pytest tests; only the exact final release commit with green repository CI may advance `main`.
 
 Read `Agents.md`, `Plan.md`, `docs/ARCHITECTURE.md`, `docs/INVARIANTS.md`, and `version.md` before changing architecture.

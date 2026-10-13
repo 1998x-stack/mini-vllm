@@ -1,54 +1,80 @@
-# mini-vLLM v1.0 exercises
+# mini-vLLM v1.1 exercises
 
-Use historical branch diffs to learn one mechanism at a time, then use v1.0 to practice cross-layer reasoning.
+Use historical branch diffs to learn one mechanism at a time. Use v1.0 to practice cross-layer composition, then v1.1 to reason about what changes when execution crosses a real OS process boundary.
 
-## Follow one request end to end
+## Follow one request across processes
 
-1. Run `examples/15_integrated_runtime.py`. Draw the request path from `submit()` to the terminal event and label the owner of every decision.
-2. From `engine.snapshot()`, identify the difference between `output_tokens` and `num_computed_tokens`. Give a moment when they can differ.
-3. Locate the `WorkTrace` entries for prefill and decode. Why can one logical request require many EngineCore steps?
-4. Explain why the async layer can delay delivery without changing which tokens were logically committed.
+1. Run `examples/16_multiprocess_transport.py`. Record the parent PID and every worker PID. Why is PID inequality stronger evidence of isolation than a Python class boundary?
+2. Draw the path from `submit()` to `TokenEvent`. Mark which arrows stay inside the parent and which cross IPC.
+3. Identify the exact point at which a child-computed logit becomes eligible for EngineCore logical commit.
+4. Explain why “the parent successfully sent EXECUTE” is not evidence that execution succeeded.
 
-## Prefix-aware admission
+## Protocol and serialization
 
-5. Warm a prompt, then submit a cold request before a warm request. Use only `snapshot()` to explain which request was admitted first and why.
-6. Compare `reusable_tokens` with `actual_reuse_tokens`. Why must the latter remain authoritative?
-7. Construct an optimistic stale hint using the v0.13 tests. Show why a stale estimate cannot move `num_computed_tokens` forward.
-8. Lower the fairness bypass limit. Explain when cache warmth stops being allowed to bypass older cold work.
+5. Pick one `TransportCommand` and list every field that must survive pickle serialization.
+6. Explain why v1.1 sends a `WorkerSpec` into the child instead of constructing a `Worker` in the parent and treating it as remotely owned.
+7. Inspect `TensorPayload`. What information is copied across IPC, and what live tensor/storage identity is deliberately lost?
+8. Explain why a correlation-ID mismatch must be treated as a transport failure even if the payload looks numerically plausible.
 
-## KV ownership and preemption
+## Child-owned physical state
 
-9. Revisit `examples/03_page_table_walkthrough.py`. For one logical position, calculate logical block, offset and physical block manually.
-10. Use the v0.6 preemption example to distinguish logical token history from active KV ownership.
-11. Explain why preemption followed by replay does not resample historical output tokens.
-12. Describe what would break if Scheduler selected victims by reading physical block IDs directly.
+9. List the objects constructed inside each child process: model, cache, runner and Worker. Which parent policies are intentionally absent?
+10. Explain why a parent-side `CheckpointHandle` is not a physical KV ownership capability.
+11. For one paged-cache position, calculate logical block, offset and physical block. Which process is allowed to know the resulting physical block ID?
+12. Explain why Scheduler still receives prefix reuse quantities but not child block tables/refcounts.
+
+## Ordinary execution atomicity
+
+13. Trace one ordinary forward: remote checkpoint → rank execution → result validation → gather → checkpoint commit → EngineCore logical commit.
+14. Inject a structured child error after checkpoint. Which state must be rolled back before the parent surfaces the error?
+15. Suppose rank 0 returns success and rank 1 dies before responding. Why can rank 0's result not be logically committed?
+16. Explain the conservative rule: if full physical consistency cannot be proven, mark the executor unhealthy rather than guessing.
 
 ## Speculative transactions
 
-13. Run `examples/08_speculative_decoding.py` and locate matching `VerificationResult` entries in a v1.0 snapshot.
-14. For a rejected speculative suffix, identify which state survives and which state must disappear.
-15. Explain why speculative rollback may free a private tail but cannot mutate an immutable shared prefix.
+17. Run a deterministic v1.1 request that triggers speculation. Find the `VerificationResult` in the public snapshot.
+18. Distinguish the outer parent-side logical speculative transaction from each child's private real cache checkpoint.
+19. When a speculative suffix is rejected, which candidate tokens remain logical history, and which child-local KV must disappear?
+20. Why does process isolation not change the rule that shared prefix blocks are immutable?
 
-## Distributed execution
+## Error taxonomy
 
-16. Compare v1.0 with `world_size=1` and `world_size=2`. Why should committed deterministic output agree?
-17. Inspect each `RankExecutionSnapshot.vocab_range`. Explain how rank-local logits become one global vocabulary distribution.
-18. Force a rank-local failure using the existing distributed tests. Why must physical rollback happen before EngineCore logical commit?
+21. Trigger `checkpoint("missing", 0)`. Why is the result a `WorkerRemoteError` rather than `WorkerProcessDied`?
+22. After that structured error, verify the worker process is still alive. What does that teach about remote exceptions versus transport failures?
+23. Kill a worker process and call a remote operation. Why must v1.1 surface `WorkerProcessDied` explicitly?
+24. Compare timeout, EOF, structured remote error and wrong-correlation failures. Which may preserve executor health and which make state uncertain?
 
-## Attention and compilation
+## Lifecycle and cleanup
 
-19. Switch PagedAttention from `vectorized` to `reference` and compare committed output. Which snapshot counters should change?
-20. Disable compilation with `CompileConfig(enabled=False)`. Which compile counters/modes change, and why should output not change?
-21. Explain why vectorized attention and compile-aware projection are optimizations at different architectural boundaries.
+25. Call `engine.close()` after the async driver is idle. Verify every `worker_alive` entry becomes false.
+26. Why does `close()` reject an actively running async driver while `aclose()` first waits for idle?
+27. Explain why process termination is a cleanup fallback, not a request-cancellation primitive.
+28. Describe what an orphan worker would imply about runtime ownership correctness.
 
-## Observability
+## Multiprocess observability
 
-22. Call `snapshot()` twice without running a step. Prove the two snapshots are equal and runtime state does not advance.
-23. List every question that can now be answered without private-field access: admission, reuse, preemption, speculation, execution path, cache state and committed output.
-24. Propose one useful new observation. Decide whether it belongs in Scheduler, cache, execution, async delivery or the snapshot-copy layer. Justify the ownership choice.
+29. Call `snapshot()` twice with no intervening serving work. Prove the snapshots compare equal even though each snapshot queries child state over IPC.
+30. Explain why `CACHE_STATS` and `SNAPSHOT_EXECUTION` reads are excluded from serving-command counters.
+31. For each rank, interpret `process_id`, `worker_state`, commands sent/completed, remote errors and transport failures.
+32. Propose a new transport observation. Decide whether reading it can remain side-effect free.
+
+## Semantic equivalence
+
+33. Run v1.0 and v1.1 with `world_size=1` and identical configuration. Compare committed output token histories.
+34. Repeat with `world_size=2`. Why should moving execution into child processes not change deterministic model semantics?
+35. Switch v1.1 PagedAttention between reference and vectorized modes. Which process owns the counter changes?
+36. Disable compile-aware projection. Why is eager/compiled equivalence independent of IPC correctness?
+
+## Prefix-aware scheduling across IPC
+
+37. Warm a prompt in v1.1, then submit warm/cold requests. Use `snapshot()` to explain admission using only policy-visible reuse facts.
+38. Explain why prefix estimation must remain side-effect free even though the cache that computes it now lives remotely.
+39. Distinguish: estimated reusable prefix, actual attached prefix, parent logical computed frontier, child physical ownership.
+40. Why would exposing child block IDs to the Scheduler violate both v0.13 and v1.1 contracts?
 
 ## Historical synthesis
 
-25. Pick any adjacent pair from v0.1–v0.13. State exactly one new mechanism introduced and one invariant preserved.
-26. Explain why v1.0 is primarily a composition release rather than a new mechanism release.
-27. Before proposing v1.1, name the genuinely new learning target. If the proposal can be expressed only as “more features,” do not create the version.
+41. Compare v0.8 and v1.1. Both expose `Executor → Worker`; what new problem appears only when that boundary becomes an OS process boundary?
+42. Compare v0.9 and v1.1. What remains a logical/reference collective, and what becomes physically distributed across processes?
+43. Explain why v1.1 is a new mechanism release while v1.0 was primarily a composition release.
+44. Propose a v1.2 learning target. Reject proposals that are merely “more multiprocessing features” rather than a distinct systems boundary.

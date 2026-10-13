@@ -36,6 +36,14 @@ from mini_vllm.distributed import (
     WorkerGroup,
 )
 from mini_vllm.execution import Executor, LocalExecutor, Worker
+from mini_vllm.multiprocess import (
+    MultiprocessExecutor,
+    MultiprocessExecutorUnhealthy,
+    WorkerProcessDied,
+    WorkerRemoteError,
+    WorkerTransportError,
+    WorkerTransportTimeout,
+)
 from mini_vllm.observability import (
     AsyncRuntimeSnapshot,
     ExecutionSnapshot,
@@ -45,7 +53,7 @@ from mini_vllm.observability import (
     SchedulerSnapshot,
     SchedulingObservation,
 )
-from mini_vllm.runtime import RuntimeConfig
+from mini_vllm.runtime import MultiprocessConfig, RuntimeConfig
 from mini_vllm.scheduler.prefix_aware import (
     AdmissionCost,
     PrefixAwareBudgetedScheduler,
@@ -57,11 +65,14 @@ from mini_vllm.versions import create_engine
 
 __all__ = [
     "CacheConfig", "EngineConfig", "TinyModelConfig", "RuntimeConfig",
+    "MultiprocessConfig",
     "Request", "RequestStatus", "SamplingParams", "PrefixReuseHint",
     "DraftProvider", "IncrementDraftProvider", "ScriptedDraftProvider",
     "Engine", "EngineCore", "Executor", "LocalExecutor", "Worker",
     "RankConfig", "ReferenceCollective", "ReferenceTensorParallel",
-    "WorkerGroup", "DistributedExecutor",
+    "WorkerGroup", "DistributedExecutor", "MultiprocessExecutor",
+    "MultiprocessExecutorUnhealthy", "WorkerProcessDied", "WorkerRemoteError",
+    "WorkerTransportError", "WorkerTransportTimeout",
     "AsyncEngine", "AsyncRequestHandle", "StreamEvent", "TokenEvent",
     "FinishedEvent", "CancelledEvent", "ErrorEvent",
     "CompileConfig", "CompileEvent", "CompileStats", "CompiledKernelCache",
@@ -75,4 +86,4 @@ __all__ = [
     "AsyncRuntimeSnapshot", "create_engine",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
