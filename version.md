@@ -1,376 +1,441 @@
-# mini-vLLM v1.1 — real multiprocessing executor transport
+# mini-vLLM v1.2 — model artifact + tokenizer loading boundary (planning branch)
 
 ## Version identity
 
-- Branch: `v1.1`
-- Previous: validated `v1.0`
-- Theme: make the existing Executor/Worker abstraction a real operating-system process boundary with explicit IPC, lifecycle, health and failure semantics
-- Package version: `1.1.0`
-- Status: implementation complete; freeze requires the exact final release commit to pass repository CI
+- Branch: `v1.2`
+- Base: validated `v1.1` / `main`
+- Previous: `v1.1`
+- Theme: load external model/tokenizer artifacts into validated runtime-owned configuration, weights and token IDs
+- Status: planning; runtime remains exactly v1.1 until v1.2 acceptance criteria pass
 
-## Why v1.1
+## Why v1.2
 
-v0.8 introduced the architectural `EngineCore → Executor → Worker` boundary. v0.9 added logical ranks. v1.0 integrated those mechanisms coherently, but every Worker/model/cache still lived in the same Python process.
+v1.1 made execution physically real: parent policy and child model/KV state now communicate through an explicit transport contract. The next missing boundary appears before serving even starts.
 
-v1.1 adds a genuinely new systems lesson:
+Today the educational runtime constructs `TinyModelConfig` and deterministic model weights directly in code. Real serving systems instead receive external artifacts whose identity, metadata, tensor names, shapes, dtypes and tokenizer vocabulary must be validated before they can become runtime state.
 
-> An abstraction boundary becomes materially different when it crosses an OS process boundary.
+v1.2 should teach:
 
-Serialization becomes explicit, physical ownership becomes remote, command completion must be acknowledged, process lifecycle must be managed, and failures become transport events rather than ordinary in-process exceptions.
+```text
+external files are not runtime truth
+        ↓
+parse + validate + map
+        ↓
+validated ModelArtifact
+        ↓
+construct runtime model
+        ↓
+load owned tensor copies
+        ↓
+validated TokenizerArtifact
+        ↓
+text ⇄ token IDs
+        ↓
+existing v1.1 serving runtime
+```
+
+The new lesson is artifact ingestion and compatibility, not a larger Transformer or a network download client.
 
 ## Primary mental model
 
 ```text
-PARENT PROCESS
-
-AsyncEngine
-   ↓
-EngineCore                         logical request truth
-   ↓
-Scheduler                          policy
-   ↓
-MultiprocessExecutor               IPC / health / coordination
-   ├──────── command ────────┐
-   ▼                          ▼
-CHILD rank 0             CHILD rank 1 ...
-Worker                   Worker
-├─ ModelRunner           ├─ ModelRunner
-└─ KV cache              └─ KV cache
-   │                          │
-   └──── result / error ──────┘
-               ↓
-        parent-side gather
-               ↓
-       EngineCore commit
+MODEL DIRECTORY
+├─ model_config.json
+├─ weights.pt          educational checkpoint format
+└─ tokenizer.json
+        │
+        ▼
+ArtifactLoader
+├─ parse metadata
+├─ validate schema
+├─ validate tensor manifest
+├─ validate tokenizer vocabulary
+└─ compute stable artifact identity
+        │
+        ▼
+ValidatedModelArtifact
+├─ model config
+├─ named tensor manifest
+└─ tokenizer artifact
+        │
+        ▼
+RuntimeModelFactory
+├─ construct TinyDecoderLM architecture
+├─ map external names → runtime parameter names
+├─ copy tensors into runtime-owned parameters
+└─ verify no missing/unexpected/incompatible weights
+        │
+        ▼
+Tokenizer
+├─ encode(text) → token IDs
+└─ decode(token IDs) → text
+        │
+        ▼
+create_engine(model_artifact=...)
+        │
+        ▼
+existing v1.1 multiprocessing serving path
 ```
 
-Core ownership equation:
+## Core ownership rule
 
 ```text
-parent owns logical truth
-child owns physical model/KV truth
-IPC acknowledgment is the evidence connecting them
+artifact bytes / parsed metadata
+        !=
+runtime configuration
+        !=
+runtime-owned parameter storage
+        !=
+request token history
 ```
 
-## Implementation
+Loading means validation plus an explicit ownership transfer into runtime-created modules. It must not mean “keep arbitrary external Python objects alive and trust them forever.”
 
-### Explicit protocol
+## Required delta
 
-New `mini_vllm/multiprocess/protocol.py` defines transport-safe dataclasses:
+### 1. Artifact manifest
 
-- `WorkerSpec`;
-- `TransportCommand` / `TransportResponse`;
-- `TensorPayload`;
-- `CheckpointHandle` / `MultiprocessCacheCheckpoint`;
-- serialized normal/speculative execution results;
-- worker readiness and execution observations.
-
-Every serving command receives a monotonically increasing correlation ID. A response is accepted only when the ID matches the outstanding command.
-
-The protocol carries logical values and copies. It never transports live Scheduler objects, Worker references, cache objects, block-table ownership or live tensor storage.
-
-### Child-owned Worker construction
-
-`MultiprocessExecutor` starts one `multiprocessing.Process` per logical rank. The child receives only `WorkerSpec` and constructs locally:
+Introduce a small educational artifact format with explicit files and versions. Preferred first format:
 
 ```text
-RankConfig
-TinyDecoderLM
-TransactionalPrefixCachingPagedKVCache
-CompileAwareVocabParallelTinyRunner
-Worker
+model_dir/
+├─ model_config.json
+├─ weights.pt
+└─ tokenizer.json
 ```
 
-Therefore the parent never constructs or directly invokes the child-owned Worker/model/cache used for v1.1 serving.
+`model_config.json` should contain the architecture facts needed to construct `TinyModelConfig`, for example:
 
-### Tensor transport
+- artifact format/version;
+- architecture identifier;
+- vocabulary size;
+- hidden dimension;
+- attention/KV head counts;
+- layer count;
+- feed-forward dimension;
+- maximum positions;
+- expected dtype or supported dtype policy;
+- tokenizer compatibility identifier.
 
-Rank-local logits are converted into a simple explicit CPU wire representation:
+The loader must reject missing required fields, unknown incompatible format versions and invalid dimensions before model construction.
+
+### 2. Stable artifact identity
+
+Define a logical `ModelArtifactIdentity`, for example:
 
 ```text
-TensorPayload
-├─ shape
-├─ dtype
-└─ flat copied values
+artifact format version
+architecture
+model metadata digest
+weights manifest digest
+tokenizer digest
 ```
 
-The parent reconstructs fresh tensors, then uses the existing readable `ReferenceCollective` to gather vocabulary shards. v1.1 intentionally avoids shared-memory/CUDA-IPC optimization so transport ownership remains obvious.
+Identity is for provenance/compatibility and observability. It is not a filesystem path and not a mutable model object.
 
-### Ordinary execution transaction
+### 3. Safe tensor manifest validation
 
-Normal execution is protected across IPC, not merely speculative execution.
+The loader must know the expected runtime parameter names and shapes before accepting weights.
+
+Validation should distinguish:
 
 ```text
-for every scheduled request:
-    checkpoint every child rank
-        ↓
-all checkpoint handles acknowledged
-        ↓
-execute work on every rank
-        ↓
-validate all correlated successful results
-        ↓
-parent all-gather
-        ↓
-commit child checkpoints
-        ↓
-return ExecutionResult
-        ↓
-EngineCore may advance logical state
+missing tensor
+unexpected tensor
+shape mismatch
+dtype mismatch / supported conversion
+non-tensor payload
 ```
 
-If any execution fails before logical commit, the executor attempts rollback on every reachable checkpointed rank/request. If rollback cannot be proven complete, the executor becomes unhealthy rather than allowing EngineCore to guess.
+Do not silently ignore unknown tensors or silently initialize missing required weights.
 
-### Child-private checkpoint registry
+The preferred educational implementation may use `torch.load(..., weights_only=True)` for a local checkpoint if supported by the minimum PyTorch version. Arbitrary checkpoint code execution is explicitly out of scope.
 
-Actual `CacheCheckpoint` objects remain inside the child. The parent receives only `CheckpointHandle(checkpoint_id, request_id, num_tokens)`.
+### 4. External-name → runtime-name mapping
 
-This keeps physical block-table identity private while still allowing rollback/commit commands to reference a transaction deterministically.
+Keep mapping explicit and inspectable, even if the first artifact format already uses near-identical names.
 
-### Speculative transport
-
-`EXECUTE_SPECULATIVE` crosses the same process boundary. The pre-existing v0.7/v1.0 speculative flow remains authoritative:
-
-```text
-checkpoint
-→ remote candidate execution
-→ target verification
-→ rollback to accepted frontier
-→ commit accepted/fallback logical tokens
-```
-
-No speculative token becomes caller-visible merely because a child executed it.
-
-### Prefix/cache lifecycle
-
-The following operations now cross IPC in v1.1:
-
-- side-effect-free prefix reuse estimation;
-- authoritative prefix attachment;
-- capacity reservation;
-- normal/speculative execution;
-- work publication;
-- checkpoint/rollback/commit;
-- request free;
-- cache statistics.
-
-The Scheduler still observes only logical reuse quantities, never physical child block IDs or refcounts.
-
-## Worker lifecycle
-
-Each rank client performs a readiness handshake before the runtime becomes usable.
-
-Conceptual lifecycle:
-
-```text
-STARTING
-   ↓ readiness acknowledged
-READY
-   ├─ normal command → READY
-   ├─ structured child error → READY when state remains provable
-   ├─ timeout/protocol uncertainty → UNHEALTHY
-   └─ unexpected exit/EOF → DEAD
-   ↓ explicit shutdown
-STOPPED
-```
-
-`MultiprocessAsyncEngine` adds:
+Preferred concept:
 
 ```python
-engine.close()
-await engine.aclose()
-```
-
-`close()` requires an idle async driver. `aclose()` waits for idle, then sends shutdown and joins workers. Termination is used only as a final cleanup fallback.
-
-## Failure taxonomy
-
-### Structured child error
-
-An ordinary child exception is serialized as a failed `TransportResponse` and surfaced as `WorkerRemoteError`. The child can remain alive; successful repair/rollback may preserve executor health.
-
-### Unexpected process death
-
-A dead child is surfaced explicitly as `WorkerProcessDied`. The parent never treats the absence of a response as success.
-
-### Timeout / protocol uncertainty
-
-A timeout, EOF, invalid response or correlation mismatch means the parent cannot prove the physical result. Such uncertainty cannot authorize logical commit.
-
-### Rollback failure
-
-If failed ordinary execution may have mutated child state and complete rollback cannot be proven, the executor enters unhealthy state and rejects further logical progress.
-
-## Public construction
-
-`create_engine()` now defaults to v1.1.
-
-`RuntimeConfig` adds:
-
-```python
-MultiprocessConfig(
-    start_method="spawn",
-    command_timeout_s=30.0,
-    shutdown_timeout_s=2.0,
+WeightMapping(
+    external_name="layers.0.attn.q_proj.weight",
+    runtime_name="layers.0.attn.q_proj.weight",
+    expected_shape=(...),
 )
 ```
 
-Explicit `create_engine("v1.0")` remains the in-process semantic oracle, and v0.1–v0.13 builders remain available as frozen learning snapshots.
+The learning point is that file naming and runtime module ownership are distinct contracts.
 
-## Observability
+### 5. Runtime-owned parameter copy
 
-The stable v1.0 `engine.snapshot()` path remains the public teaching API.
-
-v1.1 extends `ExecutionSnapshot` / `RankExecutionSnapshot` with:
-
-- boundary type (`multiprocess-ipc`);
-- child PID;
-- lifecycle state;
-- serving commands sent/completed;
-- structured remote-error count;
-- transport-failure count;
-- executor health.
-
-Attention and compile observations are read from the real child-owned runner.
-
-Pure observation commands (`CACHE_STATS`, `SNAPSHOT_EXECUTION`) do not increment serving-command counters. Therefore two snapshots with no intervening serving work compare equal.
-
-## Stable invariants added in v1.1
-
-The full contract lives in `docs/INVARIANTS.md`. New process-boundary rules include:
+After validation:
 
 ```text
-command sent != execution success
+artifact tensor
+    ↓ validate
+runtime parameter target
+    ↓ copy under no_grad
+runtime-owned parameter storage
 ```
+
+The runtime model must remain usable after the artifact file/tensor container is released. No serving request should depend on the loader keeping a checkpoint dictionary alive.
+
+### 6. Tokenizer artifact
+
+Add a deliberately small readable tokenizer format. A good educational first target is a vocabulary + deterministic greedy/whitespace-safe encoding contract rather than importing a full production tokenizer library.
+
+Required behavior:
 
 ```text
-logical commit requires
-correlation-matched acknowledged remote success
+text → token IDs
+valid token IDs → text
+unknown token handling
+special token metadata
+vocabulary size compatibility
 ```
+
+The tokenizer's vocabulary size must agree with the model artifact's `vocab_size` before engine construction.
+
+### 7. Text-facing request convenience without replacing token-native core
+
+The serving core should remain token-ID native. v1.2 may add a thin public helper such as:
+
+```python
+engine.encode(text)
+engine.decode(token_ids)
+engine.submit_text(...)
+```
+
+or an equivalent artifact-bound facade.
+
+Do not push strings into Scheduler, KV cache, WorkItem or model-runner contracts. Text normalization/tokenization belongs before the serving core.
+
+### 8. Multiprocessing compatibility
+
+v1.1 children currently receive serializable model configuration and construct deterministic model state themselves. v1.2 must decide explicitly how loaded weights enter child processes.
+
+Preferred educational design:
 
 ```text
-CheckpointHandle != physical KV ownership
+parent validates artifact once
+        ↓
+serializable validated artifact spec / local artifact path + identity
+        ↓
+child independently loads validated weights
+        ↓
+all ranks report same artifact identity
+        ↓
+serving begins
 ```
+
+Alternative parent-to-child weight transport is possible but risks teaching a large tensor IPC mechanism at the same time. Keep v1.2 focused on artifact loading rather than weight-distribution optimization.
+
+Whichever design is chosen, all ranks must prove the same model/tokenizer identity before the executor becomes ready.
+
+### 9. Readiness becomes model-specific
+
+v1.1 readiness means “worker process constructed successfully.” v1.2 readiness should include:
 
 ```text
-unknown child physical consistency
-    => executor unhealthy
-    => no logical commit
+process alive
++ artifact parsed
++ architecture compatible
++ all required weights loaded
++ tokenizer/model compatibility validated
++ artifact identity agreed across ranks
 ```
 
-and:
+A worker that cannot validate/load the configured model must fail startup before any request is admitted.
+
+### 10. Observability
+
+Extend public read-only snapshot/model metadata with logical facts such as:
+
+- artifact identity;
+- architecture;
+- artifact format version;
+- tokenizer identity/vocab size;
+- loaded dtype/device;
+- per-rank model identity agreement;
+- loader warnings/conversions that are part of the explicit policy.
+
+Do not expose raw checkpoint dictionaries or parameter storage pointers.
+
+## Critical invariants
+
+### Artifact truth
 
 ```text
-normal shutdown => every owned child joined/reaped
+filesystem presence != valid model artifact
 ```
 
-All v1.0 logical/KV/prefix/preemption/speculation/attention/compile/async invariants remain in force.
+Only the validated artifact object/spec may drive runtime construction.
 
-## Tests
+### Complete weight coverage
 
-New `tests/test_multiprocess_runtime.py` covers:
+Every required runtime parameter is populated exactly once from an accepted source tensor unless a documented deterministic initialization rule explicitly says otherwise.
 
-1. transport protocol pickle serialization;
-2. actual child PID isolation from parent;
-3. default v1.1 builder and process boundary;
-4. repeated snapshot equality;
-5. world-size 1 output equivalence to v1.0;
-6. world-size 2 output equivalence to v1.0;
-7. speculative verification over IPC;
-8. prefix reuse/cache lifecycle over IPC;
-9. vectorized attention observations from child state;
-10. structured remote error while worker remains alive;
-11. explicit unexpected worker-death detection;
-12. shutdown/join with no live worker remaining.
+### No silent extras
 
-Historical v1.0 regression tests are explicitly version-pinned so changing the default builder does not rewrite the prior lesson.
+Unexpected external tensors cause an explicit validation result/error unless the format contract explicitly marks them ignorable.
 
-The first complete implementation candidate passed:
+### Shape compatibility
+
+A tensor with the correct name but incorrect shape can never be copied into runtime state.
+
+### Vocabulary compatibility
 
 ```text
-91 pytest tests
-examples 01–16
-all checks passed
+tokenizer.vocab_size == model.vocab_size
 ```
 
-The exact final release SHA must independently pass the same repository CI gate before `main` advances.
+must hold before text/token serving begins.
 
-## Example
+### Ownership
 
-`examples/16_multiprocess_transport.py` demonstrates:
+Loaded runtime parameters must not alias mutable loader/checkpoint containers in a way that allows external mutation to change serving state unexpectedly.
+
+### Rank identity
+
+Every v1.2 worker rank serving the same engine must report the same validated model artifact identity and tokenizer compatibility identity.
+
+### Semantic equivalence
+
+Exporting the deterministic v1.1 TinyDecoder model into the educational artifact format, then loading it through v1.2, must reproduce the same deterministic token outputs under equivalent serving configuration.
+
+### Failure-before-serving
+
+Malformed/incompatible artifacts fail startup before Scheduler admission or request execution.
+
+## Preferred modules
+
+Possible readable layout:
 
 ```text
-parent PID
-→ child rank PIDs
-→ request submit
-→ IPC model/cache execution
-→ committed token stream
-→ public transport/attention/compile observations
-→ aclose()
-→ workers alive = false
+mini_vllm/artifacts/
+├─ types.py
+├─ loader.py
+├─ manifest.py
+├─ weights.py
+└─ tokenizer.py
+
+mini_vllm/model/
+└─ factory.py
+
+mini_vllm/versions/v1_2/
+└─ engine.py
 ```
 
-## Files added
+Keep parsing/validation separate from model construction and separate again from serving execution.
 
-- `mini_vllm/multiprocess/protocol.py`
-- `mini_vllm/multiprocess/executor.py`
-- `mini_vllm/multiprocess/__init__.py`
-- `mini_vllm/versions/v1_1/engine.py`
-- `mini_vllm/versions/v1_1/__init__.py`
-- `tests/test_multiprocess_runtime.py`
-- `examples/16_multiprocess_transport.py`
+## Tests required
 
-## Important files updated
+### Valid artifact
 
-- `mini_vllm/runtime.py`
-- `mini_vllm/observability.py`
-- `mini_vllm/versions/__init__.py`
-- `mini_vllm/__init__.py`
-- `scripts/check.sh`
-- `tests/test_v1_version.py`
-- `README.md`
-- `Agents.md`
-- `Plan.md`
-- `docs/ARCHITECTURE.md`
-- `docs/INVARIANTS.md`
-- `docs/ROADMAP.md`
-- `docs/EXERCISES.md`
-- `version.md`
+- export/build a deterministic tiny model artifact in a temporary directory;
+- parse manifest;
+- load all weights;
+- tokenizer encodes/decodes supported text;
+- v1.2 output equals v1.1 reference output.
 
-## Acceptance evidence
+### Manifest failures
 
-- real `multiprocessing.Process` owns each serving Worker/model/cache: implemented and PID-tested;
-- parent does not directly invoke child Worker: implemented via `WorkerSpec` + commands;
-- explicit serializable command/result protocol: implemented and pickle-tested;
-- ordinary execution over IPC: implemented;
-- prefix/cache lifecycle over IPC: implemented;
-- checkpoint/rollback and speculative execution over IPC: implemented;
-- child-reported errors cannot silently commit logical state: structured response + rollback contract;
-- unexpected worker death: explicit `WorkerProcessDied` path;
-- normal shutdown joins workers: tested;
-- world-size 1/2 deterministic output equals v1.0: tested;
-- public snapshot exposes transport state without physical handles: implemented;
-- v0.1–v1.0 regression suite: preserved in first full CI candidate;
-- example 16: included in release check script;
-- final release requirement: exact final implementation commit must pass GitHub Actions before `main` moves.
+- missing config field;
+- unsupported artifact version;
+- invalid head/model dimensions;
+- missing weights file;
+- missing tokenizer file.
+
+### Weight failures
+
+- missing required tensor;
+- unexpected tensor;
+- wrong shape;
+- unsupported dtype;
+- non-tensor entry rejected;
+- duplicate mapping impossible/rejected.
+
+### Tokenizer failures
+
+- tokenizer/model vocabulary mismatch;
+- unknown token policy deterministic;
+- invalid token ID rejected;
+- malformed special-token metadata.
+
+### Ownership
+
+- mutate/delete loader-side tensor container after successful load and prove runtime output is unchanged;
+- prove model parameters are runtime-owned copies under the chosen contract.
+
+### Multiprocess consistency
+
+- world-size 1 and 2 load the same artifact identity;
+- rank identity disagreement prevents readiness;
+- child loading failure surfaces as startup failure with no orphan workers;
+- normal close still reaps all workers.
+
+### Regression
+
+All v0.1–v1.1 tests and examples 01–16 remain green.
+
+## Integrated example target
+
+Add an executable walkthrough such as `examples/17_model_loading.py`:
+
+```text
+create/export tiny artifact
+        ↓
+inspect manifest + identity
+        ↓
+load tokenizer
+        ↓
+create v1.2 engine from artifact
+        ↓
+encode text
+        ↓
+serve through multiprocessing runtime
+        ↓
+decode output token IDs
+        ↓
+show model/tokenizer identity in snapshot
+        ↓
+clean shutdown
+```
+
+## Acceptance criteria
+
+- external local model directory is parsed through a versioned manifest;
+- malformed/incompatible manifests fail before serving;
+- required weight names/shapes are validated completely;
+- runtime parameters are populated from validated external tensors without silent missing/extra tensors;
+- a readable tokenizer artifact supports deterministic encode/decode;
+- tokenizer/model vocabulary compatibility is enforced;
+- token-ID-native serving core remains unchanged in responsibility;
+- v1.2 model loading works through the v1.1 multiprocessing boundary;
+- every worker rank agrees on the same artifact identity before readiness;
+- loaded artifact output is deterministic and equivalent to the exported v1.1 reference model;
+- public observability exposes artifact/tokenizer identity without physical storage handles;
+- child load failure leaves no orphan processes;
+- v0.1–v1.1 regression tests remain green;
+- examples 01–16 remain green plus a v1.2 model-loading walkthrough;
+- exact release candidate passes repository CI before `main` advances.
 
 ## Non-goals
 
-- multi-node networking;
-- NCCL/Gloo production collectives;
-- shared-memory optimized tensor transport;
-- GPU process isolation or CUDA IPC;
-- throughput-oriented process pools;
-- automatic elastic worker replacement;
-- OpenAI-compatible HTTP serving;
-- production model/tokenizer loading;
-- Triton/CUDA PagedAttention kernels;
-- remote/disaggregated KV cache.
+- Hugging Face Hub/network downloads;
+- authentication/token management;
+- arbitrary remote code/custom model classes;
+- full `transformers` tokenizer compatibility;
+- safetensors/multiple checkpoint formats unless needed after the reference format works;
+- quantized checkpoint formats;
+- tensor/pipeline parallel checkpoint sharding;
+- model hot swapping while requests are active;
+- LoRA/adapters;
+- production model registry/cache eviction;
+- GPU weight streaming;
+- CUDA/Triton kernel work.
 
 ## Learning goal
 
-By v1.1 a reader should be able to explain why a clean Python abstraction is not yet a distributed-systems boundary: once a Worker lives in another process, serialization, correlation, acknowledgment, transaction repair, process health and cleanup become part of correctness.
-
-## Next direction
-
-The preferred next distinct learning target is production-style model/tokenizer loading: turn external model artifacts into validated runtime-owned weights while keeping artifact identity/configuration separate from serving execution state. That belongs in a later version, not in the v1.1 transport mechanism.
+By v1.2 a reader should be able to explain the boundary between untrusted/external model artifacts and trusted runtime state: metadata must be parsed, tensor coverage and shapes validated, tokenizer compatibility proven, rank identity agreed, and only then may the existing serving runtime admit requests.
