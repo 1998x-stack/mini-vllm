@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
+from mini_vllm.artifacts.types import ModelArtifactSpec
 from mini_vllm.attention import PagedAttentionConfig
 from mini_vllm.compile_runtime import CompileConfig
 from mini_vllm.config import CacheConfig, TinyModelConfig
@@ -19,6 +20,7 @@ class WorkerSpec:
     cache_config: CacheConfig
     compile_config: CompileConfig
     attention_config: PagedAttentionConfig
+    artifact_spec: ModelArtifactSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +106,9 @@ class WorkerExecutionObservation:
     compile_cache_misses: int
     compile_fallbacks: int
     eager_projection_calls: int
+    artifact_identity: str | None = None
+    tokenizer_identity: str | None = None
+    artifact_architecture: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

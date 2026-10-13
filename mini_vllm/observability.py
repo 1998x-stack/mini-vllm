@@ -66,6 +66,9 @@ class RankExecutionSnapshot:
     transport_commands_completed: int = 0
     remote_errors: int = 0
     transport_failures: int = 0
+    artifact_identity: str | None = None
+    tokenizer_identity: str | None = None
+    artifact_architecture: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +83,20 @@ class ExecutionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelArtifactSnapshot:
+    identity: str
+    architecture: str
+    format_version: int
+    tokenizer_identity: str
+    tokenizer_compatibility_id: str
+    vocab_size: int
+    weight_dtype: str
+    runtime_dtype: str
+    device: str
+    rank_identity_agreement: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeSnapshot:
     version: str
     next_step: int
@@ -91,6 +108,7 @@ class RuntimeSnapshot:
     preemption_events: int = 0
     last_step: EngineStepOutput | None = None
     recent_steps: tuple[EngineStepOutput, ...] = ()
+    model_artifact: ModelArtifactSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)

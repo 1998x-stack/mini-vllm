@@ -14,11 +14,12 @@ if TYPE_CHECKING:
 
 
 def create_engine(
-    version: str = "v1.1",
+    version: str = "v1.2",
     *,
     runtime_config: RuntimeConfig | None = None,
     engine_config: EngineConfig | None = None,
     model_config: TinyModelConfig | None = None,
+    model_artifact: str | None = None,
     cache_config: CacheConfig | None = None,
     draft_provider: DraftProvider | None = None,
     max_speculative_tokens: int | None = None,
@@ -32,13 +33,18 @@ def create_engine(
     normalized = version.lower().replace("_", ".")
     is_v10 = normalized in {"v1.0", "1.0"}
     is_v11 = normalized in {"v1.1", "1.1"}
-    is_v1 = is_v10 or is_v11
+    is_v12 = normalized in {"v1.2", "1.2"}
+    is_v1 = is_v10 or is_v11 or is_v12
     if runtime_config is not None and not is_v1:
         raise ValueError("runtime_config is only supported by v1.0+")
-    if multiprocess_config is not None and not is_v11:
+    if runtime_config is not None and runtime_config.model_artifact is not None and not is_v12:
+        raise ValueError("RuntimeConfig.model_artifact is only supported by v1.2+")
+    if model_artifact is not None and not is_v12:
+        raise ValueError("model_artifact is only supported by v1.2+")
+    if multiprocess_config is not None and not (is_v11 or is_v12):
         raise ValueError("multiprocess_config is only supported by v1.1+")
     if fairness_bypass_limit is not None and normalized not in {
-        "v0.13", "0.13", "v1.0", "1.0", "v1.1", "1.1"
+        "v0.13", "0.13", "v1.0", "1.0", "v1.1", "1.1", "v1.2", "1.2"
     }:
         raise ValueError("fairness_bypass_limit is only supported by v0.13+")
 
@@ -177,6 +183,24 @@ def create_engine(
         return build(
             runtime_config=runtime_config,
             **kwargs,
+            draft_provider=draft_provider,
+            max_speculative_tokens=max_speculative_tokens,
+            world_size=world_size,
+            max_queue_size=max_queue_size,
+            compile_config=compile_config,
+            attention_config=attention_config,
+            fairness_bypass_limit=fairness_bypass_limit,
+            multiprocess_config=multiprocess_config,
+        )
+
+    if is_v12:
+        from mini_vllm.versions.v1_2 import create_engine as build
+        return build(
+            runtime_config=runtime_config,
+            engine_config=engine_config,
+            model_config=model_config,
+            model_artifact=model_artifact,
+            cache_config=cache_config,
             draft_provider=draft_provider,
             max_speculative_tokens=max_speculative_tokens,
             world_size=world_size,

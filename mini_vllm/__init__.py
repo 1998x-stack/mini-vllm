@@ -1,5 +1,19 @@
 """mini-vLLM: a deliberately small LLM serving runtime for learning."""
 
+from mini_vllm.artifacts import (
+    ARTIFACT_ARCHITECTURE,
+    ARTIFACT_FORMAT_VERSION,
+    ArtifactValidationError,
+    ModelArtifactIdentity,
+    ModelArtifactSpec,
+    TokenizerArtifact,
+    ValidatedModelArtifact,
+    WeightMapping,
+    WhitespaceTokenizer,
+    build_weight_mappings,
+    export_tiny_model_artifact,
+    load_model_artifact,
+)
 from mini_vllm.async_runtime import (
     AsyncEngine,
     AsyncRequestHandle,
@@ -44,9 +58,11 @@ from mini_vllm.multiprocess import (
     WorkerTransportError,
     WorkerTransportTimeout,
 )
+from mini_vllm.artifacts.executor import ArtifactMultiprocessExecutor
 from mini_vllm.observability import (
     AsyncRuntimeSnapshot,
     ExecutionSnapshot,
+    ModelArtifactSnapshot,
     RankExecutionSnapshot,
     RequestSnapshot,
     RuntimeSnapshot,
@@ -64,6 +80,11 @@ from mini_vllm.speculative import DraftProvider, IncrementDraftProvider, Scripte
 from mini_vllm.versions import create_engine
 
 __all__ = [
+    "ARTIFACT_ARCHITECTURE", "ARTIFACT_FORMAT_VERSION",
+    "ArtifactValidationError", "ModelArtifactIdentity", "ModelArtifactSpec",
+    "TokenizerArtifact", "ValidatedModelArtifact", "WeightMapping",
+    "WhitespaceTokenizer", "build_weight_mappings", "export_tiny_model_artifact",
+    "load_model_artifact", "ArtifactMultiprocessExecutor",
     "CacheConfig", "EngineConfig", "TinyModelConfig", "RuntimeConfig",
     "MultiprocessConfig",
     "Request", "RequestStatus", "SamplingParams", "PrefixReuseHint",
@@ -82,8 +103,8 @@ __all__ = [
     "AdmissionCost", "PrefixAwareBudgetedScheduler", "PrefixSchedulingEvent",
     "PrefixSchedulingStats",
     "RequestSnapshot", "SchedulingObservation", "SchedulerSnapshot",
-    "RankExecutionSnapshot", "ExecutionSnapshot", "RuntimeSnapshot",
-    "AsyncRuntimeSnapshot", "create_engine",
+    "RankExecutionSnapshot", "ExecutionSnapshot", "ModelArtifactSnapshot",
+    "RuntimeSnapshot", "AsyncRuntimeSnapshot", "create_engine",
 ]
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

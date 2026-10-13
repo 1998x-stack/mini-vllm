@@ -1,6 +1,6 @@
 # mini-vLLM — Architecture-Driven Development Plan
 
-`main` is always the newest validated runtime. Version branches are educational snapshots. Exact release commits must pass repository CI.
+`main` is always the newest exact-CI-validated runtime. Version branches are educational snapshots. Exact release commits must pass repository CI.
 
 ## Version ladder
 
@@ -19,151 +19,164 @@ v0.11 compile-aware execution
 v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
 v1.0  integrated educational runtime                  frozen
-v1.1  real multiprocessing executor transport         current
+v1.1  real multiprocessing executor transport         frozen
+v1.2  model artifact + tokenizer loading boundary     current
 ```
 
-## v1.1 learning target
+## v1.2 learning target
 
-v1.0 proved that all serving mechanisms can coexist behind clean logical ownership boundaries. v1.1 asks the next systems question: what changes when the Executor/Worker boundary becomes a real OS isolation boundary?
+v1.1 made execution physically real. v1.2 makes model startup explicit: external local files are data to validate, not objects the serving runtime may blindly trust.
 
 ```text
-parent process
-EngineCore / Scheduler
-        ↓
-MultiprocessExecutor
-        ↓ explicit serializable IPC
-child process per logical rank
-Worker + ModelRunner + KV
-        ↓ acknowledged result / structured error
-parent gather / logical commit
+model directory
+    ↓
+ArtifactLoader
+    ↓
+ValidatedModelArtifact + stable identity
+    ↓
+RuntimeModelFactory
+    ↓ copy
+runtime-owned TinyDecoderLM parameters
+    ↓
+worker readiness / cross-rank identity agreement
+    ↓
+existing v1.1 serving path
 ```
 
-This version is about transport, ownership, lifecycle and failure isolation. It is not a throughput claim and it does not introduce a new scheduling, KV, speculative or attention algorithm.
+This release introduces no new scheduling, KV, speculative, attention or IPC algorithm.
 
-## New mechanism
+## Implemented mechanism
 
-### 1. Explicit transport protocol
+### Versioned local artifact
 
-Transport uses a fixed command/result vocabulary and monotonically increasing correlation IDs. Commands move only logical serializable values: request IDs, token IDs, positions, transport-safe checkpoint handles, copied tensor payloads and observations.
-
-The parent must never treat a live child `Worker`, cache backend, block table, model runner or tensor storage as a local object.
-
-### 2. Process-owned physical state
-
-Each child constructs its own:
+The reference format is intentionally small:
 
 ```text
-RankConfig
-TinyDecoderLM
-TransactionalPrefixCachingPagedKVCache
-CompileAwareVocabParallelTinyRunner
-Worker
+model_config.json
+weights.pt
+tokenizer.json
 ```
 
-The parent owns only `WorkerSpec`, IPC endpoints and logical runtime state.
+`model_config.json` declares exact format version, architecture, weight dtype, tokenizer compatibility ID and TinyModel dimensions. Unknown/missing fields and unsupported versions fail explicitly.
 
-### 3. Remote checkpoint/rollback
+### Stable identity
 
-Ordinary execution crosses a transaction boundary too:
+`ModelArtifactIdentity` combines logical digests for model metadata, checkpoint contents and tokenizer metadata. A path is never treated as identity.
+
+### Explicit weight contract
+
+`build_weight_mappings()` derives the complete expected runtime `state_dict` surface and records external name, runtime name, shape and dtype. Loading rejects:
 
 ```text
-checkpoint every participating request/rank
-        ↓
-execute remote model work
-        ↓
-all rank results acknowledged?
-  yes → gather → commit checkpoints → EngineCore may commit
-  no  → rollback reachable checkpoints → no logical commit
+missing required name
+unexpected name
+shape mismatch
+dtype mismatch
+non-tensor entry
 ```
 
-Speculative decoding reuses the existing v0.7 logical contract; the difference is that the real cache checkpoint stays in the child and the parent carries only a `CheckpointHandle`.
+No required weight is silently initialized and no extra tensor is silently ignored.
 
-### 4. Worker lifecycle and health
+### Runtime-owned copy
 
-A remote worker moves through explicit lifecycle states around startup/readiness, normal operation, death and shutdown. Parent-side transport distinguishes:
+`build_model_from_artifact()` constructs a new runtime module and copies validated source tensors into its state under `torch.no_grad()`. Serving does not depend on retaining the loader checkpoint dictionary.
 
-- child-reported runtime/model errors;
-- correlation/protocol failures;
-- command timeout;
-- unexpected EOF/process death;
-- clean shutdown.
+### Readable tokenizer
 
-A child-reported error can leave the worker healthy after successful rollback. Unknown physical state cannot: the executor becomes unhealthy and refuses further logical progress.
+The v1.2 reference tokenizer is deterministic whitespace tokenization with an explicit vocabulary and `unk` token. The model/tokenizer vocabulary sizes and compatibility IDs must agree before readiness.
 
-### 5. Explicit cleanup
+The serving core remains token-ID native. `encode`, `decode` and `submit_text` are convenience methods above the core boundary.
 
-v1.1 introduces engine cleanup because child processes are owned resources:
+### Child-independent model load
+
+Parent construction validates the artifact first and passes a serializable `ModelArtifactSpec` containing path, validated identity and model facts. Every child process independently:
+
+1. re-reads the local files;
+2. re-computes identity;
+3. rejects changed/incompatible bytes;
+4. constructs a runtime model;
+5. copies weights;
+6. reports artifact/tokenizer identity in the readiness observation.
+
+`ArtifactMultiprocessExecutor` becomes healthy only after all ranks agree with the parent-validated identity. If one rank fails startup, already-created workers are shut down/reaped.
+
+### Default builder without a bypass
+
+When no `model_artifact` path is supplied, v1.2 exports the deterministic teaching model to a temporary artifact directory and then uses the same validation + child reload path. Close/aclose removes that owned temporary directory after workers stop.
+
+## Public API
 
 ```python
-engine.close()
-await engine.aclose()
+engine = create_engine("v1.2", model_artifact="./model_dir")
+ids = engine.encode("tok1 tok2")
+handle = engine.submit_text("r", "tok1 tok2", max_new_tokens=4)
 ```
 
-Normal close sends `shutdown`, joins children, and uses terminate only as cleanup fallback. Tests prove worker processes are not left alive.
+`create_engine()` now defaults to v1.2. `RuntimeConfig.model_artifact` provides the same path-based construction surface. Explicit v1.0/v1.1 builders remain historical references.
 
-## Public construction
+## Observability
 
-`create_engine()` defaults to v1.1. `RuntimeConfig` retains all v1.0 fields and adds `MultiprocessConfig`:
+`engine.snapshot()` adds `ModelArtifactSnapshot` and rank-level fields for:
 
-```text
-start_method
-command_timeout_s
-shutdown_timeout_s
-```
+- artifact identity;
+- tokenizer identity;
+- architecture;
+- format version;
+- vocabulary size;
+- artifact dtype versus runtime dtype/device;
+- rank identity agreement.
 
-Explicit `create_engine("v1.0")` remains the in-process integration reference. Historical v0.x builders remain frozen.
+Observation remains copy/read-only and does not expose checkpoint dictionaries or parameter storage handles.
 
-## Public observability
+## Correctness contract
 
-`engine.snapshot()` remains the single teaching surface. v1.1 extends execution observations with:
+v1.2 adds these release-level rules:
 
-- parent/child boundary type;
-- child PID;
-- worker lifecycle state;
-- serving commands sent/completed;
-- remote-error count;
-- transport-failure count.
+1. filesystem presence is not artifact validity;
+2. schema/version validation precedes model construction;
+3. tokenizer/model compatibility precedes readiness;
+4. required tensor coverage is exact;
+5. tensor shape and dtype are validated before copy;
+6. runtime parameters own their copied values;
+7. parent artifact identity is re-proven independently by every child;
+8. changed files between parent validation and child startup fail readiness;
+9. a failed child load leaves no orphan processes;
+10. no request is admitted before all workers are ready;
+11. loaded deterministic v1.2 output equals the exported v1.1 model for world sizes 1 and 2.
 
-Pure snapshot/cache-stat reads do not increment serving-command counters. Therefore repeated snapshots with no intervening serving action remain equal.
+All earlier logical/KV/speculation/transport invariants remain active.
 
-## Cross-process correctness contract
+## Validation evidence
 
-In addition to the v1.0 invariants in `docs/INVARIANTS.md`, v1.1 requires:
+`tests/test_model_artifacts.py` covers:
 
-1. logical commit requires an acknowledged successful physical result;
-2. correlation IDs must match before a result is accepted;
-3. IPC carries copies/logical handles, never live physical ownership objects;
-4. child-reported errors are distinct from process/transport failures;
-5. remote checkpoint identity remains child-owned;
-6. rollback must be attempted on every reachable participating rank after failed execution;
-7. if complete physical consistency cannot be proven, the executor is unhealthy;
-8. unexpected worker death is surfaced explicitly as `WorkerProcessDied`;
-9. shutdown joins every child process;
-10. deterministic world-size 1 and 2 output equals v1.0 under equivalent configuration.
+- deterministic artifact/tokenizer identity;
+- manifest/version/missing-file errors;
+- vocabulary and special-token errors;
+- missing/unexpected/shape/dtype/non-tensor checkpoint errors;
+- runtime-owned parameter copies;
+- v1.1↔v1.2 deterministic equivalence at world sizes 1 and 2;
+- token-native `submit_text` facade;
+- pre-start rank identity disagreement;
+- child-side changed-artifact startup failure and cleanup;
+- default temporary artifact lifecycle.
 
-## Validation
+Historical multiprocessing tests remain pinned to explicit v1.1 construction.
 
-`tests/test_multiprocess_runtime.py` proves:
+`examples/17_model_loading.py` performs export → validate → text encode → two-process serving → decode → public identity inspection → clean shutdown.
 
-- protocol dataclasses are pickle-serializable;
-- workers have real child PIDs distinct from the parent;
-- default v1.1 construction uses the process boundary;
-- snapshot remains read-only;
-- world-size 1 and 2 outputs match v1.0;
-- speculative execution crosses IPC;
-- prefix reuse/cache lifecycle crosses IPC;
-- child-reported errors remain structured and do not kill healthy workers;
-- unexpected child death is explicitly detected;
-- close joins/reaps child processes.
-
-`examples/16_multiprocess_transport.py` shows parent PID → command transport → child worker PIDs → committed output → public transport observations → clean shutdown.
-
-The first implementation candidate passed 91 pytest tests plus examples 01–16. The final exact release SHA must independently pass the same gate.
+The first green v1.2 implementation tree passed **101 pytest tests** plus examples 01–17. The final frozen tree and the cleaned release SHA must each independently pass the repository gate.
 
 ## Release rule
 
-Only the exact v1.1 implementation commit with green repository CI may advance `main`. Before release, branch history is reduced to the planning commit plus one implementation commit so the learning diff remains inspectable.
+Before `main` advances:
 
-## After v1.1
+1. docs and implementation must agree;
+2. full frozen tree must pass CI;
+3. WIP history is reduced to the existing v1.2 planning commit plus one implementation commit;
+4. that exact cleaned implementation SHA must pass CI;
+5. `main` fast-forwards to exactly that SHA.
 
-The next version must again have a genuinely new learning target. Production-style model/tokenizer loading is a strong candidate because it introduces another ownership boundary—external model artifacts → validated runtime weights—without conflating transport work with GPU-kernel optimization.
+## After v1.2
+
+The next branch must introduce a distinct systems boundary rather than adding more checkpoint formats. A natural next target is a **network serving/API boundary**: request protocol, server lifecycle, admission/backpressure at the socket/API edge, readiness/health endpoints and disconnect semantics. Real CUDA/Triton kernels remain an independent later optimization line.

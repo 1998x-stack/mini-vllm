@@ -26,12 +26,7 @@ class MultiprocessConfig:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    """Stable v1 construction facade for the integrated educational runtime.
-
-    Internal storage structures stay hidden. The facade exposes only the
-    serving and transport knobs a learner should reason about when constructing
-    the runtime.
-    """
+    """Stable v1 construction facade for the integrated educational runtime."""
 
     engine: EngineConfig = field(default_factory=EngineConfig)
     model: TinyModelConfig = field(default_factory=TinyModelConfig)
@@ -39,14 +34,19 @@ class RuntimeConfig:
     compile: CompileConfig = field(default_factory=CompileConfig)
     attention: PagedAttentionConfig = field(default_factory=PagedAttentionConfig)
     multiprocess: MultiprocessConfig = field(default_factory=MultiprocessConfig)
+    model_artifact: str | None = None
     world_size: int = 2
     max_queue_size: int = 8
     fairness_bypass_limit: int = 2
 
     def __post_init__(self) -> None:
+        if self.model_artifact is not None and not self.model_artifact:
+            raise ValueError("model_artifact must be a non-empty path when provided")
         if self.world_size <= 0:
             raise ValueError("world_size must be > 0")
-        if self.world_size > self.model.vocab_size:
+        # When an external artifact is configured its validated manifest becomes
+        # authoritative for vocabulary size in the v1.2 builder.
+        if self.model_artifact is None and self.world_size > self.model.vocab_size:
             raise ValueError("world_size cannot exceed vocabulary size")
         if self.max_queue_size <= 0:
             raise ValueError("max_queue_size must be > 0")

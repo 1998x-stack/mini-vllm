@@ -15,8 +15,9 @@
 | v0.11 | compile-aware rank-local tensor execution | frozen |
 | v0.12 | reference + vectorized PagedAttention | frozen |
 | v0.13 | prefix-aware scheduling / cache-aware admission | frozen |
-| v1.0 | integrated public API + observability + end-to-end runtime | frozen |
-| v1.1 | real multiprocessing Executor/Worker transport | current implementation / exact-CI release rule |
+| v1.0 | integrated public API + observability | frozen |
+| v1.1 | real multiprocessing Executor/Worker transport | frozen |
+| v1.2 | model artifact + tokenizer loading boundary | current implementation / exact-CI release rule |
 
 Dependency order:
 
@@ -35,8 +36,9 @@ serving semantics
 → cache-aware policy
 → integrated runtime
 → real OS process isolation / IPC
+→ validated external model + tokenizer ingestion
 ```
 
-v1.1 intentionally stops at one-machine multiprocessing. It does not claim multi-node transport, NCCL, CUDA IPC, shared-memory tensor transport, or throughput improvement.
+v1.2 intentionally supports one local educational model format. It does not add Hub downloads, arbitrary model code, safetensors/sharded formats, quantization, LoRA, hot swap or GPU weight streaming. Adding more checkpoint formats alone is not enough reason for a new version.
 
-After v1.1, a new branch again requires a genuinely new learning target. The preferred next direction is production-style model/tokenizer loading: validating external model artifacts, mapping weights into runtime-owned modules, tokenizer/model compatibility, and separating artifact identity from serving execution state. Real CUDA/Triton kernels remain a later independent learning line.
+A strong next systems boundary is **network serving/API lifecycle**: request serialization at the socket/API edge, server startup/readiness, client disconnect/cancellation, bounded ingress/backpressure and health/readiness observations. Real CUDA/Triton kernels remain an independent later optimization line.

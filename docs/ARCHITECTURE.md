@@ -1,389 +1,306 @@
-# mini-vLLM Architecture — v1.1
+# mini-vLLM Architecture — v1.2
 
-## Integrated serving stack
+## Complete startup + serving stack
 
-v1.1 keeps the v1.0 policy stack in the parent process and moves rank-local execution/storage into real child processes.
-
-```text
-PARENT PROCESS
-
-caller
-  ↓
-MultiprocessAsyncEngine
-  │ submit / stream / cancel / backpressure
-  ▼
-MultiprocessIntegratedEngine
-  │ EngineCore logical truth / atomic step / commit authority
-  ▼
-PrefixAwareBudgetedScheduler
-  │ admission / token budget / fairness / preemption victim
-  ▼
-MultiprocessExecutor
-  │ correlation / IPC / health / rollback coordination
-  ├──────────────────────┬──────────────────────┐
-  │ serialized commands  │                      │
-  ▼                      ▼                      ▼
-CHILD rank 0         CHILD rank 1          CHILD rank N
-Worker               Worker                Worker
-  ↓                    ↓                     ↓
-ModelRunner          ModelRunner           ModelRunner
-  ↓                    ↓                     ↓
-TinyDecoderLM        TinyDecoderLM         TinyDecoderLM
-  ├─ local KV          ├─ local KV           ├─ local KV
-  ├─ PagedAttention    ├─ PagedAttention     ├─ PagedAttention
-  └─ compile cache     └─ compile cache      └─ compile cache
-  │                    │                     │
-  └──── copied rank-local result / error ────┘
-                       ↓
-              ReferenceCollective gather
-                       ↓
-              EngineCore logical commit
-                       ↓
-              committed async events
-```
-
-The Transformer trunk and KV remain replicated across logical ranks, as in v0.9/v1.0. The new mechanism is process isolation and transport, not a new tensor-parallel algorithm.
-
-## Ownership map
-
-### Parent: Async boundary
-
-`MultiprocessAsyncEngine` owns caller handles, pending submissions, cancellation intent, bounded event queues and child-process cleanup entry points. `close()` is synchronous and requires an idle driver; `aclose()` waits for idle before shutting workers down.
-
-### Parent: EngineCore boundary
-
-`MultiprocessIntegratedEngine` owns all logical request truth:
-
-- request registration/status;
-- `num_computed_tokens` logical frontier;
-- Scheduler reconciliation;
-- preemption state transitions;
-- speculative logical acceptance;
-- final `EngineStepOutput` commit.
-
-It does not own child cache tensors or execute rank-local model code.
-
-### Parent: Scheduler boundary
-
-`PrefixAwareBudgetedScheduler` is unchanged. It owns admission, work budget, fairness and preemption-victim policy. Multiprocessing does not make process/PID/IPC health a scheduling cost signal.
-
-### Parent: MultiprocessExecutor boundary
-
-`MultiprocessExecutor` owns transport orchestration:
-
-- start method and child creation;
-- startup/readiness handshake;
-- monotonically increasing correlation IDs;
-- command/response matching;
-- one-process-per-rank coordination;
-- parent-side collective gather;
-- remote transaction coordination;
-- timeout/EOF/death detection;
-- lifecycle/health observations;
-- shutdown/join.
-
-It owns no admission policy and no physical KV structures.
-
-### Child: Worker boundary
-
-Each child constructs its own rank-local execution stack from a serializable `WorkerSpec`:
+v1.2 adds a model-ingestion boundary before the validated v1.1 multiprocessing serving stack.
 
 ```text
-WorkerSpec
-  ↓ child startup
-RankConfig
-TinyDecoderLM
-TransactionalPrefixCachingPagedKVCache
-CompileAwareVocabParallelTinyRunner
-Worker
-```
-
-Only that child owns its live `Worker`, model, KV cache, block tables, refcounts, prefix-index residency and compile cache.
-
-### Cache / attention / compile boundaries
-
-Within a child, all pre-v1.1 storage and compute invariants remain unchanged:
-
-```text
-logical_block = position // block_size
-block_offset  = position % block_size
-physical      = block_table[logical_block]
-```
-
-`VectorizedPagedAttention` reads the child-local logical KV view. `CompiledKernelCache` specializes child/rank-local vocabulary projection. Neither gains transport ownership.
-
-## IPC protocol
-
-The wire vocabulary is explicit rather than arbitrary remote method invocation. Supported command families include:
-
-```text
-ESTIMATE_PREFIX_REUSE
-PREPARE_REQUEST
-ENSURE_CAPACITY
-EXECUTE
-EXECUTE_SPECULATIVE
-COMMIT_WORK
-CHECKPOINT
-ROLLBACK
-COMMIT_CHECKPOINT
-FREE
-CACHE_STATS
-SNAPSHOT_EXECUTION
-SHUTDOWN
-```
-
-Each request is represented as:
-
-```text
-TransportCommand
-├─ correlation_id
-├─ operation
-└─ serializable payload
-```
-
-Each reply is:
-
-```text
-TransportResponse
-├─ correlation_id
-├─ ok
-├─ payload
-├─ error_type
-└─ error_message
-```
-
-The parent accepts a response only when its correlation ID matches the outstanding command.
-
-## Tensor transfer
-
-Rank-local logits are converted in the child into an explicit `TensorPayload`:
-
-```text
-shape
-dtype
-flat CPU values
-```
-
-The parent reconstructs a fresh tensor before collective gathering. This is intentionally simple and copy-based. v1.1 does not teach shared-memory tensor transport, CUDA IPC or zero-copy transfer.
-
-## Checkpoint handles
-
-Real cache checkpoints remain child-owned. A child stores its actual `CacheCheckpoint` in a private registry and returns only:
-
-```text
-CheckpointHandle
-├─ checkpoint_id
-├─ request_id
-└─ num_tokens
-```
-
-The parent aggregates one handle per rank into `MultiprocessCacheCheckpoint`. A handle is a transaction identity, not a block-table or storage ownership capability.
-
-## Ordinary execution atomicity
-
-In v1.0, `WorkerGroup` checkpointed rank-local state in process. v1.1 performs the same logical transaction over IPC.
-
-```text
-EngineCore work items
-      ↓
-checkpoint request frontier on every child rank
-      ↓
-all checkpoint handles acknowledged
-      ↓
-EXECUTE on rank 0 ... rank N
-      ↓
-all successful results acknowledged and validated
-      ↓
-parent all-gather rank-local logits
-      ↓
-commit remote checkpoints
-      ↓
-return ExecutionResult to EngineCore
-      ↓
-logical request state may advance
-```
-
-If execution fails before logical commit:
-
-```text
-failure
-  ↓
-attempt rollback on every reachable checkpointed rank/request
-  ↓
-rollback fully provable?
-  ├─ yes → surface original failure; no logical commit
-  └─ no  → executor unhealthy; no logical commit
-```
-
-A send operation alone never authorizes logical commit.
-
-## Speculative execution
-
-The outer v0.7 transaction contract is preserved:
-
-```text
-EngineCore checkpoint()
-      ↓
-child-owned checkpoint handles
-      ↓
-EXECUTE_SPECULATIVE across ranks
-      ↓
-parent gathers verification logits
-      ↓
-accept/reject candidates
-      ↓
-ROLLBACK(handle, retain_tokens)
-      ↓
-only accepted logical tokens become visible
-```
-
-Rejected KV stays child-local and is discarded before the corresponding logical candidate is committed.
-
-## Prefix/cache lifecycle over IPC
-
-The cache remains policy-safe despite process isolation:
-
-```text
-parent Scheduler wants estimate
+EXTERNAL LOCAL FILES
+model_config.json / weights.pt / tokenizer.json
         ↓
-ESTIMATE_PREFIX_REUSE
+ArtifactLoader
+├─ exact schema/version validation
+├─ model-dimension validation
+├─ tokenizer compatibility validation
+├─ complete tensor manifest validation
+└─ stable artifact identity
         ↓
-child computes side-effect-free PrefixReuseHint
+ValidatedModelArtifact
         ↓
-parent admission policy
+parent creates serializable ModelArtifactSpec
         ↓
-PREPARE_REQUEST only after admission
-        ↓
-child performs authoritative prefix attach
-        ↓
-actual reusable frontier returned / reconciled
+ArtifactMultiprocessExecutor
+        ├───────────────┬───────────────┐
+        ↓               ↓               ↓
+child rank 0        child rank 1    child rank N
+re-validate files   re-validate     re-validate
+build model         build model     build model
+copy weights        copy weights    copy weights
+build KV/runner     build KV/runner build KV/runner
+        ↓               ↓               ↓
+ready(identity)     ready(identity)  ready(identity)
+        └───────────────┴───────────────┘
+                        ↓
+             all identities agree
+                        ↓
+PARENT SERVING STACK
+AsyncEngine → EngineCore → Scheduler → IPC execution
+                        ↓
+               committed async events
 ```
 
-Capacity, work publication, free and cache statistics use the same explicit boundary. Scheduler still never sees physical block IDs/refcounts.
-
-## Failure classes
-
-### Structured child error
-
-A child catches an ordinary model/cache/runtime exception and returns:
+There are now two independent trust/ownership boundaries:
 
 ```text
-ok = false
-error_type
-error_message
+external artifact truth  → validated/runtime-owned model truth
+parent logical truth     ↔ child physical execution truth
 ```
 
-The child process may remain alive. Parent rollback/repair determines whether the executor can remain healthy.
+Neither boundary may be collapsed into the other.
 
-### Protocol / correlation error
+## Artifact ownership
 
-A malformed response or wrong correlation ID makes the transport untrustworthy. It is not accepted as execution success.
+### External files
 
-### Timeout
+The model directory is external input. Filesystem existence, successful JSON parsing or successful `torch.load` does not establish compatibility.
 
-If no response arrives before the configured timeout, the parent cannot assume success. The transport is unhealthy unless consistency can be re-established—which v1.1 intentionally does not attempt.
+### ArtifactLoader
 
-### Unexpected process death
+The loader owns parsing and validation only. It produces immutable logical metadata (`ValidatedModelArtifact`, `ModelArtifactSpec`, `ModelArtifactIdentity`) and temporary checkpoint tensor containers used during validation/copy. It does not own a serving model, request or worker.
 
-If a worker exits or IPC closes unexpectedly, v1.1 surfaces `WorkerProcessDied`. Unknown child physical state means no logical commit and executor unhealthy.
-
-### Cancellation
-
-Cancellation remains an EngineCore/AsyncEngine lifecycle operation at atomic step boundaries. It sends normal release/free operations; it does not kill a healthy worker process.
-
-## Lifecycle
-
-Conceptually each child follows:
+The first format accepts exactly:
 
 ```text
-CREATED
-  ↓
-STARTING
-  ↓ readiness response
-READY
-  ↓ commands
-READY
-  ├─ structured remote error → may remain READY
-  ├─ transport uncertainty   → UNHEALTHY
-  └─ process exit            → DEAD
-  ↓ shutdown
-STOPPED
+model_config.json
+weights.pt
+tokenizer.json
 ```
 
-The parent joins every child during normal shutdown. If a child does not exit within the shutdown timeout, terminate is a final cleanup fallback.
+and one architecture identifier: `tiny-decoder-lm`.
 
-## Public observability
+### ModelArtifactIdentity
 
-The v1.0 public path is preserved:
+Identity is derived from:
 
 ```text
-engine.snapshot()
-      │
-      ├─ async state
-      ├─ request state
-      ├─ scheduler/admission observations
-      ├─ cache statistics
-      ├─ recent EngineStepOutput traces
-      └─ ExecutionSnapshot
-            └─ RankExecutionSnapshot[]
-                 ├─ rank/world size
-                 ├─ vocab range
-                 ├─ attention counters
-                 ├─ compile counters
-                 ├─ boundary = multiprocess-ipc
-                 ├─ process_id
-                 ├─ worker_state
-                 ├─ serving commands sent/completed
-                 ├─ remote errors
-                 └─ transport failures
+format version + architecture
+model metadata digest
+weights content/manifest digest
+tokenizer digest
 ```
 
-`CACHE_STATS` and `SNAPSHOT_EXECUTION` used by public observation are non-serving reads: they do not increment serving command counters. Therefore repeated snapshots with no intervening serving work remain equal.
+A filesystem path is location, not identity. Two ranks may read the same path only after independently proving the expected identity.
 
-## One request lifecycle
+## Manifest and tensor validation
+
+`model_config.json` declares the exact TinyModel configuration, artifact weight dtype and tokenizer compatibility ID. Unknown or missing fields are rejected.
+
+`build_weight_mappings()` creates the complete external-name → runtime-name contract from the runtime architecture:
 
 ```text
-submit in parent
-  ↓
-async pending
-  ↓
-EngineCore WAITING
-  ↓ side-effect-free remote prefix hint
-Scheduler admission
-  ↓ authoritative remote prepare
-RUNNING
-  ↓
-remote chunked prefill / decode
-  ↓
-acknowledged gathered logits
-  ↓
-normal or speculative logical decision
-  ↓
-committed EngineStepOutput
-  ↓
-TokenEvent delivery
-  ↓
-FINISHED / CANCELLED / ERROR
+WeightMapping
+├─ external_name
+├─ runtime_name
+├─ expected_shape
+└─ expected_dtype
 ```
 
-The caller never sees a token merely because a child computed something. External visibility begins only after EngineCore has committed it.
+For the v1.2 reference format names are intentionally identical, but the mapping remains explicit so file naming and runtime module ownership stay conceptually separate.
 
-## Logical versus physical versus transport truth
-
-v1.1 adds a third systems distinction to the earlier logical/physical separation:
+Accepted checkpoint state must satisfy set equality:
 
 ```text
-logical request truth           parent / EngineCore
-physical model + KV truth       child process
-transport evidence              IPC command/acknowledgment
+external tensor names == expected required tensor names
 ```
 
-Correctness requires all three to align before logical commit.
+Then every tensor must match shape and supported artifact dtype. Missing, unexpected, wrong-shape, wrong-dtype and non-tensor entries fail before runtime construction succeeds.
 
-## Stable correctness references
+`torch.load(..., weights_only=True)` is used for the local educational checkpoint. Arbitrary Python checkpoint code is outside the format contract.
 
-- deterministic v1.0 committed output is the v1.1 semantic oracle;
-- child-local paged addressing remains the KV oracle;
+## Runtime model factory
+
+The runtime never serves directly from a checkpoint dictionary.
+
+```text
+validated source tensor
+        ↓
+new TinyDecoderLM parameter target
+        ↓ target.copy_(source) under no_grad
+runtime-owned parameter storage
+```
+
+After copying, loader/checkpoint container lifetime is irrelevant to the model's parameter values. Device/runtime dtype conversion happens after the accepted float32 artifact state is copied.
+
+## Tokenizer boundary
+
+`WhitespaceTokenizer` is intentionally readable:
+
+```text
+text
+ ↓ split on Unicode whitespace
+vocabulary lookup
+ ↓ unknown → declared unk ID
+list[int]
+```
+
+Decode validates every ID is in range and joins vocabulary strings with spaces.
+
+Before readiness:
+
+```text
+tokenizer.compatibility_id == model.tokenizer_compatibility_id
+tokenizer.vocab_size        == model.vocab_size
+```
+
+The serving core remains token-native. Strings do not enter Scheduler, KV cache, WorkItem, ModelRunner or speculative contracts.
+
+## Parent validation versus child validation
+
+Parent validation establishes the artifact expected by one engine:
+
+```text
+parent load_model_artifact(path)
+        ↓
+ModelArtifactSpec(path, expected_identity, model_config, dtype, tokenizer ID)
+```
+
+Each worker child then independently calls the loader again with `expected_identity`.
+
+This catches a time-of-check/time-of-startup change:
+
+```text
+parent validates artifact A
+files change to artifact B
+child loads B
+identity B != expected A
+→ startup error
+→ no READY
+→ no request admission
+```
+
+The parent does not serialize a huge state dict through IPC in v1.2. Weight-distribution optimization is deliberately separate from artifact validation.
+
+## Worker readiness
+
+v1.1 readiness meant that the process/worker stack constructed successfully. v1.2 requires model-specific readiness:
+
+```text
+process started
++ local artifact readable
++ schema/version valid
++ tokenizer compatible
++ exact weight coverage valid
++ runtime parameter copy complete
++ reported artifact identity == parent expected
++ every rank reports same tokenizer identity
+= executor ready
+```
+
+If a later rank fails while earlier ranks are ready, `ArtifactMultiprocessExecutor` shuts down/reaps the already-created clients before surfacing startup failure.
+
+## Parent serving ownership
+
+After readiness, v1.2 reuses v1.1 responsibilities unchanged:
+
+- `ArtifactAsyncEngine`: caller handles, stream delivery, cancellation and lifecycle; plus text convenience methods.
+- `ArtifactIntegratedEngine`: EngineCore logical truth and public artifact snapshot composition.
+- `PrefixAwareBudgetedScheduler`: admission, budget, fairness and preemption policy.
+- `ArtifactMultiprocessExecutor`: IPC, correlation, remote transactions, process health and rank identity agreement.
+- child Worker/ModelRunner/KV: physical model execution and cache ownership.
+
+Artifact identity is not a scheduling input.
+
+## Process transport
+
+The v1.1 fixed command protocol remains unchanged for serving work. `WorkerSpec` gains an optional serializable `artifact_spec`; historical v1.1 workers leave it `None`.
+
+Rank readiness/execution observations may include:
+
+```text
+artifact_identity
+tokenizer_identity
+artifact_architecture
+```
+
+These are logical provenance facts, not parameter-storage handles.
+
+## Default construction without a bypass
+
+`create_engine()` defaults to v1.2. For teaching convenience, if no external path is supplied it:
+
+```text
+construct deterministic TinyDecoderLM only for export
+        ↓
+write temporary v1.2 artifact
+        ↓
+load_model_artifact(temp_dir)
+        ↓
+start child ranks from that same artifact spec
+```
+
+The serving workers therefore still cross the artifact boundary. The temporary directory is runtime-owned lifecycle state and is removed only after child workers have stopped.
+
+## Read-only observability
+
+`engine.snapshot()` adds:
+
+```text
+RuntimeSnapshot.model_artifact
+├─ identity
+├─ architecture
+├─ format_version
+├─ tokenizer_identity
+├─ tokenizer_compatibility_id
+├─ vocab_size
+├─ weight_dtype
+├─ runtime_dtype
+├─ device
+└─ rank_identity_agreement
+
+RankExecutionSnapshot
+├─ existing v1.1 process/attention/compile facts
+├─ artifact_identity
+├─ tokenizer_identity
+└─ artifact_architecture
+```
+
+No raw checkpoint tensors, parameter pointers or mutable loader objects are exposed. Existing snapshot reads remain non-serving observations.
+
+## Request path
+
+Text convenience path:
+
+```text
+caller text
+  ↓ WhitespaceTokenizer
+prompt token IDs
+  ↓ normal Request
+AsyncEngine
+  ↓
+EngineCore / Scheduler
+  ↓
+remote prefix/KV/model work
+  ↓ matching acknowledged results
+logical commit
+  ↓
+TokenEvent
+```
+
+Direct token-ID requests continue to bypass the tokenizer and use the same core.
+
+## Failure layers
+
+### Artifact validation failure
+
+Malformed/incompatible files fail during parent construction before workers/requests exist.
+
+### Child artifact divergence
+
+If child re-validation disagrees with the parent identity, readiness fails. The child sends a structured startup error and the executor reaps partial startup state.
+
+### Serving child error/transport death
+
+Once ready, v1.1 failure atomicity remains authoritative: remote checkpoints, matching responses, rollback of reachable state, unhealthy executor on unknown physical consistency and no EngineCore logical commit on uncertain execution.
+
+### Caller cancellation
+
+Cancellation remains an EngineCore/Async lifecycle operation. It neither modifies model artifacts nor kills healthy workers.
+
+## Stable equivalence oracles
+
+- exported deterministic v1.1 TinyDecoder weights are the v1.2 model-loading semantic oracle;
+- world-size 1 and 2 v1.2 outputs must equal v1.1 under equivalent configuration;
 - reference PagedAttention remains the attention oracle;
-- eager projection remains the compile oracle;
-- `docs/INVARIANTS.md` is the cross-version correctness contract.
+- eager LM-head projection remains the compile oracle;
+- paged block translation remains the KV oracle;
+- `docs/INVARIANTS.md` is the complete cross-version contract.

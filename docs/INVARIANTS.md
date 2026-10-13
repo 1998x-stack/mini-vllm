@@ -1,17 +1,18 @@
-# mini-vLLM v1.1 invariant contract
+# mini-vLLM v1.2 invariant contract
 
-v1.1 preserves the v1.0 serving semantics while turning the Executor/Worker boundary into a real operating-system process boundary. These invariants are the stable correctness contract across the complete runtime.
+v1.2 preserves all v1.1 serving/process semantics and adds the trust boundary from external model/tokenizer files to validated runtime-owned state.
 
 ## Logical token state
 
 1. `num_computed_tokens` counts only tokens whose model work executed and whose K/V remains valid and addressable.
-2. A sampled output token is logical history, not computed history, until a later forward pass executes it.
-3. Preemption may preserve logical token history while rolling the computed frontier backward.
+2. A sampled output token is logical history, not computed history, until a later forward executes it.
+3. Preemption may preserve logical history while rolling the computed frontier backward.
+4. Text is converted to token IDs before entering the serving core; Scheduler/KV/WorkItem contracts remain token-native.
 
 ## KV ownership and addressing
 
-4. Physical ownership/reservation exists before any K/V read or write.
-5. Paged translation is authoritative:
+5. Physical ownership/reservation exists before any K/V read or write.
+6. Paged translation is authoritative:
 
 ```text
 logical_block = position // block_size
@@ -19,65 +20,100 @@ block_offset  = position % block_size
 physical      = block_table[logical_block]
 ```
 
-6. Attention reads only logical positions `[0, length)`; unused physical tail slots are never visible.
-7. Shared prefix blocks are immutable while referenced.
-8. Finished or cancelled requests release active ownership exactly once.
-9. In v1.1 the child process owns its physical KV/cache structures; the parent may not use block tables/refcounts/cache objects as remote ownership handles.
+7. Attention reads only logical positions `[0, length)`.
+8. Shared prefix blocks are immutable while referenced.
+9. Finished/cancelled requests release active ownership exactly once.
+10. Physical KV/cache structures remain child-owned; the parent never treats block tables/refcounts/cache objects as remote ownership handles.
 
-## Prefix reuse and scheduling
+## Prefix reuse, preemption and speculation
 
-10. `PrefixReuseHint` is advisory. It is not a reservation, block-table entry, refcount, or computed-token claim.
-11. Side-effect-free prefix estimation cannot create request ownership or change LRU/refcount state.
-12. Only authoritative `prepare_request()` establishes the actual reusable computed frontier.
-13. Stale hints may reduce scheduling quality but cannot change serving correctness.
-14. Warm-prefix preference has deterministic tie-breaking and explicit starvation protection.
+11. `PrefixReuseHint` is advisory, never reservation/ownership/computed state.
+12. Side-effect-free prefix estimation cannot create ownership or mutate cache recency.
+13. Only authoritative prepare establishes the actual reusable computed frontier.
+14. Warm-prefix preference retains deterministic starvation protection.
+15. A preempted request cannot claim released KV.
+16. Replay preserves known logical history without resampling historical outputs.
+17. Rejected speculative state disappears from logical history and physical KV.
+18. Speculative rollback never mutates shared immutable prefixes.
 
-## Preemption and transactions
+## External artifact truth
 
-15. A preempted request cannot claim KV that was released.
-16. Recompute replays known prompt/output history without resampling historical tokens.
-17. Rejected speculative state disappears from both logical history and physical KV state.
-18. Speculative rollback never mutates a shared immutable prefix.
-19. A transport-safe checkpoint handle identifies child-owned transaction state; it is not itself physical cache ownership.
+19. Filesystem presence is not proof of a valid model artifact.
+20. Successful JSON parsing is not proof of schema/architecture compatibility.
+21. Successful checkpoint deserialization is not proof of complete or compatible model state.
+22. Artifact format/version and architecture must be accepted explicitly before runtime construction.
+23. Required manifest fields are exact; missing or unexpected incompatible fields fail explicitly.
+24. Model dimensions must satisfy the same `TinyModelConfig` validity rules as programmatic construction.
+25. The artifact path is location, not model identity.
 
-## Execution and distribution
+## Weight manifest and copy
 
-20. EngineCore owns logical commit decisions; Executor/Worker performs physical execution only.
-21. Replicated ranks must agree on cache capacity, checkpoints, and policy-visible prefix facts.
-22. A rank failure cannot leave another reachable rank's speculative or ordinary execution knowingly committed while EngineCore rejects the step.
-23. Tensor-parallel gathered logits are equivalent to the readable unsharded reference for the supported educational model.
-24. Deterministic world-size 1 and 2 v1.1 output is equivalent to v1.0 under equivalent configuration.
+26. The external tensor-name set must exactly equal the required mapping set for the reference format.
+27. Missing required tensors are never silently initialized.
+28. Unexpected tensors are never silently ignored.
+29. Every accepted source tensor must match its expected shape before copy.
+30. Every accepted source tensor must use a supported artifact dtype before copy.
+31. Non-tensor checkpoint entries are rejected.
+32. The external-name → runtime-name relationship remains explicit even when names are identical.
+33. Every required runtime tensor target is populated exactly once under the accepted mapping.
+34. Runtime model state owns copied tensor values; serving correctness cannot depend on retaining or mutating the loader checkpoint dictionary.
+35. Runtime dtype/device conversion may change representation after validation but cannot change model semantics outside documented numeric behavior.
 
-## Multiprocessing transport
+## Tokenizer compatibility
 
-25. IPC messages contain serializable logical values/copies, not live parent references to child Workers, caches, model runners, block tables, refcounts or tensor storage.
-26. Every command/result exchange has a correlation ID. A response with the wrong ID is not eligible for logical commit.
-27. Sending a command is not evidence that physical execution succeeded. Logical commit requires an acknowledged successful response.
-28. Child-reported execution/model errors and transport/process-death failures are distinct failure classes.
-29. A child-reported error may preserve worker health only when the process remains reachable and required rollback succeeds.
-30. Unexpected EOF, timeout, process exit, or unprovable physical consistency makes the relevant executor unhealthy; EngineCore may not guess and commit.
-31. After failed ordinary execution, rollback is attempted on every reachable checkpointed rank/request before the failure is surfaced.
-32. Parent-side checkpoint handles do not expose child physical block identity.
-33. Normal shutdown sends an explicit shutdown intent and joins child processes. No child worker may remain alive after successful `close()`/`aclose()`.
-34. Termination is a cleanup fallback, not the normal request-cancellation mechanism.
+36. Tokenizer format/type/version are validated before use.
+37. Tokenizer tokens are non-empty and unique under the reference format.
+38. Required special-token metadata, including `unk`, must contain in-range integer IDs.
+39. `tokenizer.vocab_size == model.vocab_size` before readiness.
+40. tokenizer compatibility ID in `tokenizer.json` equals the model manifest compatibility ID.
+41. Unknown-text handling is deterministic according to the declared `unk` token.
+42. Decode rejects token IDs outside the tokenizer vocabulary.
 
-## Optimization correctness
+## Artifact identity and multiprocess readiness
 
-35. Vectorized PagedAttention is numerically equivalent to the readable reference attention path.
-36. Compile-aware LM-head projection is numerically equivalent to eager projection.
-37. Optimization fallback may change execution mode, never serving semantics.
-38. No speedup claim is valid without measurement; multiprocessing isolation is not itself a performance claim.
+43. `ModelArtifactIdentity` is derived from format/architecture plus model, weights and tokenizer digests; it is not a path or mutable object reference.
+44. Parent validation establishes the exact identity expected by one engine startup.
+45. Every child independently re-reads/re-validates its configured artifact before reporting ready.
+46. A child that observes changed bytes after parent validation must fail identity comparison rather than silently adopting the new artifact.
+47. Every ready rank reports the parent-validated artifact identity.
+48. Every ready rank reports the same tokenizer identity.
+49. Executor readiness requires cross-rank identity agreement before any request admission/execution.
+50. If one worker fails artifact startup, already-created workers are shut down/reaped; partial startup cannot leak orphan processes.
+51. A default temporary educational artifact follows the same loader/child-revalidation path as an explicit artifact; it is not a serving bypass.
+52. Runtime-owned temporary artifact files are removed only after workers stop.
 
-## Async delivery
+## Multiprocessing execution
 
-39. Async clients observe committed tokens only.
-40. Each request exposes exactly one terminal outcome: finished, cancelled, or error.
-41. Backpressure can delay delivery but cannot cause hidden logical commits or duplicate tokens.
-42. Cancellation is applied between atomic EngineCore steps; it does not arbitrarily kill a healthy child worker.
+53. EngineCore owns logical commit decisions; child Worker/ModelRunner owns physical execution.
+54. IPC contains serializable logical values/copies, not live child model/cache/tensor-storage references.
+55. Every serving command/result uses a matching correlation ID.
+56. Sending a command is not evidence of success; logical commit requires a matching successful acknowledgment.
+57. Child-reported execution errors and transport/process-death failures remain distinct.
+58. Parent-side checkpoint handles identify child-owned transaction state; they are not KV ownership handles.
+59. Failed ordinary execution attempts rollback on every reachable checkpointed participant before surfacing failure.
+60. Unknown physical consistency after EOF/timeout/process death/rollback failure makes the executor unhealthy; EngineCore cannot guess and commit.
+61. Successful close/aclose joins/reaps every child process.
 
-## Observability
+## Distribution and optimization
 
-43. `snapshot()` is read-only: observing the runtime cannot schedule work, attach KV, mutate cache recency, advance request state, or change serving-command counters.
-44. Public snapshots report mechanism/transport facts without exposing physical ownership handles as policy inputs.
-45. Snapshot transport reads such as execution observations and cache statistics are non-serving reads and must not make two otherwise identical snapshots differ.
-46. The same deterministic v1.0 configuration remains the semantic oracle for v1.1 committed output.
+62. Replicated ranks agree on policy-visible cache facts and model identity required by the operation.
+63. Tensor-parallel gathered logits remain equivalent to the supported readable reference.
+64. Vectorized PagedAttention is numerically equivalent to reference PagedAttention.
+65. Compile-aware LM-head projection is numerically equivalent to eager projection.
+66. Optimization fallback may change execution mode, never serving semantics.
+67. No speedup claim follows merely from multiprocessing, loading, vectorization or compilation.
+
+## Async delivery and observability
+
+68. Async clients observe committed tokens only.
+69. Each request exposes exactly one terminal outcome.
+70. Backpressure may delay delivery but cannot duplicate or hide logical commits.
+71. Cancellation is applied between atomic EngineCore steps and does not arbitrarily kill healthy workers.
+72. `snapshot()` is read-only: it cannot schedule, attach KV, mutate recency, advance requests or alter serving-command counters.
+73. Artifact observations expose logical identity/configuration facts, never checkpoint dictionaries, parameter pointers or storage ownership handles.
+74. Repeated snapshots with no intervening serving action remain equal.
+
+## Semantic equivalence
+
+75. Exporting the deterministic v1.1 TinyDecoder into the v1.2 reference artifact and loading it back must reproduce the same committed output under equivalent world-size 1 and 2 serving configuration.
+76. Historical v0.1–v1.1 builders retain their original mechanism semantics; v1.2 artifact loading is opt-in only through the v1.2/default builder.

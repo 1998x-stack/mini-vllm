@@ -97,10 +97,11 @@ def test_transport_protocol_is_pickle_serializable() -> None:
 
 def test_default_builder_starts_real_worker_processes_and_snapshot_is_read_only() -> None:
     engine = create_engine(
+        "v1.1",
         runtime_config=RuntimeConfig(
             world_size=1,
             multiprocess=MultiprocessConfig(start_method=FAST_START_METHOD),
-        )
+        ),
     )
     try:
         assert isinstance(engine, MultiprocessAsyncEngine)

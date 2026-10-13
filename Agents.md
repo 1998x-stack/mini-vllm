@@ -26,69 +26,97 @@ v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
 v1.0  integrated educational runtime
 v1.1  real multiprocessing executor transport
+v1.2  model artifact + tokenizer loading boundary
 ```
 
-v1.1 is the first post-v1.0 mechanism release because it adds a genuinely new systems lesson: a real OS isolation boundary with serialization, lifecycle and transport failure semantics.
+Post-v1.0 branches require a genuinely new systems boundary. v1.1 introduced real OS-process isolation; v1.2 introduces external-artifact validation and transfer into runtime-owned model/tokenizer state.
 
 ## Ownership
 
-- `AsyncEngine`: caller lifecycle, bounded event delivery, cancellation intent and backpressure.
-- `EngineCore`: logical request truth, atomic step boundaries, reconciliation and commit authority.
-- `Scheduler`: admission order, token budget, fairness and preemption-victim policy.
-- `MultiprocessExecutor`: parent-side IPC orchestration, correlation, worker health, result coordination and shutdown.
+- `AsyncEngine`: caller lifecycle, bounded delivery, cancellation intent and backpressure.
+- `EngineCore`: logical request truth, atomic step boundaries and commit authority.
+- `Scheduler`: admission, token budget, fairness and preemption-victim policy.
+- `ArtifactLoader`: parse external local files, validate schema/tensor/tokenizer contracts and compute artifact identity. It owns no serving request state.
+- `RuntimeModelFactory`: construct runtime modules and copy accepted tensor values into runtime-owned parameters. It does not decide scheduling or artifact trust policy.
+- `WhitespaceTokenizer`: text ↔ token-ID boundary only. Strings must not leak into Scheduler/KV/WorkItem contracts.
+- `ArtifactMultiprocessExecutor`: parent-side IPC orchestration plus rank model-identity agreement and process lifecycle.
 - child `Worker/ModelRunner`: rank-local model execution and physical KV ownership inside one OS process.
-- KV backend: physical storage, block tables, allocation, sharing, recycling, transactions and policy-safe reuse facts; in v1.1 it lives only in the child process.
-- PagedAttention backend: read the child-local logical K/V view and compute context; it does not own blocks.
-- Compile registry: child/rank-local tensor specialization only.
-- Collective: parent-side reference communication mathematics only.
-- observability: copy public facts into read-only snapshots; never become a policy owner.
+- KV backend: physical storage, allocation, sharing, recycling and transactions inside the child.
+- PagedAttention backend: read child-local logical K/V; it does not own blocks or artifacts.
+- Compile registry: rank-local tensor specialization only.
+- observability: copy logical facts into read-only snapshots; never become a policy or ownership authority.
 
-The parent process must not keep or inspect a live child `Worker`, cache object, block table, refcount structure, model runner or tensor-storage handle.
+A filesystem path, parsed JSON object, checkpoint dictionary or tokenizer file is not runtime model ownership. The serving model begins only after validation and explicit parameter copy into a runtime-created module.
 
 ## Stable invariants
 
-The canonical expanded list is `docs/INVARIANTS.md`. At minimum every change must preserve:
+The canonical expanded contract is `docs/INVARIANTS.md`. Every active-version change must preserve at least:
 
 - computed tokens imply valid, addressable KV;
-- sampled output tokens are not computed until a later forward executes them;
-- physical ownership precedes K/V access;
+- sampled outputs are not computed until later model execution;
+- physical KV ownership precedes access;
 - block-table translation is authoritative;
-- `PrefixReuseHint` is advisory, never reservation/ownership/computed state;
-- authoritative `prepare_request()` establishes the actual reusable frontier;
-- warm-prefix preference has deterministic starvation protection;
+- prefix hints are advisory, never ownership;
 - preemption cannot retain claims to released KV;
-- replay preserves logical history without resampling historical output;
 - rejected speculative state disappears;
-- speculative rollback cannot mutate shared immutable prefixes;
-- execution failures cannot partially commit logical state;
-- replicated ranks roll physical state back together when rollback remains reachable;
-- async clients see committed tokens only and exactly one terminal outcome;
-- vectorized PagedAttention equals the readable reference path;
-- compile-aware projection equals eager projection;
-- `snapshot()` is read-only and cannot schedule, attach, evict, touch LRU or advance request state;
-- IPC messages contain logical/serializable data, not live physical ownership objects;
-- a remote execution result becomes commit-eligible only after its correlation ID and success response are acknowledged;
-- child-reported errors are distinct from transport/process-death failures;
-- if child physical state cannot be proven consistent, the executor becomes unhealthy and EngineCore cannot logically commit that step;
-- normal shutdown joins every child process; no worker may remain orphaned after close.
+- execution/transport failures cannot partially commit logical state;
+- async clients observe committed tokens only and one terminal outcome;
+- `snapshot()` is read-only;
+- IPC carries logical copies/handles, not live child ownership objects;
+- a sent command is not execution success; logical commit requires matching acknowledgment;
+- unknown child physical state makes the executor unhealthy;
+- successful close/aclose leaves no worker process alive;
+- filesystem presence is not proof of a valid model artifact;
+- artifact schema/version/model dimensions must validate before worker readiness;
+- every required checkpoint tensor must be present exactly once under the explicit mapping contract;
+- unexpected tensors, shape mismatches, unsupported dtypes and non-tensor payloads fail explicitly;
+- tokenizer vocabulary/special metadata must be compatible with the model artifact;
+- runtime parameters are copied into runtime-owned storage rather than aliasing mutable loader containers;
+- every worker rank must report the parent-validated artifact/tokenizer identity before serving begins;
+- malformed, changed or rank-divergent artifacts fail before request admission;
+- deterministic v1.2 loading of the exported v1.1 model preserves committed output.
 
-## Public v1.1 surface
+## Public v1.2 surface
 
-Prefer teaching through these stable entry points:
+Prefer teaching through:
 
 ```text
-RuntimeConfig
+RuntimeConfig(model_artifact=...)
 MultiprocessConfig
-create_engine()          # defaults to v1.1
+create_engine()                  # defaults to v1.2
+create_engine("v1.2", model_artifact=...)
+export_tiny_model_artifact(...)
+load_model_artifact(...)
+engine.encode() / engine.decode()
+engine.submit_text(...)
 Request / AsyncRequestHandle
 engine.snapshot()
 engine.close() / await engine.aclose()
-EngineStepOutput
 ```
 
-Historical `create_engine("v0.x")` and `create_engine("v1.0")` builders remain available for mechanism-by-mechanism comparison.
+Historical builders remain explicit and frozen.
 
-Do not expose private physical ownership structures merely to make observability convenient. Add logical/copy snapshots or explicit transport-safe values instead.
+Do not expose raw checkpoint dictionaries, parameter pointers, block IDs, refcounts or live child objects merely for convenience. Add immutable logical metadata instead.
+
+## Artifact-boundary rule
+
+```text
+external files
+    ↓ parse
+untrusted structured values
+    ↓ exact validation
+ValidatedModelArtifact + identity
+    ↓ construct + copy
+runtime-owned model/tokenizer state
+    ↓ all ranks independently agree
+READY
+    ↓
+request admission
+```
+
+Never skip a boundary by treating a path, filename, state-dict key or successful `torch.load` as proof of compatibility.
+
+A model artifact that changes between parent validation and child startup must be detected through identity mismatch; do not silently accept the new bytes.
 
 ## Process-boundary rule
 
@@ -96,13 +124,11 @@ Do not expose private physical ownership structures merely to make observability
 parent logical truth
         ↓ command
 child physical mutation
-        ↓ acknowledged result
+        ↓ matching acknowledgment
 parent logical commit
 ```
 
-Never skip the acknowledgment boundary. A send is not an execution success, and a child process being alive is not proof that a command completed.
-
-Transport failures after possible mutation are conservative failures: repair reachable state if possible, otherwise mark the executor unhealthy rather than guessing.
+Artifact identity agreement does not replace execution acknowledgment, and process liveness does not prove command completion.
 
 ## Change protocol
 
@@ -112,12 +138,13 @@ Before changing `main` or the active version:
 2. read `Plan.md`;
 3. read `version.md`;
 4. read `docs/ARCHITECTURE.md` and `docs/INVARIANTS.md`;
-5. inspect the relevant implementation and invariant tests;
-6. separate policy changes from mechanism/transport changes;
-7. add tests that prove ownership, serialization, rollback and cleanup directly;
-8. run the exact release gate before advancing `main`.
+5. inspect implementation and invariant tests;
+6. separate parsing/validation from model construction and from serving execution;
+7. add direct tests for invalid external inputs and ownership transfer;
+8. preserve historical builders;
+9. run the exact release gate before advancing `main`.
 
-Historical branches are frozen except narrowly scoped documentation/test corrections or true bugs within that historical lesson.
+Historical branches are frozen except narrowly scoped documentation/test corrections or true bugs within that lesson.
 
 ## Testing / release
 
@@ -133,20 +160,10 @@ Never claim tests passed unless executed on the exact reported snapshot. An acti
 3. `main` advances to that same commit;
 4. branch history remains pedagogically clean.
 
-For multiprocessing changes, tests must include process identity, structured remote error, unexpected child death, deterministic equivalence, and explicit shutdown/join behavior.
+For v1.2 artifact changes, tests must cover schema/version errors, missing/unexpected tensors, shape/dtype errors, tokenizer compatibility, runtime-owned copies, rank identity agreement, startup failure cleanup, deterministic v1.1 equivalence and examples 01–17.
 
-## Performance / policy rule
+## Performance / security scope
 
-```text
-readable mechanism fact
-        ↓
-explicit policy input
-        ↓
-invariant tests
-        ↓
-observable decision
-        ↓
-authoritative execution truth
-```
+The educational local loader is not a benchmark or production security sandbox. It deliberately uses `torch.load(..., weights_only=True)` and one known architecture/checkpoint contract. Do not add arbitrary remote code or network downloads to solve a local artifact problem.
 
-Do not convert an estimate into ownership merely because it improves scheduling. Do not claim speedup from multiprocessing, `torch.compile`, vectorization, CUDA or Triton without measurement. v1.1 multiprocessing is an isolation/transport lesson, not a throughput claim.
+Do not claim speedup from multiprocessing, `torch.compile`, vectorization, CUDA or Triton without measurement. v1.2 is a trust/ownership/loading lesson, not a loading-throughput claim.
