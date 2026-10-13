@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from mini_vllm.cache.base import KVCacheBackend
-from mini_vllm.core.work import WorkItem
+from mini_vllm.execution.types import ExecutionItem
 from mini_vllm.model.tiny_transformer import TinyDecoderLM
 
 
@@ -13,7 +13,7 @@ class ModelRunner(ABC):
     @abstractmethod
     def execute(
         self,
-        work_items: list[WorkItem],
+        work_items: list[ExecutionItem],
         cache: KVCacheBackend,
     ) -> dict[str, torch.Tensor]:
         ...
@@ -37,7 +37,7 @@ class TinyTransformerRunner(ModelRunner):
     @torch.no_grad()
     def execute(
         self,
-        work_items: list[WorkItem],
+        work_items: list[ExecutionItem],
         cache: KVCacheBackend,
     ) -> dict[str, torch.Tensor]:
         outputs: dict[str, torch.Tensor] = {}
@@ -73,7 +73,7 @@ class ScriptedModelRunner(ModelRunner):
 
     def execute(
         self,
-        work_items: list[WorkItem],
+        work_items: list[ExecutionItem],
         cache: KVCacheBackend,
     ) -> dict[str, torch.Tensor]:
         outputs: dict[str, torch.Tensor] = {}

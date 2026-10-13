@@ -6,19 +6,18 @@ from mini_vllm.cache.base import KVCacheBackend
 from mini_vllm.config import EngineConfig
 from mini_vllm.core.request import Request, RequestStatus
 from mini_vllm.core.sampler import Sampler
-from mini_vllm.speculative.types import VerificationResult
 from mini_vllm.core.work import EngineStepOutput, ScheduleDecision, WorkItem, WorkTrace
+from mini_vllm.execution import ExecutionItem, ExecutionRequest, Executor, LocalExecutor, Worker
 from mini_vllm.model.runner import ModelRunner
 from mini_vllm.scheduler.base import Scheduler, make_work_item
+from mini_vllm.speculative.types import VerificationResult
 
 
-class Engine:
-    """Small synchronous serving loop with explicit scheduling/cache boundaries.
+class EngineCore:
+    """Central policy/state coordinator.
 
-    v0.6 adds one policy feedback path: if KV reservation fails, the scheduler
-    may select another active request to preempt.  The Engine owns the state
-    transition because only it can coordinate Request + Scheduler + KV cache
-    without hiding policy inside the storage backend.
+    v0.8 moves physical execution behind Executor/Worker while keeping request
+    lifecycle, scheduling, preemption policy and logical commit centralized.
     """
 
     def __init__(
@@ -26,21 +25,42 @@ class Engine:
         *,
         config: EngineConfig,
         scheduler: Scheduler,
-        cache: KVCacheBackend,
-        model_runner: ModelRunner,
+        executor: Executor | None = None,
+        cache: KVCacheBackend | None = None,
+        model_runner: ModelRunner | None = None,
         sampler: Sampler | None = None,
         version: str,
     ) -> None:
+        if executor is None:
+            if cache is None or model_runner is None:
+                raise ValueError("provide executor or both cache and model_runner")
+            executor = LocalExecutor(Worker(model_runner=model_runner, cache=cache))
+        elif cache is not None or model_runner is not None:
+            raise ValueError("executor is mutually exclusive with cache/model_runner")
+
         self.config = config
         self.scheduler = scheduler
-        self.cache = cache
-        self.model_runner = model_runner
+        self.executor = executor
         self.sampler = sampler or Sampler()
         self.version = version
         self._requests: OrderedDict[str, Request] = OrderedDict()
         self._step = 0
         self._preemption_events = 0
         self._step_speculation: list[VerificationResult] = []
+
+    @property
+    def cache(self) -> KVCacheBackend:
+        """LocalExecutor compatibility/debug view; policy must use Executor APIs."""
+        if not isinstance(self.executor, LocalExecutor):
+            raise RuntimeError("cache object is not directly visible through this executor")
+        return self.executor.worker.cache
+
+    @property
+    def model_runner(self) -> ModelRunner:
+        """LocalExecutor compatibility/debug view."""
+        if not isinstance(self.executor, LocalExecutor):
+            raise RuntimeError("model runner is not directly visible through this executor")
+        return self.executor.worker.model_runner
 
     def _validate_cached_token_count(self, request: Request, cached_tokens: int) -> None:
         if cached_tokens < 0 or cached_tokens > len(request.prompt_token_ids):
@@ -51,7 +71,7 @@ class Engine:
             raise ValueError(f"duplicate request_id: {request.request_id}")
         if len(request.prompt_token_ids) + request.max_new_tokens > self.config.max_model_len:
             raise ValueError("prompt + max_new_tokens exceeds max_model_len")
-        cached_tokens = self.cache.prepare_request(
+        cached_tokens = self.executor.prepare_request(
             request.request_id, request.prompt_token_ids
         )
         self._validate_cached_token_count(request, cached_tokens)
@@ -71,18 +91,11 @@ class Engine:
         return self._preemption_events
 
     def _restore_replayed_item(self, item: WorkItem) -> WorkItem:
-        """Reattach any reusable prefix before replaying a preempted request.
-
-        The scheduler built ``item`` assuming replay starts at token 0.  Prefix
-        cache preparation may advance the valid KV frontier, so rebuild the item
-        with no more token work than the scheduler originally budgeted.
-        """
-
         request = item.request
         if not request.cache_rebuild_required:
             return item
 
-        cached_tokens = self.cache.prepare_request(
+        cached_tokens = self.executor.prepare_request(
             request.request_id, request.prompt_token_ids
         )
         self._validate_cached_token_count(request, cached_tokens)
@@ -91,7 +104,7 @@ class Engine:
         return make_work_item(request, max_tokens=item.num_tokens)
 
     def _preempt(self, victim: Request) -> None:
-        self.cache.free(victim.request_id)
+        self.executor.free(victim.request_id)
         victim.mark_preempted()
         self.scheduler.on_request_preempted(victim)
         self._preemption_events += 1
@@ -107,14 +120,13 @@ class Engine:
                 continue
 
             item = self._restore_replayed_item(original_item)
-            while not self.cache.ensure_capacity(item.request_id, item.end_pos):
+            while not self.executor.ensure_capacity(item.request_id, item.end_pos):
                 victim = self.scheduler.select_preemption_victim(item.request)
                 if victim is None:
                     raise RuntimeError(
                         f"request {item.request_id!r} cannot reserve KV capacity "
                         "and no eligible preemption victim exists"
                     )
-
                 self._preempt(victim)
                 preempted_ids.append(victim.request_id)
                 accepted = [
@@ -127,6 +139,19 @@ class Engine:
 
         decision.work_items = accepted
         return decision, tuple(preempted_ids)
+
+    @staticmethod
+    def _to_execution_request(work_items: list[WorkItem]) -> ExecutionRequest:
+        return ExecutionRequest(
+            items=tuple(
+                ExecutionItem(
+                    request_id=item.request_id,
+                    token_ids=item.token_ids,
+                    start_pos=item.start_pos,
+                )
+                for item in work_items
+            )
+        )
 
     def _produce_output_tokens(self, request: Request, logits) -> tuple[int, ...]:
         token_id = self.sampler.sample(logits, request.sampling_params)
@@ -142,10 +167,15 @@ class Engine:
         finished: list[str] = []
 
         if decision.work_items:
-            logits_by_request = self.model_runner.execute(decision.work_items, self.cache)
+            execution = self._to_execution_request(decision.work_items)
+            result = self.executor.execute(execution)
+            expected_ids = {item.request_id for item in decision.work_items}
+            if set(result.logits_by_request) != expected_ids:
+                raise RuntimeError("executor returned logits for the wrong request set")
+
             for item in decision.work_items:
                 request = item.request
-                self.cache.commit_work(
+                self.executor.commit_work(
                     item.request_id,
                     start_pos=item.start_pos,
                     token_ids=item.token_ids,
@@ -157,7 +187,7 @@ class Engine:
                     continue
 
                 committed = self._produce_output_tokens(
-                    request, logits_by_request[item.request_id]
+                    request, result.logits_by_request[item.request_id]
                 )
                 if not committed:
                     continue
@@ -171,7 +201,7 @@ class Engine:
                 reached_limit = len(request.output_token_ids) >= request.max_new_tokens
                 if reached_eos or reached_limit:
                     request.mark_finished("eos" if reached_eos else "length")
-                    self.cache.free(request.request_id)
+                    self.executor.free(request.request_id)
                     self.scheduler.on_request_finished(request)
                     finished.append(request.request_id)
 
@@ -181,7 +211,7 @@ class Engine:
             admitted_request_ids=tuple(decision.admitted_request_ids),
             sampled_token_ids=sampled,
             finished_request_ids=tuple(finished),
-            cache_stats=self.cache.stats(),
+            cache_stats=self.executor.cache_stats(),
             work=work_trace,
             preempted_request_ids=preempted_ids,
             committed_token_ids=committed_by_request,
@@ -197,3 +227,6 @@ class Engine:
                 raise RuntimeError("engine exceeded max_steps; possible scheduler deadlock")
             trace.append(self.step())
         return trace
+
+
+Engine = EngineCore

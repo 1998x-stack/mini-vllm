@@ -2,20 +2,23 @@
 
 A deliberately small, runnable, **branch-versioned** LLM-serving runtime for learning the systems ideas behind vLLM.
 
-## Current integrated version: v0.7
+## Current integrated version
+
+`main` remains the latest fully released line. `v0.8` is the current release candidate until its full repository CI gate passes.
 
 ```text
-main  ─────────────────────────────────► newest validated state (v0.7)
+main
   ├── v0.1  static batching + contiguous KV
   ├── v0.2  continuous batching
   ├── v0.3  paged KV + block tables
   ├── v0.4  token budget + chunked prefill
   ├── v0.5  prefix caching + shared KV ownership
   ├── v0.6  KV-pressure preemption + recomputation
-  └── v0.7  speculative decoding + transactional KV
+  ├── v0.7  speculative decoding + transactional KV
+  └── v0.8  EngineCore / Executor / Worker boundary   release candidate
 ```
 
-Next: `v0.8` — EngineCore / Executor / Worker separation.
+After the v0.8 CI gate passes, it is synchronized to `main`; the next planned branch is `v0.9` — distributed / tensor-parallel execution concepts.
 
 ## Version ladder
 
@@ -28,95 +31,62 @@ Next: `v0.8` — EngineCore / Executor / Worker separation.
 | `v0.5` | prefix cache + refcounts | how can identical prefixes share immutable KV? |
 | `v0.6` | recompute preemption | what happens when active KV no longer fits? |
 | `v0.7` | speculative transaction | how can temporary draft state be verified and rolled back safely? |
+| `v0.8` | EngineCore / Executor / Worker | where should centralized policy end and execution begin? |
 
 Read `Agents.md` before changing the repository and `Plan.md` for the canonical roadmap.
 
-## v0.7 mental model
+## v0.8 mental model
 
 ```text
-stable target state
-      │
-      ▼
-CacheCheckpoint
-      │
-      ▼
-DraftProvider
-      │ candidates
-      ▼
-target verification
-      │
-      ├── accept prefix ──► keep verified K/V
-      │
-      └── reject suffix ──► rollback private K/V
-      │
-      ▼
-commit logical outputs
+CONTROL / POLICY
+
+Request registry
+     │
+     ▼
+ EngineCore
+ ├─ Scheduler
+ ├─ admission / token budget
+ ├─ preemption victim policy
+ ├─ sampling / logical commit
+ └─ finish decisions
+     │
+     ▼
+ExecutionRequest
+
+================ boundary ================
+
+EXECUTION
+
+ LocalExecutor
+     │
+     ▼
+   Worker
+ ├─ ModelRunner
+ └─ KV backend
+     │
+     ▼
+ExecutionResult
+
+================ boundary ================
+
+     │
+     ▼
+ EngineCore validates + commits
 ```
 
 The central invariant is:
 
 ```text
-Draft tokens are temporary proposals until target verification commits them.
+Execution payloads carry execution facts, not mutable Request policy objects.
 ```
 
-### Partial accept
+`ExecutionItem` contains only `request_id`, token IDs, and a start position. Worker therefore does not get scheduler queues, request status, priority, or victim-selection state through the execution payload.
 
-```text
-draft:  [A B C]
-target: [A X ...]
+## Why LocalExecutor first?
 
-accepted: [A]
-rejected: [B C]
-fallback: X
-```
+The first executor stays synchronous and in-process. That proves ownership and message contracts before adding multiprocessing, RPC, multi-GPU topology, or distributed failure modes.
 
-Physical K/V for rejected positions is truncated. Logical output becomes `[A, X]`, while only `A` is already represented in KV.
-
-### Accept all
-
-```text
-draft: [A B C]
-all match target
-        │
-        ▼
-keep K/V(A,B,C)
-        +
-sample target bonus D
-```
-
-`D` remains the normal sampled-but-not-yet-computed token for the next decode step.
-
-## Architecture
-
-```text
-PreemptiveBudgetedScheduler        (unchanged v0.6 policy)
-              │
-              ▼
-      SpeculativeEngine
-              │
-      stable sampling frontier
-              ▼
-         DraftProvider
-              │
-              ▼
-TinyTransformerRunner.execute_speculative()
-              │
-              ▼
-TransactionalPrefixCachingPagedKVCache
-       │ checkpoint / rollback
-       ▼
-VerificationResult
-```
-
-Policy boundaries remain explicit:
-
-```text
-Scheduler       admission / token budget / preemption victim
-DraftProvider   proposal only
-Target model    verification truth
-KV cache        transactional physical state
-Engine          logical commit coordination
-```
+Historical builders still work: if an older version supplies `cache + model_runner`, `EngineCore` automatically wraps them in `Worker + LocalExecutor`. Frozen historical branches themselves remain unchanged.
 
 ## Install and verify
 
@@ -127,7 +97,13 @@ pip install -e '.[dev]'
 ./scripts/check.sh
 ```
 
-Current frozen v0.7 snapshot: **27 tests + 8 examples**.
+The v0.8 boundary-focused local harness passed 5/5 tests during implementation. The repository CI runs the canonical `./scripts/check.sh` on the complete checkout and is the release gate for v0.8.
+
+Run the v0.8 architecture trace:
+
+```bash
+python examples/09_executor_boundary.py
+```
 
 ## Learn through branch diffs
 
@@ -138,25 +114,19 @@ git diff v0.3..v0.4 -- mini_vllm tests examples version.md
 git diff v0.4..v0.5 -- mini_vllm/cache mini_vllm/core tests examples version.md
 git diff v0.5..v0.6 -- mini_vllm tests examples version.md
 git diff v0.6..v0.7 -- mini_vllm tests examples version.md
+git diff v0.7..v0.8 -- mini_vllm tests examples version.md
 ```
 
-For v0.7, focus on:
+For v0.8, focus on:
 
 ```text
-mini_vllm/cache/transactional.py
-mini_vllm/speculative/draft.py
-mini_vllm/speculative/types.py
+mini_vllm/execution/types.py
+mini_vllm/execution/executor.py
+mini_vllm/execution/worker.py
+mini_vllm/core/engine.py
 mini_vllm/speculative/engine.py
-mini_vllm/model/tiny_transformer.py
-mini_vllm/model/runner.py
-tests/test_speculative.py
-examples/08_speculative_decoding.py
+mini_vllm/versions/v0_8/engine.py
+tests/test_executor_boundary.py
+tests/test_v08_integration.py
+examples/09_executor_boundary.py
 ```
-
-Run:
-
-```bash
-python examples/08_speculative_decoding.py
-```
-
-Observe both `partial accept + rollback` and `accept all + bonus token`, then compare the final output with ordinary v0.6 greedy decoding.

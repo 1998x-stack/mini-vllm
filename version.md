@@ -1,162 +1,151 @@
-# mini-vLLM v0.8 — EngineCore / Executor / Worker boundary (planning branch)
+# mini-vLLM v0.8 — EngineCore / Executor / Worker boundary
 
 ## 1. Version identity
 
 - **Branch:** `v0.8`
-- **Base:** latest validated `v0.7` / `main`
 - **Previous version:** `v0.7`
-- **Theme:** separate centralized serving policy from execution transport
-- **Status:** planning / implementation target; runtime still behaves as v0.7 until acceptance criteria pass
+- **Theme:** separate centralized serving policy from execution mechanism/transport
+- **Status:** implementation complete; boundary-focused local validation passed; full repository CI is the release gate
+
+v0.8 preserves the serving algorithms from v0.7 and changes where execution happens:
+
+```text
+v0.7
+Engine
+ ├─ Scheduler / request state
+ ├─ KV lifecycle calls
+ └─ ModelRunner.execute()
+
+v0.8
+EngineCore
+  │ explicit policy-free payload
+  ▼
+Executor
+  ▼
+Worker
+ ├─ ModelRunner
+ └─ KV backend
+  │
+  ▼
+ExecutionResult
+  │
+  ▼
+EngineCore logical commit
+```
+
+The reference executor remains single-process. The learning goal is ownership boundaries, not multiprocessing.
 
 ## 2. Why v0.8 follows v0.7
 
-By v0.7 the in-process runtime already has explicit semantics for:
+By v0.7 the runtime already has explicit semantics for request lifecycle, token-budget scheduling, paged KV ownership, prefix sharing, preemption/replay, and speculative checkpoint/rollback.
 
-- request lifecycle;
-- token-budget scheduling;
-- paged KV ownership;
-- prefix sharing;
-- preemption/recompute;
-- speculative checkpoint/rollback.
+The remaining coupling was architectural: the central Engine directly invoked physical model/cache mechanisms. That makes future process or distributed execution difficult because policy and mechanism share hidden Python objects.
 
-The remaining architectural coupling is that Engine currently invokes ModelRunner/KV work directly. v0.8 asks:
+v0.8 therefore asks:
 
-> Which state and decisions must remain centralized in EngineCore, and which work can move behind an Executor/Worker interface without changing semantics?
+> What information truly needs to cross from centralized policy into execution?
 
-## 3. Primary mental model
+## 3. Primary invariant: Request objects do not cross the execution boundary
+
+`WorkItem` belongs to policy/scheduler coordination and contains a `Request` object. The executor payload deliberately strips that policy object:
 
 ```text
-EngineCore
-  request state
-  Scheduler
-  admission / victim policy
-        │
-        ▼
-ExecutionRequest
-        │
-        ▼
-Executor
-        │
-        ▼
-Worker
-  ModelRunner
-  KV backend execution
-        │
-        ▼
-ExecutionResult
-        │
-        ▼
-EngineCore commit/update
+WorkItem(request=..., token_ids, start_pos)
+       │
+       ▼
+EngineCore conversion
+       │
+       ▼
+ExecutionItem(request_id, token_ids, start_pos)
 ```
 
-The first implementation should remain single-process through `LocalExecutor`. The learning target is ownership boundaries, not multiprocessing complexity.
+Worker therefore cannot inspect request status, scheduler queues, preemption counters, or admission priority through the execution payload.
 
-## 4. Required abstractions
+## 4. New execution contracts
 
-Introduce small explicit data/contracts such as:
+`ExecutionItem` is a policy-free contiguous model-work description. `ExecutionRequest` and `ExecutionResult` form the normal forward contract. `SpeculativeExecutionRequest` and `SpeculativeExecutionResult` carry target verification work without allowing SpeculativeEngine to reach directly into ModelRunner.
 
-```text
-EngineCore
-ExecutionRequest
-ExecutionResult
-Executor
-LocalExecutor
-Worker
-```
+EngineCore validates the request-id set returned by the Executor before committing logical state.
 
-Do not move waiting/running queues or victim selection into Worker.
+## 5. Ownership model
 
-## 5. Ownership rules
+### EngineCore owns policy and logical state
 
-### EngineCore owns policy
-
-EngineCore should continue to own:
-
-- request registry and logical history;
-- Scheduler;
-- admission ordering;
-- token budgets;
-- preemption victim policy;
-- finishing/cancellation decisions;
-- logical commit of sampling/speculation results.
+EngineCore retains request registry/history, Scheduler, admission ordering, token budgets, preemption victim selection, finish decisions, sampling, speculative logical commit, and executor-result validation.
 
 ### Worker owns execution mechanism
 
-Worker may own or invoke:
-
-- ModelRunner;
-- physical KV backend operations;
-- model forward execution;
-- target verification execution;
-- execution-local tensors.
+Worker owns/invokes ModelRunner, physical KV backend, forward execution, speculative target execution, and cache lifecycle mechanisms requested by EngineCore. Worker intentionally has no Scheduler, waiting queue, running queue, or victim policy.
 
 ### Executor owns transport/orchestration
 
-Executor receives explicit execution requests and returns explicit execution results. `LocalExecutor` directly invokes a Worker but must use the same contract a future remote/multiprocess executor could use.
+Executor defines the explicit boundary. LocalExecutor invokes a local Worker directly but uses the same contracts a future process/RPC executor can implement.
 
-## 6. Critical invariants
+## 6. Cache lifecycle also crosses Executor
 
-### Semantic-equivalence invariant
+EngineCore no longer directly uses the cache for policy execution paths. Explicit executor operations include `prepare_request`, `ensure_capacity`, `commit_work`, `checkpoint`, `rollback`, `commit_checkpoint`, `free`, and `cache_stats`.
 
-Moving execution behind `LocalExecutor` must not change deterministic outputs or request state transitions relative to v0.7.
+For educational backward compatibility, `engine.cache` and `engine.model_runner` remain read-through debug views when using LocalExecutor; EngineCore policy itself does not use those views.
 
-### Policy-ownership invariant
+## 7. Historical-version compatibility
 
-Worker must not decide:
+Older version builders may still pass `cache + model_runner` into Engine/SpeculativeEngine. EngineCore automatically wraps them in Worker + LocalExecutor, so current-main regression tests can still instantiate v0.1-v0.7 without rewriting frozen historical branches. `Engine = EngineCore` remains a compatibility alias.
 
-- who gets admitted;
-- who gets preempted;
-- scheduler priority;
-- when a request is logically finished.
+## 8. Failure semantics
 
-### Execution-contract invariant
-
-Everything required for execution must cross the EngineCore→Executor boundary explicitly rather than being read from hidden Engine internals.
-
-### Transaction invariant
-
-Speculative checkpoint/verification/rollback semantics must survive the executor boundary without allowing rejected tokens to leak into logical history.
-
-## 7. Preferred implementation order
+Executor failures are explicit exceptions. EngineCore updates `num_computed_tokens` and logical output only after a successful ExecutionResult.
 
 ```text
-1. define ExecutionRequest / ExecutionResult
-2. wrap current ModelRunner + cache in Worker
-3. add Executor interface
-4. add LocalExecutor reference path
-5. refactor Engine into EngineCore coordination + executor call
-6. preserve preemption behavior
-7. preserve speculative transaction behavior
-8. add equivalence tests
+schedule work
+    ↓
+Executor.execute() raises
+    ↓
+exception surfaces
+    ↓
+no logical token commit
+no computed-token advance
 ```
 
-## 8. Acceptance criteria
+## 9. Important source files
 
-v0.8 cannot be frozen until:
+```text
+mini_vllm/execution/types.py
+mini_vllm/execution/executor.py
+mini_vllm/execution/worker.py
+mini_vllm/core/engine.py
+mini_vllm/speculative/engine.py
+mini_vllm/versions/v0_8/engine.py
+tests/test_executor_boundary.py
+tests/test_v08_integration.py
+examples/09_executor_boundary.py
+```
 
-- [ ] normal prefill/decode work executes through `LocalExecutor`;
-- [ ] Worker contains no waiting/running queue policy;
-- [ ] EngineCore still owns admission and preemption decisions;
-- [ ] v0.7 greedy/speculative outputs remain identical after refactor;
-- [ ] prefix cache and paged block ownership remain correct;
-- [ ] preemption/recompute regressions pass;
-- [ ] speculative accept-all/reject-first/partial-accept regressions pass;
-- [ ] execution request/result payloads are inspectable and tested;
-- [ ] a local executor failure is surfaced explicitly rather than silently corrupting request state;
-- [ ] an executable example traces EngineCore → Executor → Worker → result;
-- [ ] all v0.1-v0.7 tests continue to pass;
-- [ ] validated implementation is synchronized to `main`.
+Recommended comparison:
 
-## 9. Explicit non-goals
+```bash
+git diff v0.7..v0.8 -- mini_vllm tests examples version.md
+```
 
-- multiprocessing in the first increment;
-- RPC/network transport;
+## 10. Validation
+
+v0.8 adds tests for execution payload isolation, Worker policy isolation, normal/speculative LocalExecutor routing, failure-before-commit behavior, v0.7/v0.8 deterministic equivalence, and version composition.
+
+The focused v0.8 boundary harness passed **5/5** locally. GitHub Actions runs the canonical `./scripts/check.sh` against the complete checkout; that full-suite result is the gate before v0.8 is synchronized to `main` and treated as frozen.
+
+## 11. Learning goals
+
+After v0.8, the learner should be able to explain why scheduling policy should not live in workers; why mutable Request objects should not cross worker boundaries; the difference between execution payload and logical request state; why LocalExecutor comes before multiprocessing; how preemption and speculative transactions survive the boundary; and why distribution should change topology rather than scheduler semantics.
+
+## 12. Explicit non-goals
+
+- multiprocessing/RPC transport;
+- worker crash recovery;
 - multi-GPU execution;
-- tensor parallelism — `v0.9`;
-- async streaming — `v0.10`;
-- CUDA Graph or compiled execution;
-- Triton/CUDA PagedAttention.
+- tensor parallel collectives;
+- async streaming;
+- CUDA Graph / compile integration;
+- optimized Triton/CUDA PagedAttention.
 
-## 10. Next version
+## 13. Next version
 
-`v0.9` introduces **distributed / tensor-parallel execution concepts**. The executor/worker boundary from v0.8 is the prerequisite: distribution should change transport/topology, not force scheduler/cache semantics to be redesigned.
+After the full repository CI gate passes, `v0.9` introduces distributed / tensor-parallel execution concepts on top of the v0.8 boundary. Distribution changes execution topology, not request scheduling semantics.

@@ -1,100 +1,71 @@
-# Architecture notes
+# mini-vLLM Architecture — v0.8
 
-## Stable computed-token invariant
-
-```text
-0 <= num_computed_tokens <= len(prompt_token_ids + output_token_ids)
-```
-
-Every position below `num_computed_tokens` must have valid, addressable K/V. A sampled or bonus output token may be logically known while remaining physically uncomputed until a later forward pass consumes it.
-
-## Evolution through v0.7
+## Control plane vs execution plane
 
 ```text
-v0.3  block-addressed KV
-v0.4  partial token work
-v0.5  immutable shared prefixes
-v0.6  invalidate/recompute whole active request state
-v0.7  checkpoint/rollback a temporary request-private suffix
+CONTROL / POLICY
+
+Request registry
+     │
+     ▼
+ EngineCore
+ ├─ Scheduler
+ ├─ admission
+ ├─ token budgets
+ ├─ victim policy
+ ├─ sampling / logical commit
+ └─ finish decisions
+     │
+     ▼
+ExecutionRequest
+
+================ boundary ================
+
+EXECUTION
+
+ LocalExecutor
+     │
+     ▼
+   Worker
+ ├─ ModelRunner
+ └─ KV backend
+     │
+     ▼
+ExecutionResult
+
+================ boundary ================
+
+     │
+     ▼
+ EngineCore validates + commits
 ```
 
-v0.6 rollback is coarse: preemption discards active execution state and later replays logical history. v0.7 rollback is fine-grained: a speculative transaction retains the verified prefix and removes only rejected temporary positions.
+## Boundary rule
 
-## Speculative execution path
+The executor payload carries execution facts, not mutable policy objects:
 
 ```text
-normal scheduled WorkItem
-        │
-        ▼
-reach sampling frontier
-        │
-        ▼
-DraftProvider.propose()
-        │
-        ▼
-reserve optional temporary KV
-        │
-        ▼
-cache.checkpoint()
-        │
-        ▼
-ModelRunner.execute_speculative()
-        │
-        ▼
-per-position target logits
-        │
-        ▼
-longest matching draft prefix
-        │
-   ┌────┴───────────────┐
-   ▼                    ▼
-accepted             rejected
-retain KV            rollback KV
-   │                    │
-   └─────────┬──────────┘
-             ▼
-commit accepted tokens + target fallback/bonus
+ExecutionItem = request_id + token_ids + start_pos
 ```
 
-## Why verification needs per-position logits
+It does not carry `Request`, Scheduler queues, priority, or victim-selection state.
 
-For draft `[d0, d1, d2]`, target verification uses shifted distributions:
+## Cache ownership
 
-```text
-stable logits          predict d0
-logits after d0        predict d1
-logits after d1        predict d2
-logits after d2        predict bonus
-```
+EngineCore decides *whether* a request should run or another request should be preempted. Worker/cache implement *how* physical KV is allocated, released, checkpointed, and rolled back.
 
-The normal v0.1-v0.6 runner only needs final logits. v0.7 adds a reference trace API that returns logits after every computed draft token while preserving the old final-logit path.
+## Speculation
 
-## Cache checkpoint
+Speculative verification also crosses Executor. Draft proposal and logical acceptance remain centralized; target-model per-token logits and temporary KV mutation live behind Worker.
 
-A checkpoint records:
+## Failure boundary
 
-```text
-request_id
-stable token frontier
-stable block-table identity
-```
+EngineCore commits `num_computed_tokens` and logical output only after a successful `ExecutionResult`. Executor exceptions surface without pretending the forward pass completed.
 
-Temporary speculative allocation may extend the block table, but rollback is append-only. It cannot cross the checkpoint token frontier and cannot free cached/shared blocks.
+## Historical compatibility
 
-## Shared-prefix safety
+Current-main historical builders may still provide `cache + model_runner`; EngineCore wraps them in `Worker + LocalExecutor`. Frozen historical branches themselves are not modified.
 
-```text
-[ immutable shared prefix ] [ request-private speculative tail ]
-             ▲                          ▲
-      outside transaction          may rollback
-```
+## Why LocalExecutor first?
 
-This is why v0.5 block ownership is a prerequisite for v0.7: transaction code can tell which state is legal to mutate.
-
-## Fallback and bonus semantics
-
-On mismatch, target fallback token is committed logically but not computed physically. When all draft candidates match, the logits after the final accepted candidate produce one target bonus token with the same pending-token behavior.
-
-## Scheduler remains unchanged
-
-The first v0.7 increment deliberately keeps `PreemptiveBudgetedScheduler` unchanged. Draft/verification cost is not yet part of the step token budget. Correct transaction semantics are the reference oracle; later versions may integrate speculative cost into policy.
+A local reference path proves ownership and message contracts without adding multiprocessing, serialization, RPC, or distributed failure handling. v0.9 can therefore change topology without redesigning scheduler/cache semantics.
