@@ -9,6 +9,13 @@ from mini_vllm.async_runtime import (
     StreamEvent,
     TokenEvent,
 )
+from mini_vllm.compile_runtime import (
+    CompileConfig,
+    CompileEvent,
+    CompileStats,
+    CompiledKernelCache,
+    ExecutionShapeSignature,
+)
 from mini_vllm.config import CacheConfig, EngineConfig, TinyModelConfig
 from mini_vllm.core.engine import Engine, EngineCore
 from mini_vllm.core.request import Request, RequestStatus, SamplingParams
@@ -32,7 +39,8 @@ __all__ = [
     "WorkerGroup", "DistributedExecutor",
     "AsyncEngine", "AsyncRequestHandle", "StreamEvent", "TokenEvent",
     "FinishedEvent", "CancelledEvent", "ErrorEvent",
-    "create_engine",
+    "CompileConfig", "CompileEvent", "CompileStats", "CompiledKernelCache",
+    "ExecutionShapeSignature", "create_engine",
 ]
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
