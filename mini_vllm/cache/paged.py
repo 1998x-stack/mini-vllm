@@ -67,7 +67,44 @@ class PagedKVCache(KVCacheBackend):
             physical_block, offset = self.slot_mapping(request_id, position)
             key_rows.append(self.keys[layer_idx, physical_block, offset])
             value_rows.append(self.values[layer_idx, physical_block, offset])
+        if not key_rows:
+            shape = (0, self.num_kv_heads, self.head_dim)
+            return (
+                torch.empty(shape, dtype=self.dtype, device=self.keys.device),
+                torch.empty(shape, dtype=self.dtype, device=self.values.device),
+            )
         return torch.stack(key_rows, dim=0), torch.stack(value_rows, dim=0)
+
+    def read_prefix_vectorized(
+        self,
+        layer_idx: int,
+        request_id: str,
+        length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather logical positions through the block table with tensor indexing."""
+        if length < 0:
+            raise ValueError("length must be >= 0")
+        if length == 0:
+            shape = (0, self.num_kv_heads, self.head_dim)
+            return self.keys.new_empty(shape), self.values.new_empty(shape)
+
+        table = self._block_tables[request_id]
+        required_blocks = self._ceil_div(length, self.block_size)
+        if required_blocks > len(table):
+            raise IndexError("requested prefix has not been allocated")
+
+        device = self.keys.device
+        positions = torch.arange(length, dtype=torch.long, device=device)
+        logical_blocks = torch.div(positions, self.block_size, rounding_mode="floor")
+        offsets = torch.remainder(positions, self.block_size)
+        physical_table = torch.tensor(
+            table[:required_blocks], dtype=torch.long, device=device
+        )
+        physical_blocks = physical_table[logical_blocks]
+        return (
+            self.keys[layer_idx, physical_blocks, offsets],
+            self.values[layer_idx, physical_blocks, offsets],
+        )
 
     def free(self, request_id: str) -> None:
         self._free_blocks.extend(self._block_tables.pop(request_id, []))

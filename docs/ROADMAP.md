@@ -12,9 +12,9 @@
 | v0.8 | EngineCore / Executor / Worker | frozen |
 | v0.9 | WorkerGroup + reference tensor parallel | frozen |
 | v0.10 | async streaming / cancellation / backpressure | frozen |
-| v0.11 | compile-aware rank-local tensor execution | current / CI-gated |
-| v0.12 | optimized PagedAttention path | next |
-| v0.13 | prefix-aware scheduling/cache policy | planned |
+| v0.11 | compile-aware rank-local tensor execution | frozen |
+| v0.12 | reference + vectorized PagedAttention | current implementation / CI release rule |
+| v0.13 | prefix-aware scheduling/cache policy | next |
 | v1.0 | integrated educational serving runtime | planned |
 
-Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → kernel optimization.
+Dependency order: serving semantics → memory → scheduling → sharing → pressure recovery → transactions → execution boundary → distribution → async delivery → compile awareness → attention/kernel optimization → cache-aware policy.

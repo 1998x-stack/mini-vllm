@@ -4,7 +4,7 @@ A small, branch-versioned LLM-serving runtime for learning the systems ideas beh
 
 ## Current line
 
-`main` is always the newest validated release. v0.11 is the active compile-aware implementation candidate and may enter `main` only when its exact commit passes repository CI.
+`main` is always the newest exact-CI-validated release. v0.12 is the current optimized-PagedAttention implementation line; an exact v0.12 commit is synchronized to `main` only when that same commit has a green repository CI run.
 
 ```text
 v0.1  static batching + contiguous KV
@@ -17,36 +17,39 @@ v0.7  speculative decoding + transactional KV
 v0.8  EngineCore / Executor / Worker
 v0.9  logical multi-rank + tensor parallel
 v0.10 async streaming + cancellation/backpressure
-v0.11 compile-aware rank-local tensor execution       ← current candidate
-v0.12 optimized PagedAttention                        ← next
+v0.11 compile-aware rank-local tensor execution
+v0.12 reference + vectorized PagedAttention             ← current
+v0.13 prefix-aware scheduling                           ← next
 ```
 
-## v0.11 mental model
+## v0.12 mental model
 
 ```text
-control/lifecycle/orchestration                       eager
-        ↓
-rank-local TinyDecoder + KV                           eager
-        ↓
-hidden trace
-        ↓
-PureTensorProjectionKernel                            torch.compile-aware
-        ↓
-rank-local logits
-        ↓
-collective                                             eager
+logical positions
+      ↓
+block table
+      ↓
+physical block + offset
+      ↓
+ReferencePagedAttention      correctness oracle
+      or
+VectorizedPagedAttention     tensor-indexed paged gather
+      ↓
+same attention context
+      ↓
+TinyDecoder / compile-aware LM-head / WorkerGroup / AsyncEngine
 ```
 
-The project intentionally does **not** call `torch.compile(engine)`. Compile state lives next to rank-local tensor execution and is indexed by an explicit `ExecutionShapeSignature`.
+The vectorized path removes the Python per-token KV gather loop. It does **not** change Scheduler policy, cache ownership, prefix sharing, preemption, speculative rollback, distributed topology, compilation policy, or streaming semantics.
 
 ## Verify
 
 ```bash
 pip install -e '.[dev]'
 ./scripts/check.sh
-python examples/12_compile_aware.py
+python examples/13_paged_attention.py
 ```
 
-The example prints miss → compiled → hit/new-signature behavior per rank. `backend="eager"` in CI exercises Dynamo graph formation but is not a performance claim.
+The v0.12 trace compares reference and vectorized outputs and prints per-rank attention backend statistics. No speedup is claimed without measurement, and Triton/CUDA remains optional rather than a correctness dependency.
 
 Read `Agents.md`, `Plan.md`, and `version.md` before changing architecture.

@@ -25,6 +25,7 @@ v0.9 logical ranks/tensor parallel
 v0.10 async streaming/cancellation
 v0.11 compile-aware tensor execution
 v0.12 optimized PagedAttention
+v0.13 prefix-aware scheduling
 ```
 
 ## Ownership
@@ -33,22 +34,26 @@ v0.12 optimized PagedAttention
 - EngineCore/Scheduler: serving policy and logical request state.
 - Executor/WorkerGroup: execution orchestration/topology.
 - Worker/ModelRunner: rank-local model and KV mechanism.
-- KV backend: physical cache storage/ownership.
+- KV backend: physical cache storage, block tables, allocation, sharing, and recycling.
+- PagedAttention backend: read current logical K/V view and compute attention context; it does not own blocks.
 - Compile registry: rank-local tensor specialization only.
 - Collective: communication mathematics only.
 
-Compile-specific policy must not enter AsyncEngine, EngineCore, Scheduler, WorkerGroup, or KV ownership code.
+Attention optimization must not choose admissions, allocate/free blocks, mutate prefix ownership, decide preemption, or alter async lifecycle.
 
 ## Core invariants
 
 - computed tokens imply valid KV;
+- paged address translation is `logical_block=p//B`, `offset=p%B`, `physical=block_table[logical_block]`;
+- attention reads only logical positions `[0, length)` even when the final physical block has unused slots;
+- reference and vectorized paged attention are numerically equivalent;
+- shared-prefix blocks remain immutable and valid under vectorized reads;
 - rejected speculative state disappears;
 - execution failures cannot partially commit logical state;
 - distributed rank failures roll replicated KV back together;
 - async streams expose committed tokens only and one terminal event;
 - compile-aware and eager tensor paths are numerically equivalent;
-- a shape-signature miss/hit/fallback is observable;
-- compilation failure cannot change serving semantics when eager fallback is enabled.
+- explicit optimization fallbacks cannot change serving semantics.
 
 ## Testing / release
 
@@ -62,7 +67,7 @@ Never claim tests passed unless executed on the exact reported snapshot. An acti
 ## Performance rule
 
 ```text
-readable eager oracle
+readable oracle
   ↓
 correctness tests
   ↓
@@ -73,4 +78,4 @@ measure/inspect
 optimized educational path
 ```
 
-`torch.compile` success is not itself evidence of speedup. CUDA Graph, custom Triton/CUDA PagedAttention, aggressive dynamic shapes, and production bucketing remain future mechanisms until their correctness oracle exists.
+`torch.compile` success or vectorized PyTorch code is not itself evidence of speedup. A real Triton/CUDA path may only be claimed after an actual kernel exists, has capability checks, and is numerically validated against the reference path.

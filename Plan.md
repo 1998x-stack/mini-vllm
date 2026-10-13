@@ -15,28 +15,40 @@ v0.7  speculative transactions
 v0.8  EngineCore / Executor / Worker
 v0.9  WorkerGroup + reference tensor parallel
 v0.10 async streaming/cancellation/backpressure
-v0.11 compile-aware execution                         ← current candidate
-v0.12 optimized PagedAttention                        ← next
-v0.13 prefix-aware scheduling
+v0.11 compile-aware execution
+v0.12 optimized PagedAttention                         ← current implementation
+v0.13 prefix-aware scheduling                          ← next
 v1.0  integrated educational runtime
 ```
 
-## v0.11 lesson
+## v0.12 lesson
 
-Compilation belongs inside the execution plane, not the serving control plane. v0.11 keeps AsyncEngine, EngineCore, Scheduler, cache ownership, WorkerGroup orchestration, and collectives eager. A rank-local pure tensor projection kernel is wrapped by an explicit signature registry around `torch.compile`.
+PagedAttention optimization belongs below request/cache policy. The cache still owns physical blocks and block tables; attention receives only the current logical length and current storage mapping.
 
-Core equation:
+Reference equation:
 
 ```text
-same signature → reuse compiled callable
-new signature  → explicit new variant
-compile failure → eager correctness oracle
+for logical position p:
+    logical_block = p // block_size
+    offset        = p % block_size
+    physical      = block_table[logical_block]
+    K[p], V[p]    = physical_storage[physical, offset]
 ```
 
-CI uses the lightweight `eager` backend to test Dynamo/registry semantics without claiming performance. Future optimization may replace the backend or widen the pure tensor boundary only after numerical equivalence remains proven.
+The reference backend follows the readable per-position cache path. The vectorized backend constructs all logical positions at once, maps them through the block table with tensor indexing, gathers K/V in one tensor operation, and then performs the same GQA/MHA attention math.
+
+Correctness rules:
+
+- logical length masks unused tail slots;
+- physical blocks need not be contiguous;
+- prefix sharing and recycled blocks remain cache concerns;
+- vectorized and reference outputs must match;
+- unsupported cache layouts use explicit reference fallback when configured;
+- v0.11 compile-aware projection remains a separate rank-local optimization boundary.
+
+Release rule: only an exact v0.12 commit with a green repository CI run may be synchronized to `main`. This wording remains valid before and after release.
 
 ## Planned
 
-- v0.12: vectorized/optimized PagedAttention, with reference equivalence first.
-- v0.13: prefix-aware admission/cache policy.
+- v0.13: prefix-aware admission/cache-aware scheduling policy.
 - v1.0: integrated educational serving runtime.

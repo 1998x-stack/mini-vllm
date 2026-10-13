@@ -1,88 +1,120 @@
-# mini-vLLM v0.12 — optimized PagedAttention (planning branch)
+# mini-vLLM v0.12 — optimized PagedAttention
 
 ## Version identity
 
 - Branch: `v0.12`
-- Base: validated `v0.11` / `main`
-- Previous: `v0.11`
-- Theme: extract paged attention behind a correctness oracle, then add a vectorized PyTorch gather/attention path with explicit fallback
-- Status: planning until the exact implementation commit passes repository CI
+- Previous: validated `v0.11`
+- Theme: reference and vectorized paged attention with explicit cache-addressing invariants and fallback
+- Release rule: the exact implementation commit may enter `main` only after repository CI passes
 
-## Primary mental model
+## Mental model
 
 ```text
-Paged KV physical blocks + block table
-                ↓
-ReferencePagedAttention          correctness oracle
-                ↓
-VectorizedPagedAttention         optimized PyTorch path
-                ↓
-optional future Triton/CUDA path
-                ↓
-same attention context / logits / tokens
+current logical sequence length
+          +
+current block table
+          +
+physical KV tensors
+          ↓
+ReferencePagedAttention
+          or
+VectorizedPagedAttention
+          ↓
+same GQA/MHA attention context
+          ↓
+TinyDecoder
 ```
 
-The optimization replaces attention data gathering/tensor math only. Scheduler, request lifecycle, prefix ownership, preemption, speculative transactions, WorkerGroup topology, compile-aware LM-head projection, async streaming, and cancellation remain unchanged.
+v0.12 optimizes paged KV reading; it does not change request policy or cache ownership.
 
-## Required abstractions
+## Added abstractions
 
-- `PagedAttentionConfig`
+- `PagedAttentionConfig(backend, fallback_to_reference)`
 - `PagedAttentionStats`
 - `PagedAttentionEvent`
 - `PagedAttentionBackend`
 - `ReferencePagedAttention`
 - `VectorizedPagedAttention`
 - `build_paged_attention_backend`
-- vectorized paged-cache prefix read that maps logical positions to physical block/offset tensors without a Python per-token loop
+- `KVCacheBackend.read_prefix_vectorized()` optional contract
+- `PagedKVCache.read_prefix_vectorized()` tensor-indexed physical gather
 
-## Addressing invariant
+## Vectorized addressing
+
+For logical positions `0..L-1`:
 
 ```text
-logical_block = position // block_size
-block_offset  = position % block_size
-physical      = block_table[request_id][logical_block]
+positions       = arange(L)
+logical_blocks  = positions // block_size
+offsets         = positions % block_size
+physical_blocks = block_table[logical_blocks]
+K/V             = physical_storage[physical_blocks, offsets]
 ```
 
-For logical length `L`, only positions `[0, L)` may participate in attention. Unused slots in the last physical block must remain invisible.
+This removes the reference Python loop over logical positions while preserving ordering exactly.
 
-## GQA / MQA invariant
+## Partial tail invariant
 
-If `n_heads > n_kv_heads`, KV heads are expanded to query-head count with the same semantics as the v0.11 reference implementation. Optimized gathering must not change head mapping.
+Allocated capacity is not logical sequence length. If the final physical block contains unused or stale slots, only positions `< L` are gathered. Tests write a large sentinel into an unused tail slot and prove it is invisible to vectorized reads and attention.
 
-## Prefix / rollback invariant
+## GQA / MQA
 
-Shared immutable prefix blocks, private mutable tails, preemption/recompute, and speculative rollback may change which physical blocks a request references over time. The optimized attention path must use the current block table and logical length only; stale/recycled physical slots must never leak into attention.
+Both backends preserve the pre-v0.12 mapping from `n_kv_heads` to `n_heads` by repeating each KV head across the corresponding query-head group before score computation.
+
+## Ownership / lifecycle compatibility
+
+The attention backend never:
+
+- allocates/frees physical blocks;
+- changes block tables;
+- mutates prefix refcounts;
+- chooses preemption victims;
+- commits/rolls back speculative state;
+- participates in Scheduler or AsyncEngine policy.
+
+Prefix sharing, preemption, and rollback remain cache/runtime mechanisms. Attention resolves the current mapping at every call.
+
+## Distributed + compile composition
+
+Every logical rank owns its own attention backend and statistics. The Transformer trunk/KV remain replicated as in v0.9-v0.11. v0.11's compile-aware vocabulary projection remains unchanged and executes after the attention/trunk hidden trace. Collectives remain outside both optimization mechanisms.
 
 ## Fallback
 
-`backend="vectorized"` is the v0.12 default. If the cache backend cannot expose a vectorized paged read and fallback is enabled, attention executes through the reference path and records the fallback. Strict mode raises instead.
+`backend="vectorized"` is the v0.12 default. A cache backend without vectorized paged reads triggers an observable reference fallback when enabled. Strict mode raises a clear runtime error instead.
 
-Triton/CUDA is optional and not required for v0.12 correctness or CPU CI. Do not claim a Triton implementation unless a real kernel exists and is numerically validated.
+A real Triton/CUDA attention kernel is not claimed in v0.12; it remains optional future work after numerical validation and device capability checks.
 
-## Acceptance criteria
+## Validation coverage
 
-- [ ] reference backend reproduces pre-v0.12 attention exactly/numerically;
-- [ ] vectorized paged read matches the reference loop for multi-block and partial-tail sequences;
-- [ ] vectorized attention matches reference for ordinary MHA and GQA/MQA;
-- [ ] block tables need not be physically contiguous;
-- [ ] partial final blocks never expose unused slots;
-- [ ] fallback/error policy is deterministic and observable;
-- [ ] shared-prefix requests preserve output equivalence;
-- [ ] deterministic v0.12 output matches v0.11 for world_size 1 and 2;
-- [ ] speculative verification, preemption, compile-aware projection, async streaming, cancellation, and backpressure regressions pass;
-- [ ] an executable example shows reference vs vectorized stats and output equivalence;
-- [ ] all historical v0.1-v0.11 tests pass;
-- [ ] exact candidate `./scripts/check.sh` passes in GitHub Actions before `main` advances.
+`tests/test_paged_attention.py` proves:
+
+- vectorized physical gather equals reference gather for a deliberately non-contiguous block table;
+- unused partial-tail slots are masked by logical length;
+- reference and vectorized GQA attention match numerically;
+- non-paged cache fallback and strict error modes are explicit;
+- TinyDecoder logits match across reference/vectorized attention.
+
+`tests/test_v012_version.py` proves:
+
+- v0.12 deterministic async tokens equal v0.11;
+- reference and vectorized v0.12 engines match;
+- world-size 1 and 2 match;
+- attention and compile state remain rank-local and observable;
+- shared-prefix warm reuse remains correct with vectorized attention.
+
+`examples/13_paged_attention.py` prints reference/vectorized output equality and per-rank attention statistics.
+
+The exact candidate must pass `./scripts/check.sh`, which runs all historical tests and examples 01-13.
 
 ## Non-goals
 
 - production FlashAttention/vLLM kernel parity;
+- claiming PyTorch vectorization is faster without measurement;
 - distributed KV partitioning;
-- NCCL/CUDA Graph integration;
-- production Triton tuning;
-- prefix-aware admission policy (`v0.13`);
-- claiming speedup without measurement.
+- NCCL/CUDA Graph capture;
+- fake Triton wrappers that only delegate to PyTorch;
+- prefix-aware admission policy (`v0.13`).
 
 ## Next
 
-`v0.13` makes prefix reuse visible to scheduling/admission policy rather than only to the cache backend.
+`v0.13` moves prefix reuse information upward into scheduling/admission policy while preserving cache correctness and starvation guarantees.

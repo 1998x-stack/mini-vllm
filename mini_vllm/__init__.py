@@ -9,6 +9,14 @@ from mini_vllm.async_runtime import (
     StreamEvent,
     TokenEvent,
 )
+from mini_vllm.attention import (
+    PagedAttentionBackend,
+    PagedAttentionConfig,
+    PagedAttentionEvent,
+    PagedAttentionStats,
+    ReferencePagedAttention,
+    VectorizedPagedAttention,
+)
 from mini_vllm.compile_runtime import (
     CompileConfig,
     CompileEvent,
@@ -40,7 +48,10 @@ __all__ = [
     "AsyncEngine", "AsyncRequestHandle", "StreamEvent", "TokenEvent",
     "FinishedEvent", "CancelledEvent", "ErrorEvent",
     "CompileConfig", "CompileEvent", "CompileStats", "CompiledKernelCache",
-    "ExecutionShapeSignature", "create_engine",
+    "ExecutionShapeSignature",
+    "PagedAttentionBackend", "PagedAttentionConfig", "PagedAttentionEvent",
+    "PagedAttentionStats", "ReferencePagedAttention", "VectorizedPagedAttention",
+    "create_engine",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"

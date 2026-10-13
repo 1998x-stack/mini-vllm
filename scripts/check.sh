@@ -14,4 +14,5 @@ python examples/09_executor_boundary.py >/dev/null
 python examples/10_tensor_parallel.py >/dev/null
 python examples/11_async_streaming.py >/dev/null
 python examples/12_compile_aware.py >/dev/null
+python examples/13_paged_attention.py >/dev/null
 echo "all checks passed"

@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 
+from mini_vllm.attention import PagedAttentionBackend, ReferencePagedAttention
 from mini_vllm.cache.base import KVCacheBackend
 from mini_vllm.config import TinyModelConfig
 
 
 class TinySelfAttention(nn.Module):
-    """Slow reference causal attention that reads K/V through a cache backend."""
+    """Reference decoder attention with externally managed K/V storage."""
 
-    def __init__(self, config: TinyModelConfig) -> None:
+    def __init__(
+        self,
+        config: TinyModelConfig,
+        *,
+        attention_backend: PagedAttentionBackend | None = None,
+    ) -> None:
         super().__init__()
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -21,8 +25,10 @@ class TinySelfAttention(nn.Module):
         self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
+        self.attention_backend = attention_backend or ReferencePagedAttention()
 
     def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Compatibility helper retained for older educational tests."""
         if self.n_heads == self.n_kv_heads:
             return x
         repeats = self.n_heads // self.n_kv_heads
@@ -41,20 +47,29 @@ class TinySelfAttention(nn.Module):
         k = self.k_proj(x).view(self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(self.n_kv_heads, self.head_dim)
         cache.write(layer_idx, request_id, position, k, v)
-        keys, values = cache.read_prefix(layer_idx, request_id, position + 1)
-        keys = self._expand_kv(keys)
-        values = self._expand_kv(values)
-        scores = torch.einsum("hd,lhd->hl", q, keys) / math.sqrt(self.head_dim)
-        probs = torch.softmax(scores, dim=-1)
-        context = torch.einsum("hl,lhd->hd", probs, values)
+        context = self.attention_backend.attend(
+            q,
+            cache=cache,
+            layer_idx=layer_idx,
+            request_id=request_id,
+            length=position + 1,
+            n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+        )
         return self.o_proj(context.reshape(-1))
 
 
 class TinyDecoderLayer(nn.Module):
-    def __init__(self, config: TinyModelConfig) -> None:
+    def __init__(
+        self,
+        config: TinyModelConfig,
+        *,
+        attention_backend: PagedAttentionBackend | None = None,
+    ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
-        self.attn = TinySelfAttention(config)
+        self.attn = TinySelfAttention(config, attention_backend=attention_backend)
         self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_ff),
@@ -84,9 +99,15 @@ class TinyDecoderLayer(nn.Module):
 class TinyDecoderLM(nn.Module):
     """Tiny decoder-only LM whose attention cache is externally managed."""
 
-    def __init__(self, config: TinyModelConfig) -> None:
+    def __init__(
+        self,
+        config: TinyModelConfig,
+        *,
+        attention_backend: PagedAttentionBackend | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.attention_backend = attention_backend or ReferencePagedAttention()
         cpu_state = torch.random.get_rng_state()
         torch.manual_seed(config.seed)
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
@@ -94,7 +115,13 @@ class TinyDecoderLM(nn.Module):
             config.max_position_embeddings, config.d_model
         )
         self.layers = nn.ModuleList(
-            [TinyDecoderLayer(config) for _ in range(config.n_layers)]
+            [
+                TinyDecoderLayer(
+                    config,
+                    attention_backend=self.attention_backend,
+                )
+                for _ in range(config.n_layers)
+            ]
         )
         self.final_ln = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -109,11 +136,6 @@ class TinyDecoderLM(nn.Module):
         start_pos: int,
         cache: KVCacheBackend,
     ) -> tuple[torch.Tensor, ...]:
-        """Return final-normalized hidden states while materializing K/V.
-
-        v0.9 uses this as the replicated Transformer trunk before each rank
-        applies only its local LM-head vocabulary shard.
-        """
         if not token_ids:
             raise ValueError("token_ids cannot be empty")
         hidden_trace: list[torch.Tensor] = []

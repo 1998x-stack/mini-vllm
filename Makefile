@@ -1,4 +1,4 @@
-.PHONY: test examples check example-v07 example-v08 example-v09
+.PHONY: test examples check example-v07 example-v08 example-v09 example-v10 example-v11 example-v12
 
 test:
 	python -m pytest
@@ -14,6 +14,9 @@ examples:
 	python examples/08_speculative_decoding.py
 	python examples/09_executor_boundary.py
 	python examples/10_tensor_parallel.py
+	python examples/11_async_streaming.py
+	python examples/12_compile_aware.py
+	python examples/13_paged_attention.py
 
 check:
 	./scripts/check.sh
@@ -26,3 +29,12 @@ example-v08:
 
 example-v09:
 	PYTHONPATH=. python examples/10_tensor_parallel.py
+
+example-v10:
+	PYTHONPATH=. python examples/11_async_streaming.py
+
+example-v11:
+	PYTHONPATH=. python examples/12_compile_aware.py
+
+example-v12:
+	PYTHONPATH=. python examples/13_paged_attention.py

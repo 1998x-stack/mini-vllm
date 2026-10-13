@@ -1,6 +1,6 @@
-# mini-vLLM Architecture — v0.11
+# mini-vLLM Architecture — v0.12
 
-## Eager control and execution orchestration
+## Stable upper layers
 
 ```text
 AsyncEngine
@@ -11,36 +11,63 @@ DistributedExecutor
   ↓
 WorkerGroup
   ↓
-rank-local Worker
+rank-local Worker / ModelRunner
 ```
 
-These layers remain eager. They own lifecycle, policy, topology, transactions, and KV allocation.
+These layers keep the v0.11 semantics for lifecycle, scheduling, transactions, distributed rollback, compile-aware projection, streaming, cancellation, and backpressure.
 
-## Compile-aware rank-local boundary
+## Attention optimization boundary
 
 ```text
-TinyDecoder trunk + external KV                         eager
-        ↓
-hidden trace [tokens, hidden]
-        ↓
-ExecutionShapeSignature
-        ↓
-CompiledKernelCache
-   ├─ miss → torch.compile(PureTensorProjectionKernel)
-   ├─ hit  → reuse callable
-   └─ failure → eager fallback (policy-controlled)
-        ↓
-rank-local logits [tokens, local_vocab]
-        ↓
-ReferenceCollective                                     eager
+TinySelfAttention
+  │ q/k/v projection
+  │ write current K/V through cache backend
+  ▼
+PagedAttentionBackend
+  ├─ ReferencePagedAttention
+  │    └─ cache.read_prefix(): readable per-position gather
+  │
+  └─ VectorizedPagedAttention
+       └─ cache.read_prefix_vectorized():
+            positions tensor
+                ↓
+            logical block + offset
+                ↓
+            block-table tensor lookup
+                ↓
+            physical K/V advanced indexing
+  ↓
+identical GQA/MHA score → softmax → context math
+  ↓
+output projection
 ```
 
-The compiled function sees only tensors. It never sees request IDs, Scheduler objects, block tables, cancellation state, asyncio queues, or collective topology.
+The attention backend never allocates, frees, shares, evicts, or rolls back blocks. It consumes the current logical view produced by the cache manager.
 
-## Why projection first?
+## Logical versus physical length
 
-The vocabulary projection is a real model tensor operation with a stable, inspectable input/output contract. It demonstrates signature specialization and rank-local compile ownership without forcing Python KV management into Dynamo. v0.12 can widen optimization toward attention while this projection path remains a simple compile-aware reference.
+For block size `B`:
 
-## Failure semantics
+```text
+logical_block = position // B
+block_offset  = position % B
+physical      = block_table[logical_block]
+```
 
-Compile failure occurs before any extra serving commit. With fallback enabled the same eager tensor kernel runs and the surrounding KV/logical transaction proceeds unchanged. With strict mode the exception surfaces through the existing Executor/AsyncEngine error path.
+A request with logical length 5 and block size 2 owns three physical blocks, but only offsets corresponding to positions 0..4 are valid. The unused final slot must never enter attention even if it contains stale data.
+
+## GQA / MQA
+
+The cache stores `n_kv_heads`; the query tensor uses `n_heads`. When `n_heads > n_kv_heads`, both backends expand K/V heads with the same repeat mapping before score computation. Optimized gathering therefore changes storage access, not head semantics.
+
+## Prefix sharing / rollback
+
+Prefix caching may point multiple request block tables at one immutable physical block. Preemption and speculative rollback may later shorten or replace a request's private tail. Vectorized attention always resolves the current block table at call time, so it cannot retain stale physical addresses across those lifecycle changes.
+
+## Compile-aware projection remains separate
+
+v0.11's `CompiledKernelCache` still wraps only the rank-local vocabulary projection. Attention optimization and projection compilation are independent execution-plane mechanisms and can be inspected separately.
+
+## Fallback
+
+`VectorizedPagedAttention` records a fallback and uses the reference read when the selected cache backend does not implement vectorized paged access and fallback is enabled. Strict mode raises. CPU CI validates reference and vectorized PyTorch paths; no Triton/CUDA kernel is claimed in v0.12.
