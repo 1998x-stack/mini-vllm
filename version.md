@@ -1,432 +1,422 @@
-# mini-vLLM v1.3 — network serving / API boundary
+# mini-vLLM v1.4 — multi-model registry + model lifecycle/routing (planning branch)
 
 ## Version identity
 
-- Branch: `v1.3`
-- Previous: validated/frozen `v1.2`
-- Theme: bounded network bytes → validated API request → tokenizer → token-native runtime → committed JSON/SSE bytes
-- Package version: `1.3.0`
-- Runtime default: `create_engine()` selects v1.3
-- Status: implementation complete; release content is frozen by the exact-SHA CI/main synchronization rule
+- Branch: `v1.4`
+- Base: validated/frozen `v1.3` / `main`
+- Previous: `v1.3`
+- Theme: validated model identities become named routable runtime resources with explicit load/readiness/drain/unload lifecycle
+- Status: planning; runtime remains exactly v1.3 until v1.4 acceptance criteria pass
 
-## Why this version exists
+## Why v1.4
 
-v1.2 established a trustworthy startup boundary:
-
-```text
-external artifact bytes
-    ↓ validate
-runtime-owned model/tokenizer state
-    ↓ rank identity agreement
-READY
-```
-
-v1.3 adds the missing outer serving boundary:
+v1.3 completed the outer request boundary:
 
 ```text
-untrusted network bytes
-    ↓ bounded parse / API validation
-GenerateRequest
-    ↓ tokenizer
-Request(token IDs)
-    ↓ existing serving runtime
-committed StreamEvent
-    ↓ serialization
 network bytes
+→ validated API request
+→ tokenizer
+→ one artifact-bound engine
+→ committed response bytes
 ```
 
-The central lesson is that a listening socket, a valid API request, Scheduler admission and KV ownership are four different truths.
+The next distinct systems problem is not more HTTP. Real serving systems often host more than one model/version. Once multiple validated artifacts can coexist, model identity becomes a resource that must be routed, pinned, drained and released safely.
 
-## Delta from v1.2
-
-### Reference network server
-
-`mini_vllm/network/server.py` introduces a deliberately small `asyncio.start_server` HTTP/1.1 implementation. It uses no third-party web framework so request framing, limits, lifecycle and disconnect behavior remain inspectable.
-
-Supported educational contract:
+The new lesson is:
 
 ```text
-one request per TCP connection
-HTTP/1.1
-Content-Length request bodies
-application/json generation input
-Connection: close
-JSON terminal response
-SSE streaming response
+validated artifact identities
+        ↓
+ModelRegistry
+        ↓ lifecycle
+LOADING → READY → DRAINING → UNLOADED / FAILED
+        ↓ routing
+request chooses exactly one model
+        ↓ pin
+that model identity cannot change mid-request
+        ↓
+existing v1.3 network + async + execution stack
 ```
 
-Unsupported transfer-encoded/chunked requests are rejected rather than partially interpreted.
-
-### Public endpoints
+## Primary mental model
 
 ```text
-GET  /health
-GET  /ready
-POST /v1/generate
-POST /v1/generate/stream
+MODEL REGISTRY
+├─ alias: "blue"
+│    └─ artifact identity A
+├─ alias: "green"
+│    └─ artifact identity B
+└─ default route: "blue"
+        │
+        ▼
+validated API request
+├─ request_id
+├─ model = "green" (optional)
+└─ generation params
+        │
+        ▼
+route lookup
+        │
+        ├─ missing / not ready → reject before submit
+        ▼
+pin ModelLease(identity B)
+        │
+        ▼
+B-owned tokenizer + engine + workers/KV
+        │
+        ▼
+request terminal outcome
+        │
+        ▼
+release lease
 ```
 
-Generation JSON supports:
+A route/alias is not the model itself. An artifact identity is not a mutable registry slot. An in-flight request holds a stable lease to one loaded runtime instance.
+
+## Required delta
+
+### 1. Explicit model registry
+
+Introduce a parent-side `ModelRegistry` (or equivalent) that owns named loaded model runtimes. Preferred logical state per entry:
 
 ```text
-request_id        optional; deterministic server-generated ID otherwise
-prompt            required non-empty string
-max_new_tokens    required positive integer
-temperature       optional
-top_k             optional
-top_p             optional
+model_key / alias
+artifact identity
+lifecycle state
+generation/readiness generation number
+active request leases
+owned engine/runtime
+last failure (observable copy only)
 ```
 
-### Parse-before-submit contract
+Registry operations should be explicit rather than magical filesystem discovery.
 
-The server validates, in order:
+### 2. Model lifecycle state machine
 
-```text
-header byte limit
-HTTP request-line/version
-header syntax/body framing
-body byte limit
-method/path/content type
-UTF-8 JSON syntax
-exact API field set
-field types/ranges
-SamplingParams
-prompt tokenization
-max model length
-```
-
-Only then is a token-native core `Request` constructed and submitted.
-
-Malformed/invalid input therefore cannot create a hidden AsyncEngine/Core request.
-
-### Network configuration
-
-`NetworkConfig` contains:
+Preferred reference lifecycle:
 
 ```text
-host = 127.0.0.1
-port = 0
-max_inflight_requests
-max_request_bytes
-max_header_bytes
-disconnect_cancel
-shutdown_timeout_s
-```
-
-`RuntimeConfig.network` composes this with the existing artifact/cache/process/runtime configuration.
-
-### Ingress backpressure
-
-`NetworkServer` tracks submitted network requests in `_inflight` and checks `max_inflight_requests` before `engine.submit()`.
-
-```text
-valid request
-   ↓
-ingress slot available?
-   ├─ yes → submit
-   └─ no  → HTTP 429, no runtime request
-```
-
-This is intentionally independent from:
-
-```text
-AsyncEngine max_queue_size
-Scheduler max_num_seqs / token budget
-KV physical block capacity
-```
-
-### Non-stream response
-
-`POST /v1/generate` consumes the full `AsyncRequestHandle` event stream and returns one final JSON result.
-
-Draining intermediate token events is required even for non-stream clients because the existing AsyncEngine queue is bounded. Waiting only for terminal metadata could deadlock after the event queue fills.
-
-### SSE response
-
-`POST /v1/generate/stream` maps only committed runtime events:
-
-```text
-TokenEvent      → event: token
-FinishedEvent   → event: done
-CancelledEvent  → event: cancelled
-ErrorEvent      → event: error
-```
-
-The network layer has no direct access to speculative candidates or uncommitted logits.
-
-### Disconnect cancellation
-
-Once a request has been submitted, an independent reader task watches client EOF/reset. With `disconnect_cancel=True`:
-
-```text
-client disconnect
-    ↓
-AsyncRequestHandle.cancel()
-    ↓
-existing AsyncEngine cancellation intent
-    ↓
-cooperative EngineCore step boundary
-    ↓
-Scheduler/cache cleanup
-```
-
-`_disconnect_cancelled_ids` prevents duplicate disconnect accounting for one request.
-
-Worker termination is never used as a request-cancellation primitive.
-
-### Health and readiness
-
-The implementation makes these explicitly different:
-
-```text
-health
-  = NetworkServer is READY or DRAINING
-
-ready
-  = NetworkServer internal state is READY
-  + engine.snapshot() succeeds
-  + execution.healthy
-  + model artifact snapshot exists
-  + rank artifact identity agreement
-```
-
-A listener can therefore remain alive without falsely claiming model-serving readiness.
-
-### Lifecycle
-
-```text
-CREATED
-  ↓ start()
-STARTING
-  ↓ socket bind
+UNLOADED
+   ↓ load
+LOADING
+   ├─ validation/startup failure → FAILED
+   └─ all ranks ready           → READY
 READY
-  ↓ close()
+   ↓ drain
 DRAINING
-  ├─ stop accepts
-  ├─ cancel active handles
-  ├─ wait connection tasks
-  └─ cancel stuck network tasks after timeout
-  ↓
-CLOSED
+   ├─ active leases > 0 → wait/reject new work
+   └─ active leases = 0 → UNLOADING
+UNLOADING
+   ↓ workers/artifact resources reaped
+UNLOADED
 ```
 
-When deeper execution is unhealthy while the internal network state is READY, public `lifecycle_state` reports `unhealthy` and readiness is false.
+A failed model must not make unrelated ready models unusable unless the registry itself becomes unhealthy.
 
-### Resource ownership
+### 3. Stable request-to-model pinning
 
-Two construction modes are explicit:
+Routing happens before runtime submission.
 
 ```text
-engine.create_server(...)
-    → NetworkServer owns network resources only
-
-create_server(...)
-    → constructs v1.3 engine
-    → NetworkServer owns network + engine
+API request.model
+    ↓ resolve alias
+READY registry entry
+    ↓ acquire lease
+stable model identity/runtime generation
+    ↓ submit
 ```
 
-Closing the first leaves the external engine/workers alive. Closing the second calls engine `aclose()` and reaps workers/temporary artifact state.
+Changing an alias while requests are running must not move those requests to another model. The lease owns the resolved runtime generation until the request reaches one logical terminal outcome.
 
-### Network observability
+### 4. Default model routing
 
-`NetworkSnapshot` exposes read-only copied facts:
+Support a configured default route for requests without an explicit model field.
+
+The default is a routing policy fact, not an artifact identity. Changing the default affects only future requests.
+
+### 5. Network API extension
+
+Extend v1.3 generation request with optional:
+
+```json
+{
+  "model": "blue",
+  "prompt": "tok1 tok2",
+  "max_new_tokens": 4
+}
+```
+
+Response/stream terminal metadata should expose the resolved logical model key and immutable artifact identity (or a short safe representation) for provenance.
+
+Do not push route strings into Scheduler/KV/WorkItem internals. Routing must choose an engine before the token-native request enters that engine.
+
+### 6. Load contract
+
+Loading a model must reuse v1.2 artifact validation and v1.1/v1.2 child readiness semantics:
 
 ```text
-lifecycle_state
-host / port
-health / ready
-active_connections
-inflight_requests
-accepted_requests
-rejected_requests
-completed_requests
-cancelled_requests
-failed_requests
-disconnect_cancellations
+registry.load(key, artifact_path)
+        ↓
+parent artifact validation
+        ↓
+child independent validation/copy
+        ↓
+all rank identities agree
+        ↓
+entry becomes READY atomically
 ```
 
-No live socket/Worker/KV ownership object is exposed.
+A partially started model never becomes routable.
 
-## Architecture
+### 7. Drain contract
+
+Draining means:
 
 ```text
-NETWORK CLIENT
-      ↓
-NetworkServer
-      ↓ validated GenerateRequest
-WhitespaceTokenizer
-      ↓ token IDs
-AsyncEngine
-      ↓
-EngineCore / PrefixAwareBudgetedScheduler
-      ↓
-ArtifactMultiprocessExecutor
-      ↓
-validated child Worker + model + KV
-      ↓ acknowledged execution
-EngineCore logical commit
-      ↓
-AsyncRequestHandle committed events
-      ↓
-JSON / SSE response
+new lease acquisition forbidden
+existing leases continue normally
+        ↓
+active lease count reaches zero
+        ↓
+owned engine may close/unload
 ```
 
-All v1.2 artifact identity, process isolation, rollback, scheduling, KV, speculation and observability contracts remain underneath this new edge.
+Do not implement drain by cancelling healthy in-flight requests by default. A separate explicit force-unload policy may be taught later or exposed only as a narrow opt-in with clear semantics.
 
-## Files added
+### 8. Unload contract
+
+Normal unload requires no active leases. It closes the model-owned engine/workers and releases temporary/artifact runtime resources exactly once.
 
 ```text
-mini_vllm/network/__init__.py
-mini_vllm/network/types.py
-mini_vllm/network/server.py
-mini_vllm/versions/v1_3/__init__.py
-mini_vllm/versions/v1_3/engine.py
-tests/test_network_server.py
-examples/18_network_server.py
+active leases != 0
+→ normal unload rejected / waits according to explicit API
 ```
 
-## Existing files extended
+No request may observe a runtime whose workers were reaped underneath it.
+
+### 9. Alias replacement / version switch
+
+A useful reference operation is atomic future-routing replacement:
 
 ```text
-mini_vllm/runtime.py              NetworkConfig + RuntimeConfig.network
-mini_vllm/observability.py        NetworkSnapshot
-mini_vllm/versions/__init__.py    v1.3 default/routing
-mini_vllm/__init__.py             public network API
-pyproject.toml                    1.3.0
-scripts/check.sh                  example 18 release gate
-tests/test_model_artifacts.py     explicit historical v1.2 default pin
-README.md / Agents.md / Plan.md / docs/* / version.md
+load B until READY
+        ↓
+atomically route alias "prod" → B
+        ↓
+old A becomes optionally DRAINING
 ```
 
-## Critical invariants added
+Existing A leases stay pinned to A. New requests resolve to B.
 
-### Parse before submit
+This teaches zero-cross-request identity mixing without implementing production deployment orchestration.
+
+### 10. Registry concurrency / synchronization
+
+Load, route, drain, alias swap and unload can race with network requests. Use one explicit async synchronization boundary (lock/state machine) around registry metadata changes.
+
+Never hold the registry metadata lock across long model inference. Lease acquisition should be short; request execution proceeds outside the registry lock.
+
+### 11. Registry observability
+
+Add read-only snapshots such as:
 
 ```text
-invalid HTTP/API input
-    ⇒ no AsyncEngine/Core request exists
+registry lifecycle / default route
+per-model key
+artifact identity
+model state
+ready
+runtime generation
+active leases
+accepted/completed/cancelled/failed request counts
+load/unload counts
+last load error type/message (copied string facts)
 ```
 
-### Capacity separation
+Do not expose live engine, process, parameter, socket or KV handles.
+
+### 12. Failure isolation
+
+Required teaching behavior:
 
 ```text
-network ingress slot
-!= async event queue
-!= Scheduler admission/budget
-!= KV reservation
+model A load fails
+    ↓
+A = FAILED
+B remains READY and routable
 ```
 
-### Committed-only visibility
+Likewise, if A's executor becomes unhealthy, readiness/routing for A must fail without falsely marking healthy B unavailable.
+
+## Critical invariants
+
+### Route-before-submit
+
+A request cannot be submitted until its model key resolves to one READY runtime generation.
+
+### Stable identity pin
 
 ```text
-network token bytes
-    require
-committed TokenEvent
+resolved model identity at lease acquisition
+== model identity for every token/event of that request
 ```
 
-### Disconnect semantics
+Alias/default changes affect future requests only.
+
+### Drain safety
+
+DRAINING rejects new leases but does not silently cancel existing healthy leases.
+
+### Unload safety
+
+A model runtime cannot be normally destroyed while active leases remain.
+
+### No cross-model ownership
+
+Request IDs, Scheduler state, cache blocks and worker state belong to one engine/model runtime. Model A cannot read/release/mutate model B physical state.
+
+### Tokenizer binding
+
+The tokenizer used for a request is the tokenizer of the same pinned model artifact. Route switching cannot tokenize with A and execute on B.
+
+### Failure isolation
+
+Failure/unhealthiness of one model entry does not change the readiness of unrelated healthy entries.
+
+### Default-route truth
+
+The default model is an alias/routing choice, not a hidden global engine identity.
+
+### Exact terminal lease release
+
+Every successfully acquired request lease is released exactly once after finished/cancelled/error lifecycle convergence.
+
+### Historical boundaries preserved
+
+All v1.3 invariants remain active inside each model runtime: bounded network parsing, ingress capacity, committed-only streaming, cooperative cancellation, artifact identity, multiprocessing acknowledgment and KV ownership.
+
+## Preferred modules
+
+Possible readable layout:
 
 ```text
-socket disconnect
-→ cancellation intent
-→ cooperative runtime cleanup
+mini_vllm/registry/
+├─ __init__.py
+├─ types.py
+└─ registry.py
+
+mini_vllm/network/
+└─ server.py          # route before per-model submit
+
+mini_vllm/versions/v1_4/
+├─ __init__.py
+└─ engine.py
 ```
 
-not worker death and not direct physical mutation.
+Prefer a thin `MultiModelServer`/facade over teaching every lower-level engine that models are globally shared.
 
-### Readiness truth
+## Tests required
+
+### Loading / readiness
+
+- load two deterministic artifact models under different keys;
+- both independently reach READY;
+- artifact/rank identity is correct per entry;
+- malformed model load becomes FAILED before routing;
+- failure of A leaves B routable.
+
+### Routing
+
+- explicit model key routes to correct engine/output;
+- missing model uses default route;
+- unknown/not-ready/draining model rejects before runtime submission;
+- response/SSE provenance reports resolved model identity.
+
+### Pinning / alias swap
+
+- start a long request on alias `prod → A`;
+- load B and atomically change `prod → B`;
+- first request finishes entirely on A;
+- later request runs entirely on B;
+- outputs match direct per-model references.
+
+### Drain / unload
+
+- DRAINING rejects new leases;
+- existing request completes without forced cancellation;
+- normal unload cannot destroy active leased runtime;
+- once leases reach zero, unload reaps workers/resources;
+- repeated unload does not double-release.
+
+### Cancellation / disconnect
+
+- network disconnect cancels only the pinned model request;
+- lease is released exactly once after cancellation;
+- other model entries remain unaffected.
+
+### Isolation
+
+- duplicate request IDs may exist on different model engines if the public registry contract namespaces them explicitly, or are globally rejected if global uniqueness is chosen; behavior must be explicit and tested;
+- cache/scheduler snapshots for one model never contain the other model's requests;
+- unhealthy A does not make `/ready` semantics for B ambiguous—define aggregate/global readiness explicitly.
+
+### Regression
+
+All v0.1–v1.3 tests and examples 01–18 remain green.
+
+## Integrated example target
+
+Add `examples/19_multi_model_registry.py`:
 
 ```text
-listener bound != ready
+export model A and B
+→ create v1.4 registry/server
+→ load A as blue
+→ load B as green
+→ set default blue
+→ request default / explicit green
+→ start long blue request
+→ atomically switch default to green
+→ prove old request pinned to blue
+→ drain/unload blue after lease release
+→ snapshot registry
+→ close and prove all workers reaped
 ```
 
-Readiness depends on the deeper artifact-bound executor being healthy and rank identities agreeing.
+## Acceptance criteria
 
-### Ownership-aware shutdown
-
-A wrapper closes only the resources it owns. An owned server leaves no worker process alive after successful close.
-
-### Semantic equivalence
-
-Equivalent v1.3 HTTP generation produces the same committed token IDs as direct v1.2 serving.
-
-## Tests
-
-`tests/test_network_server.py` adds real loopback TCP coverage for:
-
-1. health/readiness lifecycle;
-2. read-only/equal network snapshots;
-3. external-engine ownership preservation;
-4. JSON output equivalence with direct v1.2;
-5. owned server worker cleanup;
-6. SSE committed-token ordering + one done event;
-7. malformed JSON rejection;
-8. unknown-field rejection;
-9. content-type rejection;
-10. request-body byte limit;
-11. rejection-before-runtime proof;
-12. duplicate request ID → HTTP 409;
-13. ingress `max_inflight_requests` → HTTP 429 without hidden request;
-14. streaming client disconnect → cooperative cancellation;
-15. disconnect cancellation accounting;
-16. header byte limit → HTTP 431.
-
-Existing v0.1–v1.2 regressions continue to run.
-
-The first implementation CI exposed one governance-only failure: a historical v1.2 test still called bare `create_engine()` while asserting `engine.version == "v1.2"`. Since the global default correctly moved to v1.3, that historical test was pinned explicitly to `create_engine("v1.2", ...)`; no runtime mechanism changed.
-
-## Example 18
-
-`examples/18_network_server.py` demonstrates:
-
-```text
-construct owned v1.3 server
-→ bind 127.0.0.1:0
-→ GET /health
-→ GET /ready
-→ JSON generation
-→ SSE generation
-→ inspect NetworkSnapshot
-→ inspect artifact RuntimeSnapshot
-→ close
-→ prove worker_alive == False
-```
-
-The client is also implemented with standard-library asyncio TCP primitives so the walkthrough adds no web-client dependency.
-
-## Validation evidence
-
-After the historical test pin, repository GitHub Actions ran:
-
-```text
-109 passed, 1 environment warning
-examples 01–18
-all checks passed
-```
-
-The warning is the existing PyTorch notice that NumPy is not installed; the v1.3 reference path does not require NumPy.
-
-The frozen documentation tree and cleaned two-commit release SHA must independently pass the same gate before `main` advances.
+- at least two validated model runtimes can coexist under explicit registry keys;
+- each entry has an observable lifecycle state;
+- load failure cannot make an invalid model routable;
+- API requests resolve a READY model before submission;
+- default and explicit model routing are deterministic;
+- each request is pinned to one runtime generation/artifact/tokenizer for its full lifetime;
+- alias/default replacement affects future requests only;
+- DRAINING rejects new work but preserves existing healthy requests;
+- normal unload occurs only after active leases reach zero;
+- unload closes/reaps only that model's owned resources;
+- one model's failure/unhealthiness is isolated from unrelated ready models;
+- registry snapshot is read-only and exposes no physical handles;
+- v1.3 network/KV/process/artifact invariants remain intact per model;
+- examples 01–18 remain green plus a v1.4 multi-model lifecycle walkthrough;
+- exact cleaned release SHA passes repository CI before `main` advances.
 
 ## Non-goals
 
-- production HTTP parser/compliance;
-- HTTP/2 or HTTP/3;
-- TLS/certificate management;
-- authentication/API keys;
-- tenant/account quotas;
-- OpenAI API compatibility;
-- chat templates/tool calls;
-- WebSocket transport;
-- reverse proxy functionality;
-- multi-node load balancing/routing;
-- production metrics exporters;
-- new Scheduler/KV/model algorithms.
+- production autoscaling;
+- GPU memory packing across real devices;
+- tensor-parallel placement planner;
+- model download registry / Hugging Face Hub;
+- LRU model eviction under memory pressure;
+- quantization/LoRA adapter multiplexing;
+- production deployment controller;
+- canary percentage traffic splitting;
+- tenant auth/billing/rate limiting;
+- multi-node distributed routing;
+- cross-model shared KV;
+- request migration between models;
+- force-kill hot swap as the normal deployment path.
 
-## Learning outcome
+## Learning goal
 
-A reader should be able to explain why exposing an LLM runtime over a socket creates a new ownership boundary: bytes require bounded parsing and API validation, edge ingress capacity must remain separate from model scheduling/storage, disconnect is cancellation intent rather than process death, readiness depends on deeper runtime truth, and only committed runtime events may become externally visible response bytes.
-
-## Next direction
-
-A suitable v1.4 target is **multi-model registry + model lifecycle/routing**: load multiple validated model identities, route each request to exactly one model, pin that identity for the request lifetime, and teach load/readiness/drain/unload without cross-model request/KV leakage. Merely adding more HTTP protocol features is not a sufficiently distinct next lesson.
+By v1.4 a reader should be able to explain why multi-model serving is fundamentally a lifecycle/ownership problem: aliases route only future work, every request must acquire a stable lease to one validated runtime generation, draining separates new admission from existing execution, unload waits for ownership to reach zero, and failures stay isolated per model rather than leaking across the registry.
