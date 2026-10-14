@@ -4,7 +4,7 @@ A small, branch-versioned LLM-serving runtime for learning the systems ideas beh
 
 ## Current line
 
-`main` is always the newest exact-CI-validated release. v1.2 adds the missing boundary before serving starts: external model/tokenizer files must become validated runtime-owned state before any request is admitted.
+`main` is always the newest exact-CI-validated release. v1.3 adds the outer serving boundary: bounded HTTP bytes become a validated API request, then tokenizer output, then the existing token-native runtime. Only committed runtime events may become network bytes.
 
 ```text
 v0.1  static batching + contiguous KV
@@ -22,199 +22,173 @@ v0.12 reference + vectorized PagedAttention
 v0.13 prefix-aware scheduling + cache-aware admission
 v1.0  integrated educational runtime
 v1.1  real multiprocessing executor transport
-v1.2  model artifact + tokenizer loading boundary       ← current
+v1.2  model artifact + tokenizer loading
+v1.3  network serving + API boundary               ← current
 ```
 
-Historical builders remain available for mechanism-by-mechanism study.
+Historical builders remain available so each mechanism can be studied independently.
 
-## v1.2 mental model
+## v1.3 mental model
 
 ```text
-external model directory
-├─ model_config.json
-├─ weights.pt
-└─ tokenizer.json
-        ↓
-ArtifactLoader
-├─ exact schema/version checks
-├─ tokenizer/model compatibility
-├─ complete tensor-name coverage
-├─ shape + dtype validation
-└─ stable ModelArtifactIdentity
-        ↓
-ValidatedModelArtifact
-        ↓
-WorkerSpec(path + identity)
-        ↓ IPC process startup
-child rank 0      child rank 1      ...
-re-validate       re-validate
-copy weights      copy weights
-into runtime      into runtime
-owned model       owned model
-        ↓              ↓
-ready(identity)   ready(identity)
-        └──────┬───────┘
-               ↓
-all ranks agree before serving
-               ↓
-existing v1.1 Scheduler / KV / speculation / async path
+TCP connection
+      ↓
+HTTP/1.1 bytes
+      ↓ bounded parse / validation
+GenerateRequest
+      ↓ tokenizer
+core Request(token IDs)
+      ↓
+AsyncEngine → EngineCore → Scheduler
+      ↓
+ArtifactMultiprocessExecutor
+      ↓
+child Worker / model / KV
+      ↓
+committed AsyncRequestHandle events
+      ↓
+JSON response or SSE stream
 ```
 
-The central ownership rule is:
+The central separation is:
 
 ```text
-artifact bytes / parsed metadata
+network ingress permission
         !=
-validated artifact identity
+AsyncEngine delivery capacity
         !=
-runtime-owned parameter storage
+Scheduler admission
         !=
-request token history
+KV capacity / ownership
 ```
 
-Filesystem presence is not proof that a model is valid.
+A network slot only permits a validated request to enter the Python serving facade. It does not reserve Scheduler capacity, tokens or KV blocks.
 
-## Educational artifact format
+## Reference HTTP API
 
-v1.2 intentionally supports one small local format:
+v1.3 intentionally uses `asyncio.start_server` instead of a web framework so the protocol boundary stays visible. The educational subset supports one request per connection, `Content-Length`, JSON bodies and `Connection: close`.
 
 ```text
-model_dir/
-├─ model_config.json
-├─ weights.pt
-└─ tokenizer.json
+GET  /health
+GET  /ready
+POST /v1/generate
+POST /v1/generate/stream
 ```
 
-The loader rejects missing or unexpected manifest fields, unsupported format versions, incompatible model dimensions, missing/unexpected checkpoint tensors, wrong tensor shape/dtype, non-tensor checkpoint entries, tokenizer/model vocabulary disagreement and malformed special-token metadata.
+Example request:
 
-`weights.pt` is read with `torch.load(..., weights_only=True)`. The first format accepts only the explicitly declared TinyDecoder architecture and float32 artifact weights. No arbitrary checkpoint code execution or remote model code is part of the contract.
+```json
+{
+  "request_id": "demo",
+  "prompt": "tok1 tok2",
+  "max_new_tokens": 4,
+  "temperature": 0.0
+}
+```
 
-## Stable artifact identity
+`/v1/generate` returns one JSON terminal result. `/v1/generate/stream` sends Server-Sent Events named `token`, then exactly one terminal event (`done`, `cancelled` or `error`) while the connection remains writable.
 
-A validated artifact receives a logical identity derived from:
+The server rejects malformed request lines/headers, unsupported transfer encoding, oversized headers/bodies, invalid JSON, unknown fields, invalid sampling parameters and duplicate request IDs before hidden model work can be created.
+
+## Health versus readiness
+
+These are intentionally different truths:
 
 ```text
-artifact format + architecture
-model metadata digest
-weights content/manifest digest
-tokenizer digest
+health = managed network server is alive
+ready  = health
+       + server accepts new work
+       + underlying executor is healthy
+       + model artifact identities agree across ranks
 ```
 
-A path is not identity. Every child rank independently re-loads the configured artifact and must report the same identity before the executor becomes ready.
+A listening socket by itself is not proof that serving is ready. During draining the server can remain alive while readiness is false.
 
-## Runtime-owned parameters
+## Disconnect cancellation
 
-Validated checkpoint tensors are copied into a newly constructed `TinyDecoderLM` under `no_grad`:
+A submitted request remains owned by the normal async/runtime lifecycle. Client disconnect is translated into cancellation intent:
 
 ```text
-external checkpoint tensor
-        ↓ validate
-runtime parameter target
-        ↓ copy
-runtime-owned storage
+socket EOF/reset
+     ↓
+AsyncRequestHandle.cancel()
+     ↓
+existing cooperative cancellation boundary
+     ↓
+EngineCore releases logical/physical state safely
 ```
 
-The runtime does not retain the loader-side checkpoint dictionary as serving state. Mutating the external container after the copy does not mutate the already-built model.
+The network layer never kills a worker process to cancel one request.
 
-## Text boundary, token-native core
+## Network backpressure
 
-The tokenizer is deliberately small and readable: a whitespace vocabulary with deterministic unknown-token handling.
+`NetworkConfig.max_inflight_requests` bounds API-edge in-flight requests. When full, a valid new request receives HTTP 429 before `engine.submit(...)`; no hidden runtime request is created.
 
-```python
-engine = create_engine("v1.2", model_artifact="/path/to/model")
-ids = engine.encode("tok1 tok2 tok3")
-text = engine.decode(ids)
-handle = engine.submit_text("r", "tok1 tok2 tok3", max_new_tokens=4)
-```
+This is independent from:
 
-Strings stop at the tokenizer boundary. Scheduler, WorkItem, KV cache, model runner and speculative decoding continue to operate only on token IDs.
+- `AsyncEngine.max_queue_size`, which bounds per-request event delivery;
+- Scheduler sequence/token budgets;
+- paged-KV physical capacity.
 
-## Construction
+## Construction and ownership
 
-The default builder is v1.2:
-
-```python
-from mini_vllm import RuntimeConfig, create_engine
-
-engine = create_engine(runtime_config=RuntimeConfig())
-```
-
-With no explicit model directory, the educational builder exports the deterministic tiny model into a temporary local artifact and then goes through the same loader/validation/child-reload path. There is no hidden in-memory model-construction bypass.
-
-For a persistent artifact:
+The default engine is v1.3:
 
 ```python
 from mini_vllm import create_engine
 
-engine = create_engine("v1.2", model_artifact="./model_dir")
+engine = create_engine()
+server = engine.create_server()   # server does not own engine
+await server.start()
+...
+await server.close()
+await engine.aclose()
 ```
 
-`RuntimeConfig(model_artifact=...)` is also supported. The validated artifact config is authoritative for model dimensions and vocabulary.
-
-Historical references remain explicit:
+Or construct an owned server:
 
 ```python
-v10 = create_engine("v1.0")   # integrated in-process reference
-v11 = create_engine("v1.1")   # multiprocessing reference
-v12 = create_engine("v1.2", model_artifact="./model_dir")
+from mini_vllm import NetworkConfig, create_server
+
+server = create_server(network_config=NetworkConfig(port=0))
+await server.start()
+...
+await server.close()  # also closes/reaps the engine it created
 ```
 
-## Multiprocess readiness
-
-v1.2 extends v1.1 readiness:
-
-```text
-process alive
-+ artifact parses
-+ tensor coverage/shape/dtype valid
-+ tokenizer/model compatible
-+ runtime parameter copy succeeds
-+ child artifact identity == parent-validated identity
-+ every rank agrees
-= ready
-```
-
-If any child observes changed or invalid files after parent validation, startup fails before request admission and already-started workers are shut down/reaped.
+`RuntimeConfig.network` carries network knobs alongside the already-stable model/cache/multiprocess configuration.
 
 ## Observability
 
-`engine.snapshot()` remains read-only and now exposes logical model facts:
-
-- artifact identity and architecture;
-- artifact format version;
-- tokenizer identity and compatibility ID;
-- vocabulary size;
-- artifact weight dtype versus runtime dtype/device;
-- per-rank artifact/tokenizer identity;
-- `rank_identity_agreement`.
-
-It still does not expose checkpoint dictionaries, parameter pointers or child storage handles.
-
-## Existing serving semantics remain intact
-
-v1.2 does not add a new scheduling, KV, speculative, attention or transport algorithm. After model readiness, the existing stack remains:
+`server.snapshot()` returns only copied logical facts:
 
 ```text
-AsyncEngine
-→ EngineCore
-→ PrefixAwareBudgetedScheduler
-→ ArtifactMultiprocessExecutor
-→ child Worker / ModelRunner / transactional paged KV
-→ PagedAttention / compile-aware projection
-→ speculative verification / Sampler
-→ committed async events
+lifecycle state
+bound host / port
+health / ready
+active connections
+in-flight requests
+accepted / rejected requests
+completed / cancelled / failed requests
+disconnect cancellations
 ```
 
-Exporting the deterministic v1.1 TinyDecoder into the v1.2 format and loading it back produces the same deterministic output for world sizes 1 and 2 under equivalent serving configuration.
+It exposes no live socket, Worker, block table or parameter-storage handle.
+
+The existing `engine.snapshot()` remains the deeper runtime view for model identity, Scheduler, cache, process transport, attention and compile observations.
+
+## Protocol scope
+
+v1.3 is deliberately not a production HTTP server. It does not teach HTTP/2, TLS, chunked request bodies, authentication, tenant rate limits, OpenAI API compatibility, reverse proxying or multi-node routing. Those concerns are kept separate from the API-edge ownership lesson.
 
 ## Walkthrough
 
 ```bash
 pip install -e '.[dev]'
-python examples/17_model_loading.py
+python examples/18_network_server.py
 ```
 
-The example exports a tiny artifact, prints its identity, loads it into two real worker processes, tokenizes text, serves it, decodes output and proves the worker ranks agree on model identity through the public snapshot.
+The example binds `127.0.0.1:0`, checks health/readiness, performs JSON and SSE generation, inspects network/runtime snapshots and proves owned worker cleanup.
 
 ## Verify
 
@@ -222,6 +196,14 @@ The example exports a tiny artifact, prints its identity, loads it into two real
 ./scripts/check.sh
 ```
 
-The current v1.2 implementation candidate passes 101 pytest tests plus examples 01–17. Only the exact final release SHA with green repository CI may advance `main`.
+The v1.3 implementation gate runs all historical regressions plus examples 01–18. The validated implementation tree reached:
+
+```text
+109 passed, 1 environment warning
+examples 01–18
+all checks passed
+```
+
+The warning is PyTorch noting that NumPy is not installed; the reference runtime does not require NumPy for this path.
 
 Read `Agents.md`, `Plan.md`, `docs/ARCHITECTURE.md`, `docs/INVARIANTS.md`, and `version.md` before changing architecture.

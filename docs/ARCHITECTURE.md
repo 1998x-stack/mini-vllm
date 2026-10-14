@@ -1,306 +1,302 @@
-# mini-vLLM Architecture — v1.2
+# mini-vLLM Architecture — v1.3
 
-## Complete startup + serving stack
+## Complete serving stack
 
-v1.2 adds a model-ingestion boundary before the validated v1.1 multiprocessing serving stack.
-
-```text
-EXTERNAL LOCAL FILES
-model_config.json / weights.pt / tokenizer.json
-        ↓
-ArtifactLoader
-├─ exact schema/version validation
-├─ model-dimension validation
-├─ tokenizer compatibility validation
-├─ complete tensor manifest validation
-└─ stable artifact identity
-        ↓
-ValidatedModelArtifact
-        ↓
-parent creates serializable ModelArtifactSpec
-        ↓
-ArtifactMultiprocessExecutor
-        ├───────────────┬───────────────┐
-        ↓               ↓               ↓
-child rank 0        child rank 1    child rank N
-re-validate files   re-validate     re-validate
-build model         build model     build model
-copy weights        copy weights    copy weights
-build KV/runner     build KV/runner build KV/runner
-        ↓               ↓               ↓
-ready(identity)     ready(identity)  ready(identity)
-        └───────────────┴───────────────┘
-                        ↓
-             all identities agree
-                        ↓
-PARENT SERVING STACK
-AsyncEngine → EngineCore → Scheduler → IPC execution
-                        ↓
-               committed async events
-```
-
-There are now two independent trust/ownership boundaries:
+v1.3 wraps the validated v1.2 artifact/multiprocess runtime with an explicit network edge.
 
 ```text
-external artifact truth  → validated/runtime-owned model truth
-parent logical truth     ↔ child physical execution truth
-```
-
-Neither boundary may be collapsed into the other.
-
-## Artifact ownership
-
-### External files
-
-The model directory is external input. Filesystem existence, successful JSON parsing or successful `torch.load` does not establish compatibility.
-
-### ArtifactLoader
-
-The loader owns parsing and validation only. It produces immutable logical metadata (`ValidatedModelArtifact`, `ModelArtifactSpec`, `ModelArtifactIdentity`) and temporary checkpoint tensor containers used during validation/copy. It does not own a serving model, request or worker.
-
-The first format accepts exactly:
-
-```text
-model_config.json
-weights.pt
-tokenizer.json
-```
-
-and one architecture identifier: `tiny-decoder-lm`.
-
-### ModelArtifactIdentity
-
-Identity is derived from:
-
-```text
-format version + architecture
-model metadata digest
-weights content/manifest digest
-tokenizer digest
-```
-
-A filesystem path is location, not identity. Two ranks may read the same path only after independently proving the expected identity.
-
-## Manifest and tensor validation
-
-`model_config.json` declares the exact TinyModel configuration, artifact weight dtype and tokenizer compatibility ID. Unknown or missing fields are rejected.
-
-`build_weight_mappings()` creates the complete external-name → runtime-name contract from the runtime architecture:
-
-```text
-WeightMapping
-├─ external_name
-├─ runtime_name
-├─ expected_shape
-└─ expected_dtype
-```
-
-For the v1.2 reference format names are intentionally identical, but the mapping remains explicit so file naming and runtime module ownership stay conceptually separate.
-
-Accepted checkpoint state must satisfy set equality:
-
-```text
-external tensor names == expected required tensor names
-```
-
-Then every tensor must match shape and supported artifact dtype. Missing, unexpected, wrong-shape, wrong-dtype and non-tensor entries fail before runtime construction succeeds.
-
-`torch.load(..., weights_only=True)` is used for the local educational checkpoint. Arbitrary Python checkpoint code is outside the format contract.
-
-## Runtime model factory
-
-The runtime never serves directly from a checkpoint dictionary.
-
-```text
-validated source tensor
-        ↓
-new TinyDecoderLM parameter target
-        ↓ target.copy_(source) under no_grad
-runtime-owned parameter storage
-```
-
-After copying, loader/checkpoint container lifetime is irrelevant to the model's parameter values. Device/runtime dtype conversion happens after the accepted float32 artifact state is copied.
-
-## Tokenizer boundary
-
-`WhitespaceTokenizer` is intentionally readable:
-
-```text
-text
- ↓ split on Unicode whitespace
-vocabulary lookup
- ↓ unknown → declared unk ID
-list[int]
-```
-
-Decode validates every ID is in range and joins vocabulary strings with spaces.
-
-Before readiness:
-
-```text
-tokenizer.compatibility_id == model.tokenizer_compatibility_id
-tokenizer.vocab_size        == model.vocab_size
-```
-
-The serving core remains token-native. Strings do not enter Scheduler, KV cache, WorkItem, ModelRunner or speculative contracts.
-
-## Parent validation versus child validation
-
-Parent validation establishes the artifact expected by one engine:
-
-```text
-parent load_model_artifact(path)
-        ↓
-ModelArtifactSpec(path, expected_identity, model_config, dtype, tokenizer ID)
-```
-
-Each worker child then independently calls the loader again with `expected_identity`.
-
-This catches a time-of-check/time-of-startup change:
-
-```text
-parent validates artifact A
-files change to artifact B
-child loads B
-identity B != expected A
-→ startup error
-→ no READY
-→ no request admission
-```
-
-The parent does not serialize a huge state dict through IPC in v1.2. Weight-distribution optimization is deliberately separate from artifact validation.
-
-## Worker readiness
-
-v1.1 readiness meant that the process/worker stack constructed successfully. v1.2 requires model-specific readiness:
-
-```text
-process started
-+ local artifact readable
-+ schema/version valid
-+ tokenizer compatible
-+ exact weight coverage valid
-+ runtime parameter copy complete
-+ reported artifact identity == parent expected
-+ every rank reports same tokenizer identity
-= executor ready
-```
-
-If a later rank fails while earlier ranks are ready, `ArtifactMultiprocessExecutor` shuts down/reaps the already-created clients before surfacing startup failure.
-
-## Parent serving ownership
-
-After readiness, v1.2 reuses v1.1 responsibilities unchanged:
-
-- `ArtifactAsyncEngine`: caller handles, stream delivery, cancellation and lifecycle; plus text convenience methods.
-- `ArtifactIntegratedEngine`: EngineCore logical truth and public artifact snapshot composition.
-- `PrefixAwareBudgetedScheduler`: admission, budget, fairness and preemption policy.
-- `ArtifactMultiprocessExecutor`: IPC, correlation, remote transactions, process health and rank identity agreement.
-- child Worker/ModelRunner/KV: physical model execution and cache ownership.
-
-Artifact identity is not a scheduling input.
-
-## Process transport
-
-The v1.1 fixed command protocol remains unchanged for serving work. `WorkerSpec` gains an optional serializable `artifact_spec`; historical v1.1 workers leave it `None`.
-
-Rank readiness/execution observations may include:
-
-```text
-artifact_identity
-tokenizer_identity
-artifact_architecture
-```
-
-These are logical provenance facts, not parameter-storage handles.
-
-## Default construction without a bypass
-
-`create_engine()` defaults to v1.2. For teaching convenience, if no external path is supplied it:
-
-```text
-construct deterministic TinyDecoderLM only for export
-        ↓
-write temporary v1.2 artifact
-        ↓
-load_model_artifact(temp_dir)
-        ↓
-start child ranks from that same artifact spec
-```
-
-The serving workers therefore still cross the artifact boundary. The temporary directory is runtime-owned lifecycle state and is removed only after child workers have stopped.
-
-## Read-only observability
-
-`engine.snapshot()` adds:
-
-```text
-RuntimeSnapshot.model_artifact
-├─ identity
-├─ architecture
-├─ format_version
-├─ tokenizer_identity
-├─ tokenizer_compatibility_id
-├─ vocab_size
-├─ weight_dtype
-├─ runtime_dtype
-├─ device
-└─ rank_identity_agreement
-
-RankExecutionSnapshot
-├─ existing v1.1 process/attention/compile facts
-├─ artifact_identity
-├─ tokenizer_identity
-└─ artifact_architecture
-```
-
-No raw checkpoint tensors, parameter pointers or mutable loader objects are exposed. Existing snapshot reads remain non-serving observations.
-
-## Request path
-
-Text convenience path:
-
-```text
-caller text
-  ↓ WhitespaceTokenizer
-prompt token IDs
-  ↓ normal Request
+NETWORK CLIENT
+      │
+      ▼
+TCP connection
+      │
+      ▼
+NetworkServer
+├─ bounded HTTP/1.1 parsing
+├─ endpoint/method/content-type validation
+├─ JSON → GenerateRequest
+├─ ingress-capacity accounting
+├─ health/readiness
+├─ disconnect watcher
+└─ JSON/SSE serialization
+      │
+      ▼
+WhitespaceTokenizer
+      │ text → token IDs
+      ▼
+Request
+      │
+      ▼
 AsyncEngine
-  ↓
-EngineCore / Scheduler
-  ↓
-remote prefix/KV/model work
-  ↓ matching acknowledged results
-logical commit
-  ↓
-TokenEvent
+      │ pending / bounded event queue / cancellation intent
+      ▼
+EngineCore
+      │ logical truth / atomic step / commit authority
+      ▼
+PrefixAwareBudgetedScheduler
+      │ admission / token budget / fairness
+      ▼
+ArtifactMultiprocessExecutor
+      │ IPC / worker health / rollback / rank identity
+      ├────────────────────┐
+      ▼                    ▼
+child rank 0          child rank N
+Worker                Worker
+├─ validated model    ├─ validated model
+├─ paged KV           ├─ paged KV
+├─ PagedAttention     ├─ PagedAttention
+└─ compile cache      └─ compile cache
+      │                    │
+      └──── acknowledged rank results ────┐
+                                          ▼
+                                  EngineCore commit
+                                          │
+                                          ▼
+                               AsyncRequestHandle events
+                                          │
+                                          ▼
+                                  JSON or SSE bytes
 ```
 
-Direct token-ID requests continue to bypass the tokenizer and use the same core.
+## Five ownership layers
 
-## Failure layers
+### 1. Network connection ownership
 
-### Artifact validation failure
+`NetworkServer` owns TCP listeners, connection tasks, protocol parsing, request byte limits, network ingress slots, health/readiness and response serialization.
 
-Malformed/incompatible files fail during parent construction before workers/requests exist.
+It does not own Scheduler policy, KV blocks, model parameters or child processes unless it also owns the engine as a higher-level resource.
 
-### Child artifact divergence
+### 2. Async request ownership
 
-If child re-validation disagrees with the parent identity, readiness fails. The child sends a structured startup error and the executor reaps partial startup state.
+`AsyncEngine` owns pending submissions, `AsyncRequestHandle`, bounded per-request event queues and cancellation intent. Network backpressure may delay consumption of these events, but cannot modify their meaning.
 
-### Serving child error/transport death
+### 3. Logical serving ownership
 
-Once ready, v1.1 failure atomicity remains authoritative: remote checkpoints, matching responses, rollback of reachable state, unhealthy executor on unknown physical consistency and no EngineCore logical commit on uncertain execution.
+`EngineCore` remains the logical commit authority. Only it may advance request state after physical execution is acknowledged.
 
-### Caller cancellation
+### 4. Artifact/execution ownership
 
-Cancellation remains an EngineCore/Async lifecycle operation. It neither modifies model artifacts nor kills healthy workers.
+The v1.2 contracts remain unchanged:
 
-## Stable equivalence oracles
+```text
+external artifact bytes
+   ↓ strict validation
+ValidatedModelArtifact
+   ↓ explicit parameter copy
+child runtime-owned model state
+```
 
-- exported deterministic v1.1 TinyDecoder weights are the v1.2 model-loading semantic oracle;
-- world-size 1 and 2 v1.2 outputs must equal v1.1 under equivalent configuration;
-- reference PagedAttention remains the attention oracle;
-- eager LM-head projection remains the compile oracle;
-- paged block translation remains the KV oracle;
-- `docs/INVARIANTS.md` is the complete cross-version contract.
+Each worker independently proves the configured artifact identity before serving.
+
+### 5. Physical KV ownership
+
+The child cache owns block tables/refcounts/physical slots. Neither NetworkServer nor Scheduler receives those ownership handles.
+
+## HTTP ingress pipeline
+
+```text
+socket bytes
+   ↓ max_header_bytes
+request line + headers
+   ↓ exact educational HTTP rules
+method / path / content-type / content-length
+   ↓ max_request_bytes
+UTF-8 body
+   ↓ JSON parse
+exact API field set
+   ↓ semantic validation
+GenerateRequest
+   ↓ tokenizer
+Request(prompt_token_ids)
+   ↓ engine.submit()
+```
+
+Failure at any stage above `engine.submit()` creates no runtime request.
+
+## Reference endpoints
+
+```text
+GET  /health
+GET  /ready
+POST /v1/generate
+POST /v1/generate/stream
+```
+
+The reference protocol is intentionally narrow: HTTP/1.1, one request per connection, `Content-Length` request bodies and `Connection: close`. Transfer-encoded/chunked requests are rejected.
+
+## Capacity model
+
+v1.3 has four independent capacity concepts:
+
+```text
+NetworkConfig.max_inflight_requests
+        │ API-edge lifecycle slots
+        ▼
+AsyncEngine.max_queue_size
+        │ per-request committed-event delivery queue
+        ▼
+Scheduler max_num_seqs / token budget
+        │ logical scheduling policy
+        ▼
+KV num_blocks
+        │ physical storage
+```
+
+A full network ingress returns 429 before submission. It does not consume Scheduler/KV state.
+
+A full AsyncEngine event queue backpressures the driver until the network/client consumes committed events; it does not drop tokens.
+
+Scheduler and KV pressure continue to use their historical mechanisms independently.
+
+## Streaming path
+
+The network server never reads speculative/model internals directly. Its only stream source is `AsyncRequestHandle`:
+
+```text
+committed TokenEvent
+      ↓
+event: token
+
+the single terminal StreamEvent
+      ├─ FinishedEvent  → event: done
+      ├─ CancelledEvent → event: cancelled
+      └─ ErrorEvent     → event: error
+```
+
+Serialization or a slow socket can delay visibility. It cannot move visibility earlier than logical commit.
+
+## Non-stream path
+
+`/v1/generate` still consumes the full bounded `AsyncRequestHandle` stream rather than simply waiting for terminal metadata. This matters because the producer itself respects bounded delivery queues; a non-stream HTTP handler must drain intermediate committed token events to avoid deadlock.
+
+After the terminal event, one JSON response is serialized with final token IDs/text/finish reason or an explicit error/cancellation payload.
+
+## Disconnect lifecycle
+
+Once a request is submitted, the server watches the connection independently from response production:
+
+```text
+connection EOF/reset
+      ↓
+_cancel_for_disconnect(handle)
+      ↓
+AsyncRequestHandle.cancel()
+      ↓
+AsyncEngine cancellation intent
+      ↓ cooperative boundary
+EngineCore.cancel_request()
+      ↓
+Scheduler removal + cache release
+```
+
+The watcher does not terminate worker processes and does not mutate physical state itself.
+
+If the socket is no longer writable, the server may be unable to deliver the request's terminal network bytes; the runtime still converges to exactly one logical terminal outcome.
+
+## Health and readiness
+
+The server exposes two different facts:
+
+```text
+health
+  = NetworkLifecycle in READY or DRAINING
+
+ready
+  = NetworkLifecycle == READY
+  + engine snapshot succeeds
+  + execution.healthy
+  + model_artifact exists
+  + model_artifact.rank_identity_agreement
+```
+
+`lifecycle_state` may report `unhealthy` when the network listener is internally READY but deeper execution readiness is false.
+
+This avoids treating “port is bound” as proof that requests can safely run.
+
+## Lifecycle and shutdown
+
+```text
+CREATED
+   ↓ start()
+STARTING
+   ↓ bind
+READY
+   │
+   ├─ deeper runtime unhealthy → externally not ready
+   │
+   ↓ close()
+DRAINING
+   ├─ stop accepting
+   ├─ cancel active request handles
+   ├─ wait for connection tasks
+   └─ cancel stuck connection tasks after timeout
+   ↓
+CLOSED
+```
+
+Ownership determines deeper cleanup:
+
+```text
+engine.create_server()
+  → server owns listener/connections only
+
+create_server(...)
+  → server owns listener + constructed engine
+  → close() also aclose()s executor/workers/temp artifact
+```
+
+## Network observability
+
+`NetworkSnapshot` contains copies of:
+
+```text
+lifecycle_state
+host / port
+health / ready
+active_connections
+inflight_requests
+accepted_requests
+rejected_requests
+completed_requests
+cancelled_requests
+failed_requests
+disconnect_cancellations
+```
+
+Calling `snapshot()` does not parse input, submit work, consume stream events, mutate counters, cancel requests or touch physical cache state.
+
+## Error mapping
+
+Representative network-boundary statuses:
+
+```text
+400 malformed protocol / JSON
+404 unknown endpoint
+405 wrong method
+409 duplicate request_id
+411 missing Content-Length for POST
+413 body too large
+415 unsupported content type
+422 semantically invalid generation request
+429 ingress full
+431 headers too large
+503 not ready / cancelled non-stream result
+500 internal runtime/API failure
+```
+
+An HTTP status is a network/API fact. It is not a hidden Scheduler state transition.
+
+## Stable historical boundaries underneath
+
+All prior correctness layers remain active:
+
+```text
+network bytes != validated API request
+validated API request != token-native Request
+logical request state != physical KV ownership
+parent logical truth != child physical truth
+artifact file identity != runtime parameter storage
+transport send != acknowledged execution
+```
+
+v1.3 composes these boundaries rather than collapsing them.

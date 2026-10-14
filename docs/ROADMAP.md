@@ -17,7 +17,9 @@
 | v0.13 | prefix-aware scheduling / cache-aware admission | frozen |
 | v1.0 | integrated public API + observability | frozen |
 | v1.1 | real multiprocessing Executor/Worker transport | frozen |
-| v1.2 | model artifact + tokenizer loading boundary | current implementation / exact-CI release rule |
+| v1.2 | model artifact + tokenizer loading boundary | frozen |
+| v1.3 | network serving / API ingress boundary | current implementation / exact-CI release rule |
+| v1.4 | multi-model registry + model lifecycle/routing | planned direction |
 
 Dependency order:
 
@@ -36,9 +38,11 @@ serving semantics
 → cache-aware policy
 → integrated runtime
 → real OS process isolation / IPC
-→ validated external model + tokenizer ingestion
+→ model artifact trust / tokenizer boundary
+→ network/API ingress lifecycle
+→ multi-model lifecycle + routing
 ```
 
-v1.2 intentionally supports one local educational model format. It does not add Hub downloads, arbitrary model code, safetensors/sharded formats, quantization, LoRA, hot swap or GPU weight streaming. Adding more checkpoint formats alone is not enough reason for a new version.
+v1.3 deliberately stops at a small one-process network frontend over one artifact-bound engine. It does not claim production HTTP compliance, authentication, tenant quotas, TLS, HTTP/2, reverse proxying or multi-node request routing.
 
-A strong next systems boundary is **network serving/API lifecycle**: request serialization at the socket/API edge, server startup/readiness, client disconnect/cancellation, bounded ingress/backpressure and health/readiness observations. Real CUDA/Triton kernels remain an independent later optimization line.
+The preferred v1.4 direction is **multi-model registry + model lifecycle/routing**. That version should teach a new ownership problem: a request chooses one validated model identity, remains pinned to that identity for its full lifetime, and model load/readiness/drain/unload must coexist without cross-model state leakage. Merely adding more HTTP endpoints is not a sufficiently distinct new lesson.

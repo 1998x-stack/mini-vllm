@@ -18,165 +18,177 @@ v0.10 async streaming/cancellation/backpressure
 v0.11 compile-aware execution
 v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
-v1.0  integrated educational runtime                  frozen
-v1.1  real multiprocessing executor transport         frozen
-v1.2  model artifact + tokenizer loading boundary     current
+v1.0  integrated educational runtime
+v1.1  real multiprocessing transport
+v1.2  model artifact + tokenizer loading
+v1.3  network serving / API boundary                    current
 ```
 
-## v1.2 learning target
+## v1.3 learning target
 
-v1.1 made execution physically real. v1.2 makes model startup explicit: external local files are data to validate, not objects the serving runtime may blindly trust.
+v1.2 proved that external model files are not runtime truth. v1.3 asks the next outer-systems question: what must happen before untrusted network bytes may become serving work?
 
 ```text
-model directory
+TCP/HTTP bytes
+    ↓ bounded parse
+validated GenerateRequest
+    ↓ tokenize
+core Request(token IDs)
     ↓
-ArtifactLoader
-    ↓
-ValidatedModelArtifact + stable identity
-    ↓
-RuntimeModelFactory
-    ↓ copy
-runtime-owned TinyDecoderLM parameters
-    ↓
-worker readiness / cross-rank identity agreement
-    ↓
-existing v1.1 serving path
+existing v1.2 runtime
+    ↓ committed StreamEvent
+JSON / SSE bytes
 ```
 
-This release introduces no new scheduling, KV, speculative, attention or IPC algorithm.
+This version is about network ownership, validation, liveness/readiness, ingress backpressure and disconnect lifecycle. It adds no new model, KV, scheduling or speculative algorithm.
 
 ## Implemented mechanism
 
-### Versioned local artifact
+### 1. Inspectable standard-library HTTP boundary
 
-The reference format is intentionally small:
-
-```text
-model_config.json
-weights.pt
-tokenizer.json
-```
-
-`model_config.json` declares exact format version, architecture, weight dtype, tokenizer compatibility ID and TinyModel dimensions. Unknown/missing fields and unsupported versions fail explicitly.
-
-### Stable identity
-
-`ModelArtifactIdentity` combines logical digests for model metadata, checkpoint contents and tokenizer metadata. A path is never treated as identity.
-
-### Explicit weight contract
-
-`build_weight_mappings()` derives the complete expected runtime `state_dict` surface and records external name, runtime name, shape and dtype. Loading rejects:
+`NetworkServer` uses `asyncio.start_server` and intentionally supports a small HTTP/1.1 subset:
 
 ```text
-missing required name
-unexpected name
-shape mismatch
-dtype mismatch
-non-tensor entry
+one request / connection
+Content-Length request body
+application/json generation input
+Connection: close
+JSON terminal response
+SSE streaming response
 ```
 
-No required weight is silently initialized and no extra tensor is silently ignored.
+The server rejects unsupported/malformed protocol input explicitly rather than delegating semantics to a framework.
 
-### Runtime-owned copy
+### 2. API validation before runtime submission
 
-`build_model_from_artifact()` constructs a new runtime module and copies validated source tensors into its state under `torch.no_grad()`. Serving does not depend on retaining the loader checkpoint dictionary.
+The parser produces an immutable `GenerateRequest`. Method/path/content type, JSON shape, exact field set, prompt, token limit and sampling fields are validated before tokenization/submission.
 
-### Readable tokenizer
+Header and body byte limits are enforced before model work exists.
 
-The v1.2 reference tokenizer is deterministic whitespace tokenization with an explicit vocabulary and `unk` token. The model/tokenizer vocabulary sizes and compatibility IDs must agree before readiness.
+### 3. Token-native core preserved
 
-The serving core remains token-ID native. `encode`, `decode` and `submit_text` are convenience methods above the core boundary.
-
-### Child-independent model load
-
-Parent construction validates the artifact first and passes a serializable `ModelArtifactSpec` containing path, validated identity and model facts. Every child process independently:
-
-1. re-reads the local files;
-2. re-computes identity;
-3. rejects changed/incompatible bytes;
-4. constructs a runtime model;
-5. copies weights;
-6. reports artifact/tokenizer identity in the readiness observation.
-
-`ArtifactMultiprocessExecutor` becomes healthy only after all ranks agree with the parent-validated identity. If one rank fails startup, already-created workers are shut down/reaped.
-
-### Default builder without a bypass
-
-When no `model_artifact` path is supplied, v1.2 exports the deterministic teaching model to a temporary artifact directory and then uses the same validation + child reload path. Close/aclose removes that owned temporary directory after workers stop.
-
-## Public API
-
-```python
-engine = create_engine("v1.2", model_artifact="./model_dir")
-ids = engine.encode("tok1 tok2")
-handle = engine.submit_text("r", "tok1 tok2", max_new_tokens=4)
+```text
+GenerateRequest(prompt text)
+    ↓ WhitespaceTokenizer
+Request(prompt_token_ids)
+    ↓
+AsyncEngine / EngineCore
 ```
 
-`create_engine()` now defaults to v1.2. `RuntimeConfig.model_artifact` provides the same path-based construction surface. Explicit v1.0/v1.1 builders remain historical references.
+Scheduler, WorkItem, KV and model-runner contracts remain token-ID native.
 
-## Observability
+### 4. Dedicated ingress capacity
 
-`engine.snapshot()` adds `ModelArtifactSnapshot` and rank-level fields for:
+`NetworkConfig.max_inflight_requests` bounds requests that crossed validation and currently own a network API lifecycle slot.
 
-- artifact identity;
-- tokenizer identity;
-- architecture;
-- format version;
-- vocabulary size;
-- artifact dtype versus runtime dtype/device;
-- rank identity agreement.
+```text
+ingress full → HTTP 429 → no engine.submit → no hidden core Request
+```
 
-Observation remains copy/read-only and does not expose checkpoint dictionaries or parameter storage handles.
+This capacity is deliberately separate from AsyncEngine queue backpressure, Scheduler budgets and KV allocation.
+
+### 5. Committed-only streaming
+
+The SSE writer consumes the ordinary `AsyncRequestHandle` stream:
+
+```text
+TokenEvent      → event: token
+FinishedEvent   → event: done
+CancelledEvent  → event: cancelled
+ErrorEvent      → event: error
+```
+
+Therefore the network layer has no path to speculative/uncommitted model state.
+
+### 6. Disconnect cancellation
+
+A connection watcher treats client EOF/reset as cancellation intent and calls `AsyncRequestHandle.cancel()`. Existing cooperative cancellation performs Scheduler/cache cleanup at an atomic EngineCore boundary.
+
+### 7. Health/readiness
+
+`/health` reports network lifecycle liveness. `/ready` additionally requires:
+
+- NetworkServer in READY state;
+- underlying execution healthy;
+- validated model-artifact snapshot present;
+- rank artifact identity agreement.
+
+### 8. Explicit ownership-aware shutdown
+
+Two modes exist:
+
+```text
+engine.create_server()     → NetworkServer owns network only
+create_server(...)         → NetworkServer owns constructed engine too
+```
+
+`close()` stops accepts, cancels/drains active API requests, closes connection tasks, and closes/reaps worker processes only in owned-engine mode.
+
+### 9. Read-only network observability
+
+`NetworkSnapshot` reports lifecycle, bound address, health/readiness, active connections, in-flight requests, acceptance/rejection and terminal counters. It contains no socket/Worker/KV ownership handles.
+
+## Public endpoints
+
+```text
+GET  /health
+GET  /ready
+POST /v1/generate
+POST /v1/generate/stream
+```
+
+Generation JSON supports `request_id`, `prompt`, `max_new_tokens`, `temperature`, `top_k` and `top_p`.
 
 ## Correctness contract
 
-v1.2 adds these release-level rules:
+In addition to all v1.2 invariants:
 
-1. filesystem presence is not artifact validity;
-2. schema/version validation precedes model construction;
-3. tokenizer/model compatibility precedes readiness;
-4. required tensor coverage is exact;
-5. tensor shape and dtype are validated before copy;
-6. runtime parameters own their copied values;
-7. parent artifact identity is re-proven independently by every child;
-8. changed files between parent validation and child startup fail readiness;
-9. a failed child load leaves no orphan processes;
-10. no request is admitted before all workers are ready;
-11. loaded deterministic v1.2 output equals the exported v1.1 model for world sizes 1 and 2.
+1. malformed API input creates no runtime request;
+2. network ingress capacity is not Scheduler or KV capacity;
+3. network-visible tokens come only from committed async events;
+4. disconnect becomes cancellation intent, never direct KV/process mutation;
+5. one submitted API request has one logical terminal outcome;
+6. socket liveness is weaker than serving readiness;
+7. a server closes only resources it owns;
+8. HTTP generation is deterministic and equivalent to direct v1.2 serving under equivalent configuration.
 
-All earlier logical/KV/speculation/transport invariants remain active.
+## Validation
 
-## Validation evidence
+`tests/test_network_server.py` uses real loopback TCP connections and proves:
 
-`tests/test_model_artifacts.py` covers:
+- health/readiness and read-only snapshot behavior;
+- non-stream JSON output equivalence with direct v1.2;
+- SSE token ordering and terminal event;
+- invalid JSON/fields/content-type/body limits reject before submission;
+- duplicate ID maps to HTTP 409;
+- bounded ingress returns HTTP 429 with one real runtime request only;
+- streaming disconnect becomes cooperative cancellation;
+- header limits return HTTP 431;
+- external-engine server close preserves the external engine;
+- owned server close reaps worker processes.
 
-- deterministic artifact/tokenizer identity;
-- manifest/version/missing-file errors;
-- vocabulary and special-token errors;
-- missing/unexpected/shape/dtype/non-tensor checkpoint errors;
-- runtime-owned parameter copies;
-- v1.1↔v1.2 deterministic equivalence at world sizes 1 and 2;
-- token-native `submit_text` facade;
-- pre-start rank identity disagreement;
-- child-side changed-artifact startup failure and cleanup;
-- default temporary artifact lifecycle.
+Historical artifact tests explicitly pin v1.2 when testing the old default-builder lesson.
 
-Historical multiprocessing tests remain pinned to explicit v1.1 construction.
+The first corrected implementation tree passed:
 
-`examples/17_model_loading.py` performs export → validate → text encode → two-process serving → decode → public identity inspection → clean shutdown.
+```text
+109 pytest tests
+examples 01–18
+all checks passed
+```
 
-The first green v1.2 implementation tree passed **101 pytest tests** plus examples 01–17. The final frozen tree and the cleaned release SHA must each independently pass the repository gate.
+The single warning is PyTorch noting NumPy is absent; no v1.3 network path depends on NumPy.
 
 ## Release rule
 
-Before `main` advances:
+Before v1.3 freezes:
 
-1. docs and implementation must agree;
-2. full frozen tree must pass CI;
-3. WIP history is reduced to the existing v1.2 planning commit plus one implementation commit;
-4. that exact cleaned implementation SHA must pass CI;
-5. `main` fast-forwards to exactly that SHA.
+1. implementation/docs tree passes repository CI;
+2. branch history is reduced to the v1.3 planning commit plus one implementation commit;
+3. that exact cleaned SHA independently passes CI;
+4. `main` fast-forwards to exactly that SHA;
+5. v1.3 becomes historical/frozen.
 
-## After v1.2
+## After v1.3
 
-The next branch must introduce a distinct systems boundary rather than adding more checkpoint formats. A natural next target is a **network serving/API boundary**: request protocol, server lifecycle, admission/backpressure at the socket/API edge, readiness/health endpoints and disconnect semantics. Real CUDA/Triton kernels remain an independent later optimization line.
+The next version must teach a distinct systems boundary rather than “more HTTP features.” A strong v1.4 direction is **multi-model registry + model lifecycle/routing**: model identity becomes a routable resource with load/readiness/drain/unload semantics, while requests remain bound to exactly one validated model version for their complete lifetime.

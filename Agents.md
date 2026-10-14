@@ -26,109 +26,126 @@ v0.12 optimized PagedAttention
 v0.13 prefix-aware scheduling
 v1.0  integrated educational runtime
 v1.1  real multiprocessing executor transport
-v1.2  model artifact + tokenizer loading boundary
+v1.2  model artifact + tokenizer loading
+v1.3  network serving / API boundary
 ```
 
-Post-v1.0 branches require a genuinely new systems boundary. v1.1 introduced real OS-process isolation; v1.2 introduces external-artifact validation and transfer into runtime-owned model/tokenizer state.
+v1.3 adds one distinct lesson: untrusted network bytes and connection lifetime become a validated, bounded ingress boundary around the already-correct v1.2 runtime.
 
 ## Ownership
 
-- `AsyncEngine`: caller lifecycle, bounded delivery, cancellation intent and backpressure.
-- `EngineCore`: logical request truth, atomic step boundaries and commit authority.
-- `Scheduler`: admission, token budget, fairness and preemption-victim policy.
-- `ArtifactLoader`: parse external local files, validate schema/tensor/tokenizer contracts and compute artifact identity. It owns no serving request state.
-- `RuntimeModelFactory`: construct runtime modules and copy accepted tensor values into runtime-owned parameters. It does not decide scheduling or artifact trust policy.
-- `WhitespaceTokenizer`: text ↔ token-ID boundary only. Strings must not leak into Scheduler/KV/WorkItem contracts.
-- `ArtifactMultiprocessExecutor`: parent-side IPC orchestration plus rank model-identity agreement and process lifecycle.
-- child `Worker/ModelRunner`: rank-local model execution and physical KV ownership inside one OS process.
-- KV backend: physical storage, allocation, sharing, recycling and transactions inside the child.
-- PagedAttention backend: read child-local logical K/V; it does not own blocks or artifacts.
-- Compile registry: rank-local tensor specialization only.
-- observability: copy logical facts into read-only snapshots; never become a policy or ownership authority.
+- `NetworkServer`: TCP/HTTP parsing, API validation, ingress slot accounting, connection lifecycle, health/readiness, response serialization and disconnect-to-cancel intent.
+- `AsyncEngine`: caller/request handles, bounded event delivery, cancellation intent and cooperative backpressure.
+- `EngineCore`: logical request truth, atomic step boundaries, reconciliation and commit authority.
+- `Scheduler`: admission order, token budget, fairness and preemption-victim policy.
+- `ArtifactLoader` / model factory: external artifact validation, identity and explicit copies into runtime-owned model state.
+- `ArtifactMultiprocessExecutor`: parent-side IPC orchestration, worker health, rank identity agreement, rollback and shutdown.
+- child `Worker/ModelRunner`: rank-local model execution and physical KV ownership.
+- KV backend: block tables, allocation, sharing, recycling and transactions.
+- observability: copied read-only facts only; never become a policy owner.
 
-A filesystem path, parsed JSON object, checkpoint dictionary or tokenizer file is not runtime model ownership. The serving model begins only after validation and explicit parameter copy into a runtime-created module.
+The network layer must not inspect or control block IDs, refcounts, Worker objects, model tensors or Scheduler internals.
+
+## Capacity separation
+
+Never collapse these distinct resources:
+
+```text
+network ingress slot
+!= per-request async event queue
+!= Scheduler sequence/token budget
+!= physical KV capacity
+```
+
+HTTP 429 means only that network ingress is full. It does not imply the Scheduler or KV allocator rejected a request.
+
+## Network boundary rule
+
+```text
+untrusted HTTP bytes
+      ↓ bounded parse + validation
+GenerateRequest
+      ↓ tokenizer
+core Request(token IDs)
+      ↓ normal runtime lifecycle
+committed StreamEvent
+      ↓ serialization
+network bytes
+```
+
+Malformed/invalid input fails before submission. Network serialization may delay output but cannot manufacture or reveal speculative/uncommitted tokens.
+
+## Disconnect rule
+
+```text
+client disconnect
+      ↓
+AsyncRequestHandle.cancel()
+      ↓
+cooperative EngineCore cancellation
+```
+
+Do not terminate a healthy worker to cancel one disconnected request. Cancellation is applied only through the existing request lifecycle and atomic-step contract.
+
+## Health and readiness
+
+Keep liveness separate from readiness:
+
+- health: the network server is in a managed live/draining state;
+- readiness: the server is accepting new requests and the underlying execution runtime is healthy with artifact rank identity agreement.
+
+A bound socket alone is never readiness evidence.
 
 ## Stable invariants
 
-The canonical expanded contract is `docs/INVARIANTS.md`. Every active-version change must preserve at least:
+The canonical expanded list is `docs/INVARIANTS.md`. Every change must preserve at least:
 
-- computed tokens imply valid, addressable KV;
-- sampled outputs are not computed until later model execution;
-- physical KV ownership precedes access;
-- block-table translation is authoritative;
-- prefix hints are advisory, never ownership;
-- preemption cannot retain claims to released KV;
-- rejected speculative state disappears;
-- execution/transport failures cannot partially commit logical state;
-- async clients observe committed tokens only and one terminal outcome;
-- `snapshot()` is read-only;
-- IPC carries logical copies/handles, not live child ownership objects;
-- a sent command is not execution success; logical commit requires matching acknowledgment;
-- unknown child physical state makes the executor unhealthy;
-- successful close/aclose leaves no worker process alive;
-- filesystem presence is not proof of a valid model artifact;
-- artifact schema/version/model dimensions must validate before worker readiness;
-- every required checkpoint tensor must be present exactly once under the explicit mapping contract;
-- unexpected tensors, shape mismatches, unsupported dtypes and non-tensor payloads fail explicitly;
-- tokenizer vocabulary/special metadata must be compatible with the model artifact;
-- runtime parameters are copied into runtime-owned storage rather than aliasing mutable loader containers;
-- every worker rank must report the parent-validated artifact/tokenizer identity before serving begins;
-- malformed, changed or rank-divergent artifacts fail before request admission;
-- deterministic v1.2 loading of the exported v1.1 model preserves committed output.
+- token/KV invariants from v0.x;
+- logical commit authority remains in EngineCore;
+- async clients and network clients see committed tokens only;
+- external model files become validated runtime-owned state before readiness;
+- child rank identities agree before serving;
+- network parsing is bounded before submission;
+- invalid API input creates no hidden runtime request;
+- ingress capacity is not Scheduler/KV ownership;
+- disconnect produces cancellation intent, not direct physical mutation;
+- a submitted API request has one logical terminal outcome;
+- health and readiness are separate truths;
+- an owned server reaps the engine/workers it created;
+- a server wrapping an external engine must not close that engine;
+- snapshot reads remain side-effect free.
 
-## Public v1.2 surface
+## Public v1.3 surface
 
 Prefer teaching through:
 
 ```text
-RuntimeConfig(model_artifact=...)
-MultiprocessConfig
-create_engine()                  # defaults to v1.2
-create_engine("v1.2", model_artifact=...)
-export_tiny_model_artifact(...)
-load_model_artifact(...)
-engine.encode() / engine.decode()
-engine.submit_text(...)
-Request / AsyncRequestHandle
-engine.snapshot()
-engine.close() / await engine.aclose()
+RuntimeConfig / NetworkConfig
+create_engine()          # defaults to v1.3
+create_server()
+engine.create_server()
+NetworkServer.start() / close()
+server.snapshot()
+GET /health
+GET /ready
+POST /v1/generate
+POST /v1/generate/stream
 ```
 
-Historical builders remain explicit and frozen.
+Historical `create_engine("v0.x")`, `create_engine("v1.0")`, `create_engine("v1.1")` and `create_engine("v1.2")` remain explicit references.
 
-Do not expose raw checkpoint dictionaries, parameter pointers, block IDs, refcounts or live child objects merely for convenience. Add immutable logical metadata instead.
+## Reference protocol scope
 
-## Artifact-boundary rule
+The v1.3 HTTP server is deliberately educational:
 
-```text
-external files
-    ↓ parse
-untrusted structured values
-    ↓ exact validation
-ValidatedModelArtifact + identity
-    ↓ construct + copy
-runtime-owned model/tokenizer state
-    ↓ all ranks independently agree
-READY
-    ↓
-request admission
-```
+- HTTP/1.1 only;
+- one request per connection;
+- `Content-Length` bodies;
+- JSON generation requests;
+- JSON terminal response or SSE stream;
+- `Connection: close`.
 
-Never skip a boundary by treating a path, filename, state-dict key or successful `torch.load` as proof of compatibility.
-
-A model artifact that changes between parent validation and child startup must be detected through identity mismatch; do not silently accept the new bytes.
-
-## Process-boundary rule
-
-```text
-parent logical truth
-        ↓ command
-child physical mutation
-        ↓ matching acknowledgment
-parent logical commit
-```
-
-Artifact identity agreement does not replace execution acknowledgment, and process liveness does not prove command completion.
+Do not quietly broaden this into a production HTTP stack. HTTP/2, TLS, auth, tenant rate limits, WebSocket, proxying and OpenAI compatibility require separate contracts.
 
 ## Change protocol
 
@@ -138,13 +155,12 @@ Before changing `main` or the active version:
 2. read `Plan.md`;
 3. read `version.md`;
 4. read `docs/ARCHITECTURE.md` and `docs/INVARIANTS.md`;
-5. inspect implementation and invariant tests;
-6. separate parsing/validation from model construction and from serving execution;
-7. add direct tests for invalid external inputs and ownership transfer;
-8. preserve historical builders;
-9. run the exact release gate before advancing `main`.
+5. inspect relevant source/tests;
+6. separate network protocol concerns from Scheduler/KV/model policy;
+7. add invariant tests that prove rejection-before-submit, committed-only visibility, cancellation and cleanup;
+8. run the exact release gate before advancing `main`.
 
-Historical branches are frozen except narrowly scoped documentation/test corrections or true bugs within that lesson.
+Historical branches are frozen except narrowly scoped documentation/test corrections or true bugs within that historical lesson.
 
 ## Testing / release
 
@@ -160,10 +176,20 @@ Never claim tests passed unless executed on the exact reported snapshot. An acti
 3. `main` advances to that same commit;
 4. branch history remains pedagogically clean.
 
-For v1.2 artifact changes, tests must cover schema/version errors, missing/unexpected tensors, shape/dtype errors, tokenizer compatibility, runtime-owned copies, rank identity agreement, startup failure cleanup, deterministic v1.1 equivalence and examples 01–17.
+For v1.3 network changes, tests must include real TCP parsing, health/readiness, JSON/SSE ordering, ingress rejection, client disconnect cancellation, ownership-aware shutdown and deterministic v1.2 equivalence.
 
-## Performance / security scope
+## Performance / policy rule
 
-The educational local loader is not a benchmark or production security sandbox. It deliberately uses `torch.load(..., weights_only=True)` and one known architecture/checkpoint contract. Do not add arbitrary remote code or network downloads to solve a local artifact problem.
+```text
+readable mechanism fact
+        ↓
+explicit policy input
+        ↓
+invariant tests
+        ↓
+observable decision
+        ↓
+authoritative execution truth
+```
 
-Do not claim speedup from multiprocessing, `torch.compile`, vectorization, CUDA or Triton without measurement. v1.2 is a trust/ownership/loading lesson, not a loading-throughput claim.
+Do not infer throughput improvement merely from exposing HTTP, multiprocessing, compilation or vectorization. v1.3 is an API/lifecycle boundary lesson, not a production web-server performance claim.

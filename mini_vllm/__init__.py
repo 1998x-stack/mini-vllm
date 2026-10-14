@@ -14,6 +14,7 @@ from mini_vllm.artifacts import (
     export_tiny_model_artifact,
     load_model_artifact,
 )
+from mini_vllm.artifacts.executor import ArtifactMultiprocessExecutor
 from mini_vllm.async_runtime import (
     AsyncEngine,
     AsyncRequestHandle,
@@ -58,18 +59,24 @@ from mini_vllm.multiprocess import (
     WorkerTransportError,
     WorkerTransportTimeout,
 )
-from mini_vllm.artifacts.executor import ArtifactMultiprocessExecutor
+from mini_vllm.network import (
+    GenerateRequest,
+    HttpProtocolError,
+    NetworkLifecycle,
+    NetworkServer,
+)
 from mini_vllm.observability import (
     AsyncRuntimeSnapshot,
     ExecutionSnapshot,
     ModelArtifactSnapshot,
+    NetworkSnapshot,
     RankExecutionSnapshot,
     RequestSnapshot,
     RuntimeSnapshot,
     SchedulerSnapshot,
     SchedulingObservation,
 )
-from mini_vllm.runtime import MultiprocessConfig, RuntimeConfig
+from mini_vllm.runtime import MultiprocessConfig, NetworkConfig, RuntimeConfig
 from mini_vllm.scheduler.prefix_aware import (
     AdmissionCost,
     PrefixAwareBudgetedScheduler,
@@ -78,6 +85,7 @@ from mini_vllm.scheduler.prefix_aware import (
 )
 from mini_vllm.speculative import DraftProvider, IncrementDraftProvider, ScriptedDraftProvider
 from mini_vllm.versions import create_engine
+from mini_vllm.versions.v1_3 import NetworkAsyncEngine, create_server
 
 __all__ = [
     "ARTIFACT_ARCHITECTURE", "ARTIFACT_FORMAT_VERSION",
@@ -86,7 +94,7 @@ __all__ = [
     "WhitespaceTokenizer", "build_weight_mappings", "export_tiny_model_artifact",
     "load_model_artifact", "ArtifactMultiprocessExecutor",
     "CacheConfig", "EngineConfig", "TinyModelConfig", "RuntimeConfig",
-    "MultiprocessConfig",
+    "MultiprocessConfig", "NetworkConfig",
     "Request", "RequestStatus", "SamplingParams", "PrefixReuseHint",
     "DraftProvider", "IncrementDraftProvider", "ScriptedDraftProvider",
     "Engine", "EngineCore", "Executor", "LocalExecutor", "Worker",
@@ -104,7 +112,9 @@ __all__ = [
     "PrefixSchedulingStats",
     "RequestSnapshot", "SchedulingObservation", "SchedulerSnapshot",
     "RankExecutionSnapshot", "ExecutionSnapshot", "ModelArtifactSnapshot",
-    "RuntimeSnapshot", "AsyncRuntimeSnapshot", "create_engine",
+    "RuntimeSnapshot", "AsyncRuntimeSnapshot",
+    "GenerateRequest", "HttpProtocolError", "NetworkLifecycle", "NetworkServer",
+    "NetworkSnapshot", "NetworkAsyncEngine", "create_server", "create_engine",
 ]
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

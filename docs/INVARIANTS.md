@@ -1,13 +1,13 @@
-# mini-vLLM v1.2 invariant contract
+# mini-vLLM v1.3 invariant contract
 
-v1.2 preserves all v1.1 serving/process semantics and adds the trust boundary from external model/tokenizer files to validated runtime-owned state.
+v1.3 preserves all v1.2 serving/artifact/process semantics and adds the trust/lifecycle boundary from network bytes to validated API work and committed response bytes.
 
 ## Logical token state
 
 1. `num_computed_tokens` counts only tokens whose model work executed and whose K/V remains valid and addressable.
 2. A sampled output token is logical history, not computed history, until a later forward executes it.
 3. Preemption may preserve logical history while rolling the computed frontier backward.
-4. Text is converted to token IDs before entering the serving core; Scheduler/KV/WorkItem contracts remain token-native.
+4. Text becomes token IDs before entering Scheduler/KV/WorkItem/model-runner contracts.
 
 ## KV ownership and addressing
 
@@ -22,98 +22,126 @@ physical      = block_table[logical_block]
 
 7. Attention reads only logical positions `[0, length)`.
 8. Shared prefix blocks are immutable while referenced.
-9. Finished/cancelled requests release active ownership exactly once.
-10. Physical KV/cache structures remain child-owned; the parent never treats block tables/refcounts/cache objects as remote ownership handles.
+9. Finished/cancelled/aborted requests release active ownership exactly once.
+10. The network layer never owns or exposes physical block identity.
 
-## Prefix reuse, preemption and speculation
+## Prefix reuse / scheduling
 
-11. `PrefixReuseHint` is advisory, never reservation/ownership/computed state.
-12. Side-effect-free prefix estimation cannot create ownership or mutate cache recency.
-13. Only authoritative prepare establishes the actual reusable computed frontier.
-14. Warm-prefix preference retains deterministic starvation protection.
-15. A preempted request cannot claim released KV.
-16. Replay preserves known logical history without resampling historical outputs.
-17. Rejected speculative state disappears from logical history and physical KV.
-18. Speculative rollback never mutates shared immutable prefixes.
+11. `PrefixReuseHint` is advisory, not reservation/ownership/computed state.
+12. Side-effect-free prefix estimation cannot create request ownership.
+13. Only authoritative cache preparation establishes reusable computed state.
+14. Warm-prefix scheduling remains deterministic with starvation protection.
+15. Network ingress pressure is not a Scheduler priority/cost signal.
 
-## External artifact truth
+## Preemption and transactions
 
-19. Filesystem presence is not proof of a valid model artifact.
-20. Successful JSON parsing is not proof of schema/architecture compatibility.
-21. Successful checkpoint deserialization is not proof of complete or compatible model state.
-22. Artifact format/version and architecture must be accepted explicitly before runtime construction.
-23. Required manifest fields are exact; missing or unexpected incompatible fields fail explicitly.
-24. Model dimensions must satisfy the same `TinyModelConfig` validity rules as programmatic construction.
-25. The artifact path is location, not model identity.
+16. A preempted request cannot claim released KV.
+17. Replay preserves known prompt/output history without resampling historical output.
+18. Rejected speculative state disappears from logical history and physical KV.
+19. Speculative rollback cannot mutate shared immutable prefixes.
+20. A transport-safe checkpoint handle is transaction identity, not physical cache ownership.
 
-## Weight manifest and copy
+## Execution / multiprocessing
 
-26. The external tensor-name set must exactly equal the required mapping set for the reference format.
-27. Missing required tensors are never silently initialized.
-28. Unexpected tensors are never silently ignored.
-29. Every accepted source tensor must match its expected shape before copy.
-30. Every accepted source tensor must use a supported artifact dtype before copy.
-31. Non-tensor checkpoint entries are rejected.
-32. The external-name → runtime-name relationship remains explicit even when names are identical.
-33. Every required runtime tensor target is populated exactly once under the accepted mapping.
-34. Runtime model state owns copied tensor values; serving correctness cannot depend on retaining or mutating the loader checkpoint dictionary.
-35. Runtime dtype/device conversion may change representation after validation but cannot change model semantics outside documented numeric behavior.
+21. EngineCore owns logical commit decisions; Executor/Worker performs physical execution.
+22. Replicated ranks agree on policy-visible cache facts and artifact identity.
+23. A failed rank cannot authorize a partial logical commit.
+24. IPC messages carry serializable logical/copy values, not live ownership objects.
+25. Sending work is not proof of successful execution; acknowledgment is required.
+26. Unknown child physical consistency makes the executor unhealthy rather than guessable.
+27. Normal owned-engine shutdown reaps every worker process.
 
-## Tokenizer compatibility
+## Artifact / tokenizer truth
 
-36. Tokenizer format/type/version are validated before use.
-37. Tokenizer tokens are non-empty and unique under the reference format.
-38. Required special-token metadata, including `unk`, must contain in-range integer IDs.
-39. `tokenizer.vocab_size == model.vocab_size` before readiness.
-40. tokenizer compatibility ID in `tokenizer.json` equals the model manifest compatibility ID.
-41. Unknown-text handling is deterministic according to the declared `unk` token.
-42. Decode rejects token IDs outside the tokenizer vocabulary.
+28. Filesystem presence is not a valid model artifact.
+29. Artifact schema/version/architecture/tokenizer compatibility are validated before readiness.
+30. External tensor names exactly cover required runtime mappings; missing/extra tensors fail.
+31. Tensor shape and supported dtype match before copy.
+32. Runtime parameters are explicit owned copies, not aliases to mutable checkpoint containers.
+33. Tokenizer vocabulary size and compatibility ID agree with the model manifest.
+34. Every ready rank reports the expected model/tokenizer identity.
+35. Artifact/model startup failure occurs before request admission.
 
-## Artifact identity and multiprocess readiness
+## Async delivery
 
-43. `ModelArtifactIdentity` is derived from format/architecture plus model, weights and tokenizer digests; it is not a path or mutable object reference.
-44. Parent validation establishes the exact identity expected by one engine startup.
-45. Every child independently re-reads/re-validates its configured artifact before reporting ready.
-46. A child that observes changed bytes after parent validation must fail identity comparison rather than silently adopting the new artifact.
-47. Every ready rank reports the parent-validated artifact identity.
-48. Every ready rank reports the same tokenizer identity.
-49. Executor readiness requires cross-rank identity agreement before any request admission/execution.
-50. If one worker fails artifact startup, already-created workers are shut down/reaped; partial startup cannot leak orphan processes.
-51. A default temporary educational artifact follows the same loader/child-revalidation path as an explicit artifact; it is not a serving bypass.
-52. Runtime-owned temporary artifact files are removed only after workers stop.
+36. Async clients observe committed tokens only.
+37. Each submitted runtime request has exactly one logical terminal outcome: finished, cancelled or error.
+38. Bounded delivery can delay progress but cannot drop/duplicate committed token events.
+39. Cancellation is cooperative at EngineCore step boundaries.
 
-## Multiprocessing execution
+## Network parsing / admission
 
-53. EngineCore owns logical commit decisions; child Worker/ModelRunner owns physical execution.
-54. IPC contains serializable logical values/copies, not live child model/cache/tensor-storage references.
-55. Every serving command/result uses a matching correlation ID.
-56. Sending a command is not evidence of success; logical commit requires a matching successful acknowledgment.
-57. Child-reported execution errors and transport/process-death failures remain distinct.
-58. Parent-side checkpoint handles identify child-owned transaction state; they are not KV ownership handles.
-59. Failed ordinary execution attempts rollback on every reachable checkpointed participant before surfacing failure.
-60. Unknown physical consistency after EOF/timeout/process death/rollback failure makes the executor unhealthy; EngineCore cannot guess and commit.
-61. Successful close/aclose joins/reaps every child process.
+40. Request header bytes are bounded before unbounded header parsing is allowed.
+41. Request body bytes are bounded before body allocation/JSON serving work can exceed the configured limit.
+42. Unsupported/malformed HTTP method/path/version/header/body semantics fail at the network boundary.
+43. Invalid JSON or semantic generation fields fail before `engine.submit()`.
+44. A rejected API request creates no hidden pending/core request.
+45. The reference server accepts only the documented HTTP/1.1 subset; transfer-encoded/chunked request bodies are not silently interpreted.
 
-## Distribution and optimization
+## Capacity separation
 
-62. Replicated ranks agree on policy-visible cache facts and model identity required by the operation.
-63. Tensor-parallel gathered logits remain equivalent to the supported readable reference.
-64. Vectorized PagedAttention is numerically equivalent to reference PagedAttention.
-65. Compile-aware LM-head projection is numerically equivalent to eager projection.
-66. Optimization fallback may change execution mode, never serving semantics.
-67. No speedup claim follows merely from multiprocessing, loading, vectorization or compilation.
+46. A network ingress slot is not an AsyncEngine event-queue slot.
+47. A network ingress slot is not Scheduler admission or Scheduler token budget.
+48. A network ingress slot is not KV reservation/ownership.
+49. HTTP 429 due to ingress capacity occurs before runtime submission.
+50. A full per-request AsyncEngine event queue backpressures production rather than dropping tokens.
 
-## Async delivery and observability
+## Network output
 
-68. Async clients observe committed tokens only.
-69. Each request exposes exactly one terminal outcome.
-70. Backpressure may delay delivery but cannot duplicate or hide logical commits.
-71. Cancellation is applied between atomic EngineCore steps and does not arbitrarily kill healthy workers.
-72. `snapshot()` is read-only: it cannot schedule, attach KV, mutate recency, advance requests or alter serving-command counters.
-73. Artifact observations expose logical identity/configuration facts, never checkpoint dictionaries, parameter pointers or storage ownership handles.
-74. Repeated snapshots with no intervening serving action remain equal.
+51. A token crosses the network only after `AsyncRequestHandle` exposes a committed `TokenEvent`.
+52. JSON/SSE serialization can delay visibility but cannot expose speculative/uncommitted state.
+53. A connected streaming client receives token events in committed order.
+54. A submitted connected API request emits at most one network terminal event/result corresponding to its single logical terminal outcome.
+55. A disconnected client may prevent terminal bytes from being delivered, but cannot create a second logical terminal outcome.
 
-## Semantic equivalence
+## Disconnect semantics
 
-75. Exporting the deterministic v1.1 TinyDecoder into the v1.2 reference artifact and loading it back must reproduce the same committed output under equivalent world-size 1 and 2 serving configuration.
-76. Historical v0.1–v1.1 builders retain their original mechanism semantics; v1.2 artifact loading is opt-in only through the v1.2/default builder.
+56. Client EOF/reset produces cancellation intent through `AsyncRequestHandle.cancel()` when configured.
+57. Disconnect does not directly alter block tables, KV storage, Scheduler lists or model state.
+58. Disconnect never uses worker-process termination as a request-cancellation mechanism.
+59. Duplicate disconnect observations do not create duplicate cancellation intent/counters for the same in-flight request.
+
+## Health / readiness
+
+60. A bound/listening socket alone is not readiness.
+61. Network health and serving readiness are distinct facts.
+62. v1.3 readiness requires NetworkServer READY state, healthy execution and artifact rank-identity agreement.
+63. During draining, health may remain true while readiness is false.
+64. If deeper execution health becomes unprovable, the server must not claim ready merely because the listener remains alive.
+
+## Lifecycle / ownership
+
+65. `NetworkServer.close()` first stops new accepts before draining/cancelling active API work.
+66. A server wrapping an external engine does not close that engine.
+67. A server that created/owns an engine closes and reaps that engine/workers during successful shutdown.
+68. Shutdown timeout may cancel stuck network connection tasks; it does not authorize bypassing underlying runtime cleanup for an owned engine.
+69. The server must not retain in-flight request ownership after the corresponding connection task has completed.
+
+## Optimization correctness
+
+70. Vectorized PagedAttention remains numerically equivalent to the reference path.
+71. Compile-aware vocabulary projection remains equivalent to eager projection.
+72. Optimization fallback may change execution mode, never serving semantics.
+73. No performance claim follows merely from multiprocessing, vectorization, compilation or exposing HTTP.
+
+## Observability
+
+74. `engine.snapshot()` remains side-effect free.
+75. `server.snapshot()` cannot parse/submit requests, consume events, cancel work or mutate counters.
+76. Network snapshots expose copied logical facts, never live sockets or physical ownership handles.
+77. Reading health/readiness/snapshots cannot itself change Scheduler, cache, request or network lifecycle state.
+
+## Semantic references
+
+78. Equivalent deterministic v1.2 direct serving remains the semantic oracle for v1.3 HTTP generation output.
+79. Historical artifact/process/KV/scheduler invariants remain active underneath the network boundary.
+80. The complete teaching separation is:
+
+```text
+network bytes
+!= validated API request
+!= token-native Request
+!= logical computed frontier
+!= physical KV ownership
+!= runtime parameter storage
+```

@@ -1,89 +1,107 @@
-# mini-vLLM v1.2 exercises
+# mini-vLLM v1.3 exercises
 
-Use historical diffs to learn one mechanism at a time. v1.2 focuses on the boundary between external model files and trusted runtime-owned serving state.
+Use historical branch diffs to learn one mechanism at a time. v1.3 focuses on the boundary between untrusted network bytes and the already-correct token-native v1.2 runtime.
 
-## Artifact truth
+## Follow one request from socket to token
 
-1. Run `examples/17_model_loading.py`. Draw the path `model directory → validated artifact → child runtime model → request output`.
-2. Explain why a model directory existing on disk is weaker evidence than `ValidatedModelArtifact`.
-3. Change the artifact format version. Identify the exact layer that rejects it and why no worker/request should exist afterward.
-4. Add an unknown field to `model_config.json`. Why is strict schema rejection useful in an educational serving runtime?
+1. Run `examples/18_network_server.py`. Draw `TCP → HTTP parser → GenerateRequest → tokenizer → Request → AsyncEngine → EngineCore → child Worker → committed event → JSON/SSE`.
+2. Mark which objects are owned by NetworkServer, AsyncEngine, EngineCore and child Worker.
+3. Explain why `GenerateRequest` is not the same object as core `Request`.
+4. Find the exact line where prompt text stops existing as a serving-core concern.
 
-## Identity
+## Bounded parsing
 
-5. List the components of `ModelArtifactIdentity`. Why is the filesystem path absent from the digest contract?
-6. Export the same deterministic model twice. Compare identities.
-7. Change one model weight and re-load. Which digest must change?
-8. Change only tokenizer metadata. Which identity components must change?
+5. Lower `NetworkConfig.max_header_bytes` and send a large header. Why should rejection happen before JSON or model work?
+6. Lower `max_request_bytes` and send a larger declared body. Which HTTP status is returned and why is no core request created?
+7. Send a POST without `Content-Length`. Explain why v1.3 returns 411 instead of trying to infer body framing.
+8. Send `Transfer-Encoding: chunked`. Why does the educational server reject it instead of partially implementing HTTP chunking?
 
-## Weight mapping and coverage
+## API schema validation
 
-9. Inspect `build_weight_mappings()`. For one parameter, record external name, runtime name, expected shape and dtype.
-10. Delete one checkpoint tensor. Why is deterministic initialization of the missing parameter forbidden in this format?
-11. Add one unexpected tensor. Why is ignoring it silently a compatibility hazard?
-12. Preserve a tensor name but change its shape. Explain why name equality is insufficient.
-13. Convert one tensor to float64. Where is artifact dtype policy enforced?
-14. Put a non-tensor object into the checkpoint. Why must it never become runtime parameter state?
+9. Send invalid UTF-8/JSON. Verify no request appears in `engine.snapshot()`.
+10. Add an unknown JSON field. Why does exact-field validation improve the teaching contract?
+11. Send `max_new_tokens=0`, invalid `top_k`, or invalid `top_p`. Identify which layer rejects each request.
+12. Reuse a completed request ID. Explain why the network maps the existing AsyncEngine duplicate-ID rule to HTTP 409.
 
-## Runtime ownership
+## Four capacity layers
 
-15. Follow one accepted source tensor into `build_model_from_artifact()` and identify the explicit copy point.
-16. After model construction, mutate the loader-side tensor container. Prove the runtime parameter does not change.
-17. Explain the difference between artifact weight dtype and runtime dtype/device.
-18. Why does a runtime-owned copy make loader/container lifetime irrelevant after startup?
+13. Draw and distinguish:
 
-## Tokenizer boundary
+```text
+network max_inflight_requests
+AsyncEngine max_queue_size
+Scheduler max_num_seqs / token budget
+KV num_blocks
+```
 
-19. Encode `tok1 tok2 unknown`. Explain the deterministic unknown-token result.
-20. Try to decode an out-of-range token ID. Why is rejection better than string fallback?
-21. Make tokenizer vocabulary size differ from model vocabulary size. Why must startup fail before text serving?
-22. Trace `submit_text()`. At what exact point do strings disappear from the system?
-23. List the core layers that must remain unaware of text: Scheduler, WorkItem, KV, ModelRunner and speculation.
+14. Set `max_inflight_requests=1` and start two overlapping requests. Prove one receives 429 before hidden runtime submission.
+15. Set AsyncEngine `max_queue_size=1` with one slow streaming consumer. Why does model progress pause without dropping committed tokens?
+16. Construct a KV-pressure case. Why is a cache/preemption event categorically different from HTTP 429?
 
-## Parent versus child validation
+## JSON completion
 
-24. Parent-load an artifact, then change a checkpoint tensor before worker startup. Why must child re-validation fail identity comparison?
-25. Explain why sending the parent checkpoint dictionary through IPC would teach a second large mechanism that v1.2 deliberately avoids.
-26. For world size 2, list the evidence required before `ArtifactMultiprocessExecutor` can become ready.
-27. Construct two `WorkerSpec`s with different artifact identities. Why should the parent reject them before process startup?
-28. Make rank 1 fail loading after rank 0 is ready. What must happen to rank 0 before construction returns an error?
+17. Send `/v1/generate` and compare output token IDs with direct `create_engine("v1.2").submit_text(...)` under equivalent model/runtime configuration.
+18. Explain why the non-stream handler must still consume every intermediate `TokenEvent` even though it returns only one final JSON body.
+19. What deadlock would appear if the handler only awaited terminal metadata while the bounded event queue became full?
 
-## Readiness and serving
+## SSE streaming
 
-29. Expand the v1.2 readiness equation: process alive + artifact valid + weights copied + tokenizer compatible + identity agreement.
-30. Why must no request be admitted while any rank is still loading or validating its model?
-31. After readiness, which v1.1 serving algorithms are unchanged?
-32. Explain why artifact identity should not become a Scheduler ranking input.
+20. Send `/v1/generate/stream` and list the emitted event names.
+21. Verify token event order equals `output_index` order and final `done.output_token_ids`.
+22. Explain why NetworkServer cannot expose speculative candidate tokens: what is its only event source?
+23. Slow socket writes. Which layer experiences backpressure and which serving semantics must remain unchanged?
 
-## Default builder
+## Disconnect cancellation
 
-33. Call `create_engine()` with no artifact path. Find the temporary model directory.
-34. Explain why exporting a temporary artifact and loading it back is stronger than keeping a direct in-memory TinyDecoder bypass.
-35. Close the engine and verify the temporary directory disappears only after workers stop.
+24. Open an SSE request, read one token event and close the client socket. Observe `disconnect_cancellations`.
+25. Trace the path `EOF → handle.cancel() → AsyncEngine cancellation intent → EngineCore cancel → Scheduler/cache cleanup`.
+26. Why is killing the worker process an invalid implementation of client disconnect?
+27. Explain why a disconnected client may receive no terminal bytes while the runtime must still reach exactly one logical terminal outcome.
+28. Verify duplicate disconnect observations do not double-count cancellation for one in-flight request.
+
+## Health versus readiness
+
+29. Compare `/health` and `/ready` immediately after `start()`.
+30. Explain why a bound socket is insufficient readiness evidence.
+31. Identify the deeper facts `_runtime_ready()` reads: execution health and artifact rank identity agreement.
+32. During server draining, why can health remain true while readiness is false?
+
+## Ownership-aware lifecycle
+
+33. Create an engine, then `engine.create_server()`. Close the server and prove worker processes remain alive.
+34. Use top-level `create_server(...)`. Close it and prove worker processes are reaped.
+35. Why must a wrapper never close an externally owned engine by default?
+36. Explain the shutdown order: stop accepts → cancel/drain active API requests → close connection tasks → close owned engine.
 
 ## Observability
 
-36. Inspect `snapshot.core.model_artifact`. Explain every field and which ones are logical facts rather than storage handles.
-37. Compare every rank's `artifact_identity` and `tokenizer_identity`.
-38. Call `snapshot()` twice without serving work. Prove artifact observations preserve the read-only snapshot invariant.
-39. Why are raw checkpoint dictionaries and parameter pointers intentionally absent?
+37. Call `server.snapshot()` twice without intervening work. Prove equality.
+38. Explain why reading `active_connections` or readiness must not mutate request/network counters.
+39. Propose one useful network metric. Decide whether computing it would violate read-only observability.
+40. Why are raw socket objects deliberately absent from `NetworkSnapshot`?
 
-## Semantic equivalence
+## Error taxonomy
 
-40. Export the deterministic v1.1 model, run v1.1 and v1.2 at world size 1, and compare committed outputs.
-41. Repeat at world size 2. What does equality prove, and what does it not prove?
-42. Explain why identical token output does not by itself prove strict artifact validation; which negative tests are still needed?
-
-## Failure taxonomy
-
-43. Distinguish parent artifact validation failure from child startup identity mismatch.
-44. Distinguish child startup load failure from a post-readiness `WorkerRemoteError` during execution.
-45. Why does a malformed artifact not need execution rollback, while a failed serving step may?
-46. Explain how v1.2 artifact trust and v1.1 transport acknowledgment form two independent correctness boundaries.
+41. Map malformed JSON, wrong method, duplicate ID, ingress full and not-ready to their HTTP statuses.
+42. Explain why these HTTP statuses are API-edge facts, not Scheduler states.
+43. Compare a 429 ingress rejection with a child `WorkerRemoteError`; which boundaries produced them?
+44. Compare client disconnect with unexpected worker death; why are their recovery semantics radically different?
 
 ## Historical synthesis
 
-47. Compare v1.0, v1.1 and v1.2: composition → process isolation → external-artifact ingestion.
-48. Compare v0.8's class-level Worker boundary with v1.1's process boundary and v1.2's artifact boundary.
-49. Explain why adding safetensors support alone would usually be an incremental v1.2 extension rather than a new learning version.
-50. Propose a v1.3 network/API boundary. Identify what new owner appears at the edge and which existing invariants must survive it.
+45. Compare v0.10 and v1.3. Both involve streaming/backpressure; what new ownership problem appears only with a real socket?
+46. Compare v1.1 and v1.3. Which transport is internal IPC and which is external API transport?
+47. Compare v1.2 and v1.3. Why does validated model readiness become one prerequisite inside network readiness?
+48. Explain the full separation:
+
+```text
+network bytes
+!= validated API request
+!= token-native Request
+!= logical state
+!= physical KV
+!= model parameter storage
+```
+
+49. Propose a v1.4 multi-model registry contract. What must remain pinned for an in-flight request if one model starts draining?
+50. Reject a proposed v1.4 that merely adds HTTP/2 or more routes. Why is that not yet a distinct serving-runtime learning target?

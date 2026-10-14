@@ -122,3 +122,20 @@ class AsyncRuntimeSnapshot:
     @property
     def last_step(self) -> EngineStepOutput | None:
         return self.core.last_step
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkSnapshot:
+    lifecycle_state: str
+    host: str | None
+    port: int | None
+    health: bool
+    ready: bool
+    active_connections: int
+    inflight_requests: int
+    accepted_requests: int
+    rejected_requests: int
+    completed_requests: int
+    cancelled_requests: int
+    failed_requests: int
+    disconnect_cancellations: int

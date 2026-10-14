@@ -19,4 +19,5 @@ python examples/14_prefix_aware_scheduling.py >/dev/null
 python examples/15_integrated_runtime.py >/dev/null
 python examples/16_multiprocess_transport.py >/dev/null
 python examples/17_model_loading.py >/dev/null
+python examples/18_network_server.py >/dev/null
 echo "all checks passed"

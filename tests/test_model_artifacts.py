@@ -321,6 +321,7 @@ def test_child_load_failure_surfaces_during_startup_and_reaps(tmp_path: Path) ->
 
 def test_default_v12_builder_crosses_artifact_boundary_and_cleans_up() -> None:
     engine = create_engine(
+        "v1.2",
         world_size=1,
         multiprocess_config=MultiprocessConfig(start_method=FAST_START_METHOD),
     )
